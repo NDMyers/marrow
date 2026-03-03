@@ -9,7 +9,7 @@ const path = require("path");
 const { pipeline } = require("stream/promises");
 
 const DIST_DIR = path.join(__dirname, "..", "dist");
-const REPO = "https://github.com/ndmyers/marrow/releases/latest/download/marrow-${target}.tar.gz";
+const REPO = "NDMyers/marrow";
 const BINARY_NAME = process.platform === "win32" ? "marrow.exe" : "marrow";
 
 function getTargetTriple() {
@@ -72,9 +72,10 @@ async function download(url, destPath) {
 }
 
 async function main() {
+  const version = require("../package.json").version;
   const target = getTargetTriple();
   const archiveName = `marrow-${target}.tar.gz`;
-  const url = `https://github.com/${REPO}/releases/latest/download/${archiveName}`;
+  const url = `https://github.com/${REPO}/releases/download/v${version}/${archiveName}`;
   const archivePath = path.join(DIST_DIR, archiveName);
 
   fs.mkdirSync(DIST_DIR, { recursive: true });
@@ -85,14 +86,19 @@ async function main() {
   await tar.extract({
     file: archivePath,
     cwd: DIST_DIR,
-    // Only extract the binary itself, not any surrounding directory
-    filter: (filePath) => path.basename(filePath) === BINARY_NAME,
-    strip: 1,
+    // The release action uploads it as rust-ast-context-engine or rust-ast-context-engine.exe
+    filter: (filePath) => path.basename(filePath).startsWith("rust-ast-context-engine"),
   });
 
   fs.unlinkSync(archivePath);
 
+  const extractedBinaryName = process.platform === "win32" ? "rust-ast-context-engine.exe" : "rust-ast-context-engine";
+  const extractedPath = path.join(DIST_DIR, extractedBinaryName);
   const binaryPath = path.join(DIST_DIR, BINARY_NAME);
+
+  if (fs.existsSync(extractedPath)) {
+    fs.renameSync(extractedPath, binaryPath);
+  }
 
   if (!fs.existsSync(binaryPath)) {
     console.error(`[marrow] Binary not found after extraction: ${binaryPath}`);
