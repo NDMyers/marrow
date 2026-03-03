@@ -1,2 +1,932 @@
-<!-- placeholder: replaced by Task 4 -->
-<html><body>Loading...</body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Marrow · Context Engine</title>
+  <style>
+    /* ── Reset & base ──────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #0a0d0a;
+      --surface:     #0e120e;
+      --border:      #1c2e1c;
+      --border-hi:   #2a4a2a;
+      --green:       #00e676;
+      --green-glow:  #00e67640;
+      --cyan:        #00e5ff;
+      --cyan-glow:   #00e5ff40;
+      --amber:       #ffb300;
+      --indigo:      #7c83fd;
+      --dim:         #5a745a;
+      --text:        #c8d8c8;
+      --font:        'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Courier New', monospace;
+    }
+
+    html, body {
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    /* Scanline overlay */
+    body::after {
+      content: '';
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 9999;
+      background: repeating-linear-gradient(
+        to bottom,
+        transparent,
+        transparent 2px,
+        rgba(0, 0, 0, 0.06) 2px,
+        rgba(0, 0, 0, 0.06) 4px
+      );
+    }
+
+    /* ── Layout shell ──────────────────────────────────────────────────────── */
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Header ────────────────────────────────────────────────────────────── */
+    #header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    #header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    #logo {
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--green);
+      text-shadow: 0 0 8px var(--green-glow);
+      letter-spacing: 0.08em;
+    }
+
+    #tagline {
+      color: var(--dim);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+    }
+
+    #status-area {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--dim);
+    }
+
+    #status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #ffb300;
+      flex-shrink: 0;
+    }
+
+    #status-dot.live {
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green-glow);
+      animation: pulse-dot 2s ease-in-out infinite;
+    }
+
+    #status-dot.error {
+      background: #f44336;
+      box-shadow: 0 0 6px #f4433640;
+    }
+
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; box-shadow: 0 0 6px var(--green-glow); }
+      50%       { opacity: 0.6; box-shadow: 0 0 12px var(--green); }
+    }
+
+    /* ── Tab bar ───────────────────────────────────────────────────────────── */
+    #tabs {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 20px;
+      display: flex;
+      gap: 0;
+      flex-shrink: 0;
+    }
+
+    .tab-btn {
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--dim);
+      font-family: var(--font);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 8px 16px 6px;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+
+    .tab-btn:hover {
+      color: var(--text);
+    }
+
+    .tab-btn.active {
+      color: var(--green);
+      text-shadow: 0 0 8px var(--green-glow);
+      border-bottom-color: var(--green);
+    }
+
+    /* ── Panels container ──────────────────────────────────────────────────── */
+    #panels {
+      flex: 1;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .panel {
+      display: none;
+      flex-direction: column;
+      flex: 1;
+      overflow: hidden;
+      padding: 16px 20px 0;
+    }
+
+    .panel.active {
+      display: flex;
+    }
+
+    /* ── Stat cards ────────────────────────────────────────────────────────── */
+    .cards-row {
+      display: flex;
+      gap: 12px;
+      flex-shrink: 0;
+      margin-bottom: 14px;
+    }
+
+    .card {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 12px 16px;
+      min-width: 0;
+    }
+
+    .card-label {
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--dim);
+      margin-bottom: 4px;
+    }
+
+    .card-value {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--green);
+      text-shadow: 0 0 8px var(--green-glow);
+      line-height: 1.1;
+    }
+
+    .card-value.cyan {
+      color: var(--cyan);
+      text-shadow: 0 0 8px var(--cyan-glow);
+    }
+
+    .card-value.amber {
+      color: var(--amber);
+      text-shadow: 0 0 8px #ffb30040;
+    }
+
+    .card-sub {
+      font-size: 10px;
+      color: var(--dim);
+      margin-top: 2px;
+    }
+
+    /* ── Table section ─────────────────────────────────────────────────────── */
+    .table-wrap {
+      flex: 1;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--surface);
+      margin-bottom: 0;
+    }
+
+    .table-wrap::-webkit-scrollbar { width: 6px; }
+    .table-wrap::-webkit-scrollbar-track { background: var(--bg); }
+    .table-wrap::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    thead {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: #0c100c;
+    }
+
+    th {
+      padding: 8px 14px;
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--dim);
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    th:last-child { text-align: right; }
+    th.col-pct    { text-align: center; min-width: 160px; }
+    th.col-ts     { text-align: right; min-width: 72px; }
+
+    td {
+      padding: 7px 14px;
+      border-bottom: 1px solid #111a11;
+      vertical-align: middle;
+    }
+
+    tr:last-child td { border-bottom: none; }
+
+    tr.row-new {
+      animation: slide-in 0.35s ease-out forwards;
+    }
+
+    @keyframes slide-in {
+      from {
+        opacity: 0;
+        transform: translateY(-10px);
+        background: #00e67612;
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+        background: transparent;
+      }
+    }
+
+    /* ── Tool badges ────────────────────────────────────────────────────────── */
+    .badge {
+      display: inline-block;
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 1px 6px;
+      border-radius: 3px;
+      margin-right: 6px;
+      font-weight: 700;
+      vertical-align: middle;
+    }
+
+    .badge-capsule {
+      background: #00391a;
+      color: var(--green);
+      border: 1px solid #00532a;
+    }
+
+    .badge-index {
+      background: #003040;
+      color: var(--cyan);
+      border: 1px solid #005060;
+    }
+
+    .badge-impact {
+      background: #3a2600;
+      color: var(--amber);
+      border: 1px solid #5a3a00;
+    }
+
+    .badge-server {
+      background: #1a1a40;
+      color: var(--indigo);
+      border: 1px solid #2a2a6a;
+    }
+
+    /* ── Tool label cell ────────────────────────────────────────────────────── */
+    .tool-label {
+      font-size: 12px;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 340px;
+    }
+
+    .tool-label .sym {
+      color: var(--green);
+      text-shadow: 0 0 6px var(--green-glow);
+    }
+
+    .tool-label .sep {
+      color: var(--dim);
+      margin: 0 2px;
+    }
+
+    .tool-label .repo {
+      color: var(--dim);
+    }
+
+    /* ── Origin cell ────────────────────────────────────────────────────────── */
+    .origin-cell {
+      font-size: 11px;
+      color: var(--dim);
+      white-space: nowrap;
+    }
+
+    /* ── Pct bar cell ───────────────────────────────────────────────────────── */
+    .pct-cell {
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    .pct-bar-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .pct-bar-track {
+      width: 72px;
+      height: 7px;
+      background: #1a2a1a;
+      border-radius: 3px;
+      overflow: hidden;
+      display: inline-block;
+      vertical-align: middle;
+    }
+
+    .pct-bar-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+
+    .pct-bar-fill.high   { background: var(--green); box-shadow: 0 0 4px var(--green-glow); }
+    .pct-bar-fill.medium { background: var(--amber); }
+    .pct-bar-fill.low    { background: var(--dim); }
+
+    .pct-text {
+      font-size: 11px;
+      min-width: 38px;
+      text-align: right;
+      display: inline-block;
+    }
+
+    .pct-text.high   { color: var(--green); text-shadow: 0 0 6px var(--green-glow); }
+    .pct-text.medium { color: var(--amber); }
+    .pct-text.low    { color: var(--dim); }
+
+    .pct-dash { color: var(--dim); }
+
+    /* ── Timestamp cell ─────────────────────────────────────────────────────── */
+    .ts-cell {
+      font-size: 11px;
+      color: var(--dim);
+      text-align: right;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* ── Empty state ────────────────────────────────────────────────────────── */
+    #empty-row td {
+      text-align: center;
+      color: var(--dim);
+      font-size: 11px;
+      padding: 28px;
+      border: none;
+    }
+
+    /* ── Lifetime panel ─────────────────────────────────────────────────────── */
+    #lifetime-sub {
+      font-size: 11px;
+      color: var(--dim);
+      margin-bottom: 14px;
+      margin-top: -8px;
+    }
+
+    /* ── Privacy footer ─────────────────────────────────────────────────────── */
+    #privacy {
+      flex-shrink: 0;
+      text-align: center;
+      font-size: 10px;
+      color: #3a5a3a;
+      letter-spacing: 0.04em;
+      border-top: 1px solid var(--border);
+      padding: 8px 0;
+      background: var(--bg);
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Header -->
+  <header id="header">
+    <div id="header-left">
+      <span id="logo">▸ MARROW</span>
+      <span id="tagline">local · deterministic · offline context engine</span>
+    </div>
+    <div id="status-area">
+      <div id="status-dot"></div>
+      <span id="status-text">connecting…</span>
+    </div>
+  </header>
+
+  <!-- Tab bar -->
+  <nav id="tabs">
+    <button class="tab-btn active" data-tab="session" onclick="switchTab('session')">Session</button>
+    <button class="tab-btn" data-tab="lifetime" onclick="switchTab('lifetime')">Lifetime</button>
+  </nav>
+
+  <!-- Panels -->
+  <div id="panels">
+
+    <!-- SESSION panel -->
+    <section id="panel-session" class="panel active">
+
+      <!-- Stat cards -->
+      <div class="cards-row">
+        <div class="card">
+          <div class="card-label">Requests</div>
+          <div class="card-value" id="s-requests">0</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Full-File Tokens</div>
+          <div class="card-value cyan" id="s-file-tokens">0</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Tokens Saved</div>
+          <div class="card-value" id="s-tokens-saved">0</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Reduction %</div>
+          <div class="card-value amber" id="s-reduction">0.0%</div>
+          <div class="card-sub" id="s-reduction-sub">capsule vs. full-file</div>
+        </div>
+      </div>
+
+      <!-- Live tool-call table -->
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="min-width:100px">Origin</th>
+              <th>Tool Execution</th>
+              <th class="col-pct">Token % Saved</th>
+              <th class="col-ts">Time</th>
+            </tr>
+          </thead>
+          <tbody id="event-tbody">
+            <tr id="empty-row">
+              <td colspan="4">waiting for tool calls…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Footer inside panel (so it pushes against table) -->
+      <footer id="privacy">
+        Marrow operates entirely offline. No telemetry. All data remains strictly on your local machine (127.0.0.1).
+      </footer>
+
+    </section>
+
+    <!-- LIFETIME panel -->
+    <section id="panel-lifetime" class="panel">
+
+      <div class="cards-row">
+        <div class="card">
+          <div class="card-label">All-Time Requests</div>
+          <div class="card-value" id="l-requests">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">All-Time Tokens Saved</div>
+          <div class="card-value" id="l-tokens-saved">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Lifetime Reduction %</div>
+          <div class="card-value amber" id="l-reduction">—</div>
+        </div>
+      </div>
+
+      <p id="lifetime-sub">Cumulative across all sessions and workspaces sharing this database.</p>
+
+      <footer id="privacy-lt">
+        Marrow operates entirely offline. No telemetry. All data remains strictly on your local machine (127.0.0.1).
+      </footer>
+
+    </section>
+
+  </div><!-- /panels -->
+
+</div><!-- /app -->
+
+<style>
+  /* Lifetime footer shares the same style via id, duplicate here for scoping */
+  #privacy-lt {
+    flex-shrink: 0;
+    text-align: center;
+    font-size: 10px;
+    color: #3a5a3a;
+    letter-spacing: 0.04em;
+    border-top: 1px solid var(--border);
+    padding: 8px 0;
+    background: var(--bg);
+    margin-top: auto;
+  }
+</style>
+
+<script>
+  'use strict';
+
+  // ── State ──────────────────────────────────────────────────────────────────
+
+  const session = {
+    requests:     0,
+    fileTokens:   0,
+    capsuleTokens: 0,
+    tokensSaved:  0,
+    reductionPct: 0,
+  };
+
+  let rowCount = 0;
+  const MAX_ROWS = 50;
+
+  let sseSource = null;
+  let reconnectTimer = null;
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  function escHtml(str) {
+    if (str == null) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function fmtNum(n) {
+    return Number(n).toLocaleString();
+  }
+
+  function fmtPct(n) {
+    return Number(n).toFixed(1) + '%';
+  }
+
+  function fmtTs(ts) {
+    // ts is a unix epoch in seconds
+    const d = new Date(Number(ts) * 1000);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  }
+
+  function nowTs() {
+    return Math.floor(Date.now() / 1000);
+  }
+
+  function pctBarHtml(pct) {
+    if (pct == null) return '<span class="pct-dash">—</span>';
+    const p = Math.min(100, Math.max(0, Number(pct)));
+    const cls = p > 50 ? 'high' : p >= 20 ? 'medium' : 'low';
+    return `
+      <span class="pct-bar-wrap">
+        <span class="pct-bar-track">
+          <span class="pct-bar-fill ${cls}" style="width:${p}%"></span>
+        </span>
+        <span class="pct-text ${cls}">${fmtPct(p)}</span>
+      </span>`;
+  }
+
+  function badgeHtml(type) {
+    const map = {
+      capsule: ['badge-capsule', 'capsule'],
+      index:   ['badge-index',   'index'],
+      impact:  ['badge-impact',  'impact'],
+      server:  ['badge-server',  'server'],
+    };
+    const [cls, label] = map[type] || ['badge-server', type];
+    return `<span class="badge ${cls}">${escHtml(label)}</span>`;
+  }
+
+  // ── DOM Updates ────────────────────────────────────────────────────────────
+
+  function updateSessionCards() {
+    document.getElementById('s-requests').textContent     = fmtNum(session.requests);
+    document.getElementById('s-file-tokens').textContent  = fmtNum(session.fileTokens);
+    document.getElementById('s-tokens-saved').textContent = fmtNum(session.tokensSaved);
+    document.getElementById('s-reduction').textContent    = fmtPct(session.reductionPct);
+  }
+
+  function updateLifetimeCards(lt) {
+    document.getElementById('l-requests').textContent    = fmtNum(lt.total_requests);
+    document.getElementById('l-tokens-saved').textContent = fmtNum(lt.total_tokens_saved);
+    document.getElementById('l-reduction').textContent   = fmtPct(lt.reduction_pct);
+  }
+
+  function setStatus(state) {
+    const dot  = document.getElementById('status-dot');
+    const text = document.getElementById('status-text');
+    dot.className = '';
+    if (state === 'live') {
+      dot.classList.add('live');
+      text.textContent = 'live';
+    } else if (state === 'error') {
+      dot.classList.add('error');
+      text.textContent = 'reconnecting…';
+    } else {
+      text.textContent = 'connecting…';
+    }
+  }
+
+  // ── Table row insertion ────────────────────────────────────────────────────
+
+  function removeEmptyRow() {
+    const empty = document.getElementById('empty-row');
+    if (empty) empty.remove();
+  }
+
+  function addTableRow(origin, badgeType, toolLabelHtml, pctSaved, ts) {
+    removeEmptyRow();
+
+    const tbody = document.getElementById('event-tbody');
+
+    // Trim to MAX_ROWS
+    while (tbody.rows.length >= MAX_ROWS) {
+      tbody.deleteRow(tbody.rows.length - 1);
+    }
+
+    const tsStr = ts ? fmtTs(ts) : fmtTs(nowTs());
+
+    const tr = document.createElement('tr');
+    tr.className = 'row-new';
+    tr.innerHTML = `
+      <td class="origin-cell">${escHtml(origin || '—')}</td>
+      <td class="tool-label">${badgeHtml(badgeType)}${toolLabelHtml}</td>
+      <td class="pct-cell">${pctBarHtml(pctSaved)}</td>
+      <td class="ts-cell">${escHtml(tsStr)}</td>
+    `;
+
+    tbody.insertBefore(tr, tbody.firstChild);
+    rowCount++;
+
+    // Remove animation class after it finishes
+    tr.addEventListener('animationend', () => tr.classList.remove('row-new'), { once: true });
+  }
+
+  // ── Event Handling ─────────────────────────────────────────────────────────
+
+  function handleEvent(data) {
+    switch (data.type) {
+
+      case 'capsule_served': {
+        session.requests++;
+        session.fileTokens    += data.file_tokens    || 0;
+        session.capsuleTokens += data.capsule_tokens || 0;
+        session.tokensSaved   += data.tokens_saved   || 0;
+        session.reductionPct = session.fileTokens > 0
+          ? (session.tokensSaved / session.fileTokens) * 100
+          : 0;
+        updateSessionCards();
+
+        const sym  = escHtml(data.symbol || '');
+        const repo = escHtml(data.repo   || '');
+        const toolHtml = `<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span>`;
+        const pct = data.file_tokens > 0
+          ? (data.tokens_saved / data.file_tokens) * 100
+          : null;
+        addTableRow(data.origin || '—', 'capsule', toolHtml, pct, data.ts);
+        break;
+      }
+
+      case 'repo_indexed': {
+        const repo    = escHtml(data.repo_id || '');
+        const symbols = fmtNum(data.symbols  || 0);
+        const edges   = fmtNum(data.edges    || 0);
+        const toolHtml = `<span class="sym">${repo}</span><span class="sep"> · </span><span class="repo">${symbols} symbols / ${edges} edges</span>`;
+        addTableRow('—', 'index', toolHtml, null, data.ts);
+        break;
+      }
+
+      case 'impact_analyzed': {
+        const sym  = escHtml(data.symbol || '');
+        const repo = escHtml(data.repo   || '');
+        const aff  = fmtNum(data.affected_count || 0);
+        const toolHtml = `<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo} — ${aff} affected</span>`;
+        addTableRow('—', 'impact', toolHtml, null, data.ts);
+        break;
+      }
+
+      case 'server_started': {
+        const port = escHtml(String(data.port || ''));
+        const db   = escHtml(data.db_path || '');
+        const toolHtml = `<span class="sym">server</span><span class="sep"> · </span><span class="repo">port ${port} · ${db}</span>`;
+        addTableRow('—', 'server', toolHtml, null, null);
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  // ── Replay recent_events from /stats ──────────────────────────────────────
+
+  function replayEvents(events) {
+    if (!Array.isArray(events)) return;
+    // events are newest-first from server; replay oldest-first so table ends newest-first
+    const ordered = [...events].reverse();
+    for (const ev of ordered) {
+      handleEventReplay(ev);
+    }
+  }
+
+  function handleEventReplay(data) {
+    // Same as handleEvent but skip updating session cards mid-loop (batch update after)
+    switch (data.type) {
+      case 'capsule_served': {
+        session.requests++;
+        session.fileTokens    += data.file_tokens    || 0;
+        session.capsuleTokens += data.capsule_tokens || 0;
+        session.tokensSaved   += data.tokens_saved   || 0;
+
+        const sym     = escHtml(data.symbol || '');
+        const repo    = escHtml(data.repo   || '');
+        const toolHtml = `<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span>`;
+        const pct = data.file_tokens > 0
+          ? (data.tokens_saved / data.file_tokens) * 100
+          : null;
+
+        // Insert without animation class for replayed rows
+        removeEmptyRow();
+        const tbody = document.getElementById('event-tbody');
+        while (tbody.rows.length >= MAX_ROWS) tbody.deleteRow(tbody.rows.length - 1);
+        const tsStr = data.ts ? fmtTs(data.ts) : '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="origin-cell">${escHtml(data.origin || '—')}</td>
+          <td class="tool-label">${badgeHtml('capsule')}<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span></td>
+          <td class="pct-cell">${pctBarHtml(pct)}</td>
+          <td class="ts-cell">${escHtml(tsStr)}</td>
+        `;
+        tbody.insertBefore(tr, tbody.firstChild);
+        break;
+      }
+
+      case 'repo_indexed': {
+        removeEmptyRow();
+        const tbody   = document.getElementById('event-tbody');
+        while (tbody.rows.length >= MAX_ROWS) tbody.deleteRow(tbody.rows.length - 1);
+        const repo    = escHtml(data.repo_id || '');
+        const symbols = fmtNum(data.symbols  || 0);
+        const edges   = fmtNum(data.edges    || 0);
+        const tsStr   = data.ts ? fmtTs(data.ts) : '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="origin-cell">—</td>
+          <td class="tool-label">${badgeHtml('index')}<span class="sym">${repo}</span><span class="sep"> · </span><span class="repo">${symbols} symbols / ${edges} edges</span></td>
+          <td class="pct-cell"><span class="pct-dash">—</span></td>
+          <td class="ts-cell">${escHtml(tsStr)}</td>
+        `;
+        tbody.insertBefore(tr, tbody.firstChild);
+        break;
+      }
+
+      case 'impact_analyzed': {
+        removeEmptyRow();
+        const tbody = document.getElementById('event-tbody');
+        while (tbody.rows.length >= MAX_ROWS) tbody.deleteRow(tbody.rows.length - 1);
+        const sym  = escHtml(data.symbol || '');
+        const repo = escHtml(data.repo   || '');
+        const aff  = fmtNum(data.affected_count || 0);
+        const tsStr = data.ts ? fmtTs(data.ts) : '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="origin-cell">—</td>
+          <td class="tool-label">${badgeHtml('impact')}<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo} — ${aff} affected</span></td>
+          <td class="pct-cell"><span class="pct-dash">—</span></td>
+          <td class="ts-cell">${escHtml(tsStr)}</td>
+        `;
+        tbody.insertBefore(tr, tbody.firstChild);
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  // ── fetchStats ─────────────────────────────────────────────────────────────
+
+  function fetchStats(replaySession) {
+    fetch('/stats')
+      .then(r => r.json())
+      .then(body => {
+        if (replaySession && body.session) {
+          const s = body.session;
+          session.requests      = s.total_requests      || 0;
+          session.fileTokens    = s.total_file_tokens   || 0;
+          session.capsuleTokens = s.total_capsule_tokens || 0;
+          session.tokensSaved   = s.total_tokens_saved  || 0;
+          session.reductionPct  = s.reduction_pct       || 0;
+          updateSessionCards();
+          replayEvents(s.recent_events || []);
+        }
+        if (body.lifetime) {
+          updateLifetimeCards(body.lifetime);
+        }
+      })
+      .catch(() => {
+        // Server not yet ready; silently ignore
+      });
+  }
+
+  // ── SSE ────────────────────────────────────────────────────────────────────
+
+  function connectSSE() {
+    if (sseSource) {
+      sseSource.close();
+      sseSource = null;
+    }
+
+    setStatus('connecting');
+
+    sseSource = new EventSource('/stream');
+
+    sseSource.onopen = () => {
+      setStatus('live');
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    };
+
+    sseSource.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        handleEvent(data);
+      } catch (_) {
+        // malformed JSON; skip
+      }
+    };
+
+    sseSource.onerror = () => {
+      setStatus('error');
+      sseSource.close();
+      sseSource = null;
+      reconnectTimer = setTimeout(connectSSE, 3000);
+    };
+  }
+
+  // ── Tab switching ──────────────────────────────────────────────────────────
+
+  function switchTab(name) {
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.tab === name);
+    });
+    document.querySelectorAll('.panel').forEach(p => {
+      p.classList.toggle('active', p.id === `panel-${name}`);
+    });
+    if (name === 'lifetime') {
+      // Refresh lifetime data on tab switch
+      fetchStats(false);
+    }
+  }
+
+  // ── Boot ───────────────────────────────────────────────────────────────────
+
+  document.addEventListener('DOMContentLoaded', () => {
+    fetchStats(true);
+    connectSSE();
+  });
+</script>
+</body>
+</html>
