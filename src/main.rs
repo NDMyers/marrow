@@ -634,6 +634,61 @@ mod tests {
 
 // ── CLI subcommands ───────────────────────────────────────────────────────────
 
+/// `marrow ui` — interactive dashboard configuration menu.
+fn cmd_ui() -> Result<()> {
+    use dialoguer::{Select, theme::ColorfulTheme};
+
+    loop {
+        // Re-read config each iteration so the toggle label is always current.
+        let auto_open: bool = fs::read_to_string(".marrowrc.json")
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| v.get("auto_open_ui").and_then(|b| b.as_bool()))
+            .unwrap_or(true);
+
+        let toggle_label = format!(
+            "Toggle Auto-Open (Currently: {})",
+            if auto_open { "ON" } else { "OFF" }
+        );
+
+        let items = vec![
+            "Open Dashboard in Browser",
+            toggle_label.as_str(),
+            "Exit",
+        ];
+
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Marrow Dashboard")
+            .items(&items)
+            .default(0)
+            .interact()?;
+
+        match selection {
+            0 => {
+                if let Err(e) = open::that("http://127.0.0.1:8765") {
+                    eprintln!("Could not open browser: {e}");
+                }
+            }
+            1 => {
+                let rc_path = Path::new(".marrowrc.json");
+                let mut cfg: serde_json::Value = fs::read_to_string(rc_path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str(&raw).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                cfg["auto_open_ui"] = serde_json::Value::Bool(!auto_open);
+                fs::write(rc_path, serde_json::to_string_pretty(&cfg)?)?;
+                println!(
+                    "Auto-Open is now {}.",
+                    if !auto_open { "ON" } else { "OFF" }
+                );
+            }
+            _ => break,
+        }
+    }
+
+    Ok(())
+}
+
 /// `marrow init` — scaffold a `.marrow/` directory and `.marrowrc.json` config.
 fn cmd_init() -> Result<()> {
     let marrow_dir = Path::new(".marrow");
@@ -645,7 +700,8 @@ fn cmd_init() -> Result<()> {
     } else {
         let default_config = serde_json::json!({
             "ignore": ["node_modules", "target", "dist", ".git"],
-            "show_dashboard": true
+            "show_dashboard": true,
+            "auto_open_ui": true
         });
         fs::write(rc_path, serde_json::to_string_pretty(&default_config)?)?;
         println!("Created .marrowrc.json with default ignore patterns.");
@@ -1033,6 +1089,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(|s| s.as_str()) {
+        Some("ui")   => return cmd_ui(),
         Some("init") => return cmd_init(),
         Some("index") => return cmd_index(),
         Some("integrate") => return cmd_integrate(),
@@ -1085,20 +1142,29 @@ async fn main() -> Result<()> {
     let conn   = db::init_db(&db_path)?;
     let db_arc = Arc::new(Mutex::new(conn));
 
+    // ── Read auto_open_ui from .marrowrc.json (default: true) ────────
+    let auto_open_ui = fs::read_to_string(".marrowrc.json")
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("auto_open_ui").and_then(|b| b.as_bool()))
+        .unwrap_or(true);
+
     // ── Spawn dashboard if enabled ────────────────────────────────────
     if show_dashboard {
-        let port = dashboard::start(
+        let role = dashboard::start(
             tx.clone(),
             Arc::clone(&session),
             Arc::clone(&db_arc),
-            true,
+            auto_open_ui,
         )
         .await?;
 
-        let _ = tx.send(DashboardEvent::ServerStarted {
-            port,
-            db_path: db_path.clone(),
-        });
+        if let dashboard::HubRole::Hub = role {
+            let _ = tx.send(DashboardEvent::ServerStarted {
+                port: 8765,
+                db_path: db_path.clone(),
+            });
+        }
     }
 
     // ── Build engine (re-use the shared DB Arc) ───────────────────────
