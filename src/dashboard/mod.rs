@@ -58,6 +58,7 @@ pub enum DashboardEvent {
 }
 
 /// Result of the Hub election attempt.
+#[derive(Debug)]
 pub enum HubRole {
     /// This process bound 127.0.0.1:8765 and owns the Axum server.
     Hub,
@@ -196,15 +197,19 @@ async fn emit_handler(
     State(state): State<AppState>,
     axum::Json(event): axum::Json<DashboardEvent>,
 ) -> impl IntoResponse {
-    if let Ok(mut sess) = state.session.lock() {
-        match &event {
-            DashboardEvent::CapsuleServed { capsule_tokens, file_tokens, .. } => {
-                sess.record_capsule(*capsule_tokens, *file_tokens, event.clone());
-            }
-            other => {
-                sess.recent_events.push_front(other.clone());
-                if sess.recent_events.len() > 50 {
-                    sess.recent_events.pop_back();
+    let sess_result = state.session.lock();
+    match sess_result {
+        Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(mut sess) => {
+            match &event {
+                DashboardEvent::CapsuleServed { capsule_tokens, file_tokens, .. } => {
+                    sess.record_capsule(*capsule_tokens, *file_tokens, event.clone());
+                }
+                other => {
+                    sess.recent_events.push_front(other.clone());
+                    if sess.recent_events.len() > 50 {
+                        sess.recent_events.pop_back();
+                    }
                 }
             }
         }
@@ -232,6 +237,8 @@ pub async fn start(
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             return Ok(HubRole::Spoke);
         }
+        // Any other bind error (e.g. PermissionDenied) is a genuine failure
+        // that should propagate — not silently downgraded to Spoke mode.
         Err(e) => return Err(e.into()),
     };
 
@@ -242,6 +249,8 @@ pub async fn start(
         .route("/stream",    get(sse_handler))
         .route("/stats",     get(stats_handler))
         .route("/api/emit",  axum::routing::post(emit_handler))
+        // permissive CORS is intentional: this server binds only to 127.0.0.1,
+        // and the dashboard UI is served from the same origin.
         .layer(CorsLayer::permissive())
         .with_state(state);
 
