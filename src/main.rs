@@ -57,14 +57,12 @@ fn format_capsule_string(capsule: &retrieval::ContextCapsule) -> String {
 }
 
 /// Count cl100k_base tokens in `text`.
-#[allow(dead_code)] // removed in Task 5 when run_benchmark gains this caller
 fn count_tokens(text: &str) -> anyhow::Result<usize> {
     let bpe = tiktoken_rs::cl100k_base()?;
     Ok(bpe.encode_with_special_tokens(text).len())
 }
 
 /// Format a usize with thousands separators: 4812 → "4,812".
-#[allow(dead_code)] // transitively dead until format_benchmark_table is called by run_benchmark (Task 5)
 fn fmt_num(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
@@ -82,7 +80,6 @@ fn fmt_num(n: usize) -> String {
 /// Layout (67-char inner width, 69-char total with border chars):
 ///   header rows span full 67 chars (W = L + 1 + R = 27 + 1 + 39)
 ///   metric rows: 27-char left col │ 39-char right col
-#[allow(dead_code)] // removed in Task 5 when run_benchmark gains this caller
 fn format_benchmark_table(
     symbol:         &str,
     repo_id:        &str,
@@ -134,6 +131,69 @@ fn format_benchmark_table(
     // Bottom border
     write!(t, "└{h_left}┴{h_right}┘").ok();
     t
+}
+
+/// Full benchmark pipeline:
+/// 1. Look up the pivot node to get file_path.
+/// 2. Look up the repo to get root_path → read the full source file.
+/// 3. Build the Context Capsule and format it.
+/// 4. Count tokens in both strings.
+/// 5. Print the table.
+#[allow(dead_code)] // removed in Task 6 when CLI dispatch wires this
+fn run_benchmark(
+    conn:    &rusqlite::Connection,
+    symbol:  &str,
+    repo_id: &str,
+) -> anyhow::Result<()> {
+    // ── Step 1: resolve file path ────────────────────────────────────
+    let file_path: String = conn
+        .query_row(
+            "SELECT file_path FROM nodes \
+             WHERE symbol_name = ?1 AND repo_id = ?2 LIMIT 1",
+            rusqlite::params![symbol, repo_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("Symbol '{}' not found in repo '{}'.", symbol, repo_id)
+        })?;
+
+    // ── Step 2: resolve repo root and read the full source file ──────
+    let root_path: String = conn
+        .query_row(
+            "SELECT root_path FROM repositories WHERE id = ?1",
+            rusqlite::params![repo_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Repo '{}' not found in the database. Has it been ingested?",
+                repo_id
+            )
+        })?;
+
+    let abs_path = std::path::PathBuf::from(&root_path).join(&file_path);
+    let file_content = fs::read_to_string(&abs_path).map_err(|_| {
+        anyhow::anyhow!(
+            "Source file not found at {}. Re-ingest the repo to refresh.",
+            abs_path.display()
+        )
+    })?;
+
+    // ── Step 3: build and format the capsule ─────────────────────────
+    let capsule = retrieval::get_context_capsule(conn, symbol, repo_id)?;
+    let capsule_str = format_capsule_string(&capsule);
+
+    // ── Step 4: count tokens ─────────────────────────────────────────
+    let file_tokens    = count_tokens(&file_content)?;
+    let capsule_tokens = count_tokens(&capsule_str)?;
+
+    // ── Step 5: print table ──────────────────────────────────────────
+    println!(
+        "{}",
+        format_benchmark_table(symbol, repo_id, &file_path, file_tokens, capsule_tokens)
+    );
+
+    Ok(())
 }
 
 // ── Server struct ─────────────────────────────────────────────────────────────
