@@ -64,7 +64,7 @@ fn count_tokens(text: &str) -> anyhow::Result<usize> {
 }
 
 /// Format a usize with thousands separators: 4812 → "4,812".
-#[allow(dead_code)] // removed in Task 5 when format_benchmark_table gains its caller
+#[allow(dead_code)] // transitively dead until format_benchmark_table is called by run_benchmark (Task 5)
 fn fmt_num(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
@@ -79,8 +79,8 @@ fn fmt_num(n: usize) -> String {
 
 /// Build the terminal benchmark table.
 ///
-/// Layout (68-char inner width):
-///   header rows span full 68 chars
+/// Layout (67-char inner width, 69-char total with border chars):
+///   header rows span full 67 chars (W = L + 1 + R = 27 + 1 + 39)
 ///   metric rows: 27-char left col │ 39-char right col
 #[allow(dead_code)] // removed in Task 5 when run_benchmark gains this caller
 fn format_benchmark_table(
@@ -454,8 +454,8 @@ mod tests {
     #[test]
     fn format_benchmark_table_zero_reduction_when_equal() {
         let table = format_benchmark_table("s", "r", "f.py", 500, 500);
-        assert!(table.contains("0"),    "saved should be 0:\n{table}");
-        assert!(table.contains("0.0%"), "reduction should be 0.0%:\n{table}");
+        assert!(table.contains("Tokens Saved"), "label missing:\n{table}");
+        assert!(table.contains("0.0%"),         "reduction should be 0.0%:\n{table}");
     }
 }
 
