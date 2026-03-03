@@ -139,7 +139,6 @@ fn format_benchmark_table(
 /// 3. Build the Context Capsule and format it.
 /// 4. Count tokens in both strings.
 /// 5. Print the table.
-#[allow(dead_code)] // removed in Task 6 when CLI dispatch wires this
 fn run_benchmark(
     conn:    &rusqlite::Connection,
     symbol:  &str,
@@ -525,6 +524,22 @@ mod tests {
 async fn main() -> Result<()> {
     let db_path = std::env::var("MARROW_DB_PATH")
         .unwrap_or_else(|_| ".context_engine/graph.db".to_string());
+
+    // ── CLI subcommand dispatch ────────────────────────────────────────
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("benchmark") {
+        let symbol = args.get(2).ok_or_else(|| {
+            anyhow::anyhow!("Usage: marrow benchmark <symbol> <repo_id>")
+        })?;
+        let repo_id = args.get(3).ok_or_else(|| {
+            anyhow::anyhow!("Usage: marrow benchmark <symbol> <repo_id>")
+        })?;
+
+        // DB must exist before benchmarking (ingest first).
+        let conn = db::init_db(&db_path)?;
+        run_benchmark(&conn, symbol, repo_id)?;
+        return Ok(());
+    }
 
     let db_parent = std::path::Path::new(&db_path)
         .parent()
