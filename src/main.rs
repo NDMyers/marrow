@@ -1,4 +1,5 @@
 mod db;
+mod dashboard;
 mod ingestion;
 mod retrieval;
 
@@ -11,16 +12,19 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use dashboard::{DashboardEvent, SessionStats};
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     model::{
         CallToolRequestParams, CallToolResult, Content, Implementation,
+        InitializeRequestParams, InitializeResult,
         ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
         ToolsCapability,
     },
     service::RequestContext,
     transport::stdio,
 };
+use tokio::sync::broadcast;
 
 // ── Capsule formatting ────────────────────────────────────────────────────────
 
@@ -202,14 +206,26 @@ fn run_benchmark(
 /// Clone + Send + Sync, as required by rmcp's ServerHandler bound.
 #[derive(Clone)]
 struct ContextEngine {
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db:          Arc<Mutex<rusqlite::Connection>>,
+    tx:          broadcast::Sender<DashboardEvent>,
+    session:     Arc<Mutex<SessionStats>>,
+    client_name: Arc<Mutex<String>>,
 }
 
 impl ContextEngine {
-    fn new(db_path: &str) -> Result<Self> {
+    #[allow(dead_code)]
+    fn new(
+        db_path:     &str,
+        tx:          broadcast::Sender<DashboardEvent>,
+        session:     Arc<Mutex<SessionStats>>,
+        client_name: Arc<Mutex<String>>,
+    ) -> Result<Self> {
         let conn = db::init_db(db_path)?;
         Ok(Self {
-            db: Arc::new(Mutex::new(conn)),
+            db:          Arc::new(Mutex::new(conn)),
+            tx,
+            session,
+            client_name,
         })
     }
 
@@ -261,6 +277,33 @@ impl ServerHandler for ContextEngine {
                 ..Default::default()
             },
             ..Default::default()
+        }
+    }
+
+    // ── Initialize override: capture client name ──────────────────────────────
+
+    fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<InitializeResult, rmcp::ErrorData>> + Send + '_ {
+        // Capture the connecting client's name from the MCP handshake.
+        if let Ok(mut name) = self.client_name.lock() {
+            *name = request.client_info.name.clone();
+        }
+
+        // Delegate to the default peer-info storage behaviour and return our ServerInfo.
+        if context.peer.peer_info().is_none() {
+            context.peer.set_peer_info(request);
+        }
+        let info = self.get_info();
+        async move {
+            Ok(InitializeResult {
+                protocol_version: rmcp::model::ProtocolVersion::default(),
+                capabilities:     info.capabilities,
+                server_info:      info.server_info,
+                instructions:     info.instructions,
+            })
         }
     }
 
@@ -354,27 +397,81 @@ impl ServerHandler for ContextEngine {
             match request.name.as_ref() {
                 // ── get_context_capsule ───────────────────────────────────────
                 "get_context_capsule" => {
-                    let symbol_name = Self::require_str(&args, "symbol_name")?.to_string();
-                    let repo_id = Self::require_str(&args, "repo_id")?.to_string();
+                    let symbol_name  = Self::require_str(&args, "symbol_name")?.to_string();
+                    let repo_id      = Self::require_str(&args, "repo_id")?.to_string();
+                    let tx           = self.tx.clone();
+                    let session      = Arc::clone(&self.session);
+                    let client_name  = self.client_name.lock()
+                                           .map(|g| g.clone())
+                                           .unwrap_or_else(|_| "Unknown Client".to_string());
 
-                    let capsule = tokio::task::spawn_blocking(move || {
-                        let conn = db
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
-                        retrieval::get_context_capsule(&conn, &symbol_name, &repo_id)
-                    })
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                    let sym_for_event  = symbol_name.clone();
+                    let repo_for_event = repo_id.clone();
 
-                    let out = format_capsule_string(&capsule);
+                    let (out, capsule_tokens, file_tokens, file_path) =
+                        tokio::task::spawn_blocking(move || {
+                            let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+
+                            let capsule      = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id)?;
+                            let file_path    = capsule.pivot.file_path.clone();
+                            let out          = format_capsule_string(&capsule);
+                            let capsule_toks = count_tokens(&out).unwrap_or(0);
+
+                            // Count full-file tokens for the savings delta
+                            let file_toks: usize = conn
+                                .query_row(
+                                    "SELECT root_path FROM repositories WHERE id = ?1",
+                                    rusqlite::params![repo_id],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .ok()
+                                .and_then(|root| {
+                                    let abs = std::path::PathBuf::from(&root).join(&file_path);
+                                    std::fs::read_to_string(abs).ok()
+                                })
+                                .and_then(|content| count_tokens(&content).ok())
+                                .unwrap_or(0);
+
+                            // Persist to lifetime stats
+                            let saved = file_toks.saturating_sub(capsule_toks) as i64;
+                            let _ = db::increment_stat(&conn, "total_requests",     1);
+                            let _ = db::increment_stat(&conn, "total_file_tokens",  file_toks as i64);
+                            let _ = db::increment_stat(&conn, "total_tokens_saved", saved);
+
+                            Ok::<_, anyhow::Error>((out, capsule_toks, file_toks, file_path))
+                        })
+                        .await
+                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                    let tokens_saved = file_tokens.saturating_sub(capsule_tokens);
+
+                    let event = DashboardEvent::CapsuleServed {
+                        symbol:         sym_for_event,
+                        repo:           repo_for_event,
+                        file:           file_path,
+                        capsule_tokens,
+                        file_tokens,
+                        tokens_saved,
+                        origin:         client_name,
+                        ts:             dashboard::now_ts(),
+                    };
+                    {
+                        let mut sess = session.lock().unwrap_or_else(|e| e.into_inner());
+                        sess.record_capsule(capsule_tokens, file_tokens, event.clone());
+                    }
+                    let _ = tx.send(event);
+
                     Ok(CallToolResult::success(vec![Content::text(out)]))
                 }
 
                 // ── analyze_impact ────────────────────────────────────────────
                 "analyze_impact" => {
                     let symbol_name = Self::require_str(&args, "symbol_name")?.to_string();
-                    let repo_id = Self::require_str(&args, "repo_id")?.to_string();
+                    let repo_id     = Self::require_str(&args, "repo_id")?.to_string();
+
+                    let sym_clone  = symbol_name.clone();
+                    let repo_clone = repo_id.clone();
 
                     let result = tokio::task::spawn_blocking(move || {
                         let conn = db
@@ -420,14 +517,23 @@ impl ServerHandler for ContextEngine {
                         writeln!(out, "\n{} node(s) affected.", result.affected.len()).ok();
                     }
 
+                    let _ = self.tx.send(DashboardEvent::ImpactAnalyzed {
+                        symbol:         sym_clone,
+                        repo:           repo_clone,
+                        affected_count: result.affected.len(),
+                        ts:             dashboard::now_ts(),
+                    });
+
                     Ok(CallToolResult::success(vec![Content::text(out)]))
                 }
 
                 // ── ingest_repo ───────────────────────────────────────────────
                 "ingest_repo" => {
-                    let repo_id = Self::require_str(&args, "repo_id")?.to_string();
+                    let repo_id   = Self::require_str(&args, "repo_id")?.to_string();
                     let root_path: PathBuf =
                         Self::require_str(&args, "root_path")?.to_string().into();
+
+                    let repo_id_for_event = repo_id.clone();
 
                     let (symbols, edges) = tokio::task::spawn_blocking(move || {
                         let conn = db
@@ -440,6 +546,13 @@ impl ServerHandler for ContextEngine {
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                    let _ = self.tx.send(DashboardEvent::RepoIndexed {
+                        repo_id: repo_id_for_event,
+                        symbols,
+                        edges,
+                        ts: dashboard::now_ts(),
+                    });
 
                     Ok(CallToolResult::success(vec![Content::text(format!(
                         "Ingested {symbols} symbols; resolved {edges} cross-repo edges."
@@ -531,7 +644,8 @@ fn cmd_init() -> Result<()> {
         println!(".marrowrc.json already exists — skipping.");
     } else {
         let default_config = serde_json::json!({
-            "ignore": ["node_modules", "target", "dist", ".git"]
+            "ignore": ["node_modules", "target", "dist", ".git"],
+            "show_dashboard": true
         });
         fs::write(rc_path, serde_json::to_string_pretty(&default_config)?)?;
         println!("Created .marrowrc.json with default ignore patterns.");
@@ -954,7 +1068,47 @@ async fn main() -> Result<()> {
         .unwrap_or(Path::new("."));
     fs::create_dir_all(db_parent)?;
 
-    let engine = ContextEngine::new(&db_path)?;
+    // ── Read show_dashboard from .marrowrc.json (default: true) ──────
+    let show_dashboard = fs::read_to_string(".marrowrc.json")
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("show_dashboard").and_then(|b| b.as_bool()))
+        .unwrap_or(true);
+
+    // ── Shared state ──────────────────────────────────────────────────
+    let (tx, _) = broadcast::channel::<DashboardEvent>(256);
+    let session     = Arc::new(Mutex::new(SessionStats::default()));
+    let client_name = Arc::new(Mutex::new("Unknown Client".to_string()));
+
+    // ── Init DB (shared between dashboard and engine) ─────────────────
+    let conn   = db::init_db(&db_path)?;
+    let db_arc = Arc::new(Mutex::new(conn));
+
+    // ── Spawn dashboard if enabled ────────────────────────────────────
+    if show_dashboard {
+        let port = dashboard::start(
+            tx.clone(),
+            Arc::clone(&session),
+            Arc::clone(&db_arc),
+            true,
+        )
+        .await?;
+
+        let _ = tx.send(DashboardEvent::ServerStarted {
+            port,
+            db_path: db_path.clone(),
+        });
+    }
+
+    // ── Build engine (re-use the shared DB Arc) ───────────────────────
+    // Note: bypass ContextEngine::new (which would open a second conn)
+    // by constructing the struct directly — all fields are in the same module.
+    let engine = ContextEngine {
+        db:          Arc::clone(&db_arc),
+        tx:          tx.clone(),
+        session:     Arc::clone(&session),
+        client_name: Arc::clone(&client_name),
+    };
 
     eprintln!("Marrow MCP server ready — listening on stdio.");
     let server = engine.serve(stdio()).await?;
