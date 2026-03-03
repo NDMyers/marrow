@@ -817,37 +817,41 @@ fn integrate_antigravity(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     Ok(AgentOutcome::Installed)
 }
 
-/// .cursor/mcp.json (workspace-local)
+/// ~/.cursor/mcp.json (global)
 fn integrate_cursor(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
-    if !PathBuf::from(".cursor").exists() {
-        return Ok(AgentOutcome::NotFound);
-    }
-    let path = PathBuf::from(".cursor/mcp.json");
+    let path = PathBuf::from(&ctx.home).join(".cursor/mcp.json");
     let mut cfg = load_json_or_empty(&path)?;
     cfg["mcpServers"]["marrow"] = serde_json::json!({
         "command": ctx.binary,
-        "args":    [],
-        "env":     { "MARROW_DB_PATH": ctx.db_path }
+        "args":    ["mcp"]
     });
     save_json(&path, &cfg)?;
     Ok(AgentOutcome::Installed)
 }
 
-/// .vscode/mcp.json (workspace-local)
-/// VS Code MCP uses a top-level "servers" key with a "type" discriminant.
+/// GitHub Copilot — writes two config files:
+///   ~/.mcp.json          (VS Code global MCP, uses "servers" key)
+///   ~/.copilot/mcp-config.json  (Copilot CLI, uses "mcpServers" key)
 fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
-    if !PathBuf::from(".vscode").exists() {
-        return Ok(AgentOutcome::NotFound);
-    }
-    let path = PathBuf::from(".vscode/mcp.json");
-    let mut cfg = load_json_or_empty(&path)?;
-    cfg["servers"]["marrow"] = serde_json::json!({
-        "type":    "stdio",
+    // 1. ~/.mcp.json — VS Code / global MCP
+    let vscode_path = PathBuf::from(&ctx.home).join(".mcp.json");
+    let mut vscode_cfg = load_json_or_empty(&vscode_path)?;
+    vscode_cfg["servers"]["marrow"] = serde_json::json!({
         "command": ctx.binary,
-        "args":    [],
-        "env":     { "MARROW_DB_PATH": ctx.db_path }
+        "args":    ["mcp"]
     });
-    save_json(&path, &cfg)?;
+    save_json(&vscode_path, &vscode_cfg)?;
+
+    // 2. ~/.copilot/mcp-config.json — Copilot CLI
+    let cli_path = PathBuf::from(&ctx.home).join(".copilot/mcp-config.json");
+    let mut cli_cfg = load_json_or_empty(&cli_path)?;
+    cli_cfg["mcpServers"]["marrow"] = serde_json::json!({
+        "type":    "local",
+        "command": ctx.binary,
+        "args":    ["mcp"]
+    });
+    save_json(&cli_path, &cli_cfg)?;
+
     Ok(AgentOutcome::Installed)
 }
 

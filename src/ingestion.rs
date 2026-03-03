@@ -44,6 +44,25 @@ fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
                 "(class_declaration) @class"
             ),
         }),
+        "rs" => Some(LangConfig {
+            language: tree_sitter_rust::LANGUAGE.into(),
+            query_src: concat!(
+                "(function_item) @capture.func\n",
+                "(struct_item) @capture.struct\n",
+                "(trait_item) @capture.trait\n",
+                "(impl_item) @capture.impl\n",
+                "(enum_item) @capture.enum"
+            ),
+        }),
+        "rb" => Some(LangConfig {
+            language: tree_sitter_ruby::LANGUAGE.into(),
+            query_src: concat!(
+                "(method) @capture.method\n",
+                "(singleton_method) @capture.method\n",
+                "(class) @capture.class\n",
+                "(module) @capture.module"
+            ),
+        }),
         _ => None,
     }
 }
