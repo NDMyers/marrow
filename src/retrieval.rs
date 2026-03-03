@@ -212,6 +212,17 @@ pub fn condense(raw_text: &str, lang: &str) -> String {
             tree_sitter_typescript::LANGUAGE_TSX.into(),
             "[(statement_block) @body (class_body) @body]",
         ),
+        "rs" => condense_braces(
+            raw_text,
+            tree_sitter_rust::LANGUAGE.into(),
+            concat!(
+                "[(block) @body",
+                " (field_declaration_list) @body",
+                " (declaration_list) @body",
+                " (enum_variant_list) @body]"
+            ),
+        ),
+        "rb" => condense_ruby(raw_text),
         _ => raw_text.to_string(),
     }
 }
@@ -240,6 +251,20 @@ fn condense_python(raw_text: &str) -> String {
                 .map(|l| " ".repeat(l.len() - l.trim_start().len()))
                 .unwrap_or_default();
             format!("{}{}pass{}", &raw_text[..start], indent, &raw_text[end..])
+        }
+        None => raw_text.to_string(),
+    }
+}
+
+/// Replace the outermost Ruby body node (`body_statement` or `statements`) with
+/// a `# ...` placeholder.  The closing `end` keyword lives outside the body
+/// node in tree-sitter-ruby's grammar, so the byte-range replacement leaves it
+/// intact, producing `def method_name(...)\n  # ...\nend` output.
+fn condense_ruby(raw_text: &str) -> String {
+    let lang: Language = tree_sitter_ruby::LANGUAGE.into();
+    match find_outermost_body(raw_text, lang, "(body_statement) @body") {
+        Some((start, end)) => {
+            format!("{}  # ...{}", &raw_text[..start], &raw_text[end..])
         }
         None => raw_text.to_string(),
     }
@@ -663,5 +688,32 @@ mod tests {
         assert!(result.contains("greet(name: string)"), "signature lost: {result}");
         assert!(result.contains("{ /* ... */ }"), "placeholder missing: {result}");
         assert!(!result.contains("Hello"), "body leaked: {result}");
+    }
+
+    #[test]
+    fn condense_rust_function_replaces_body() {
+        let raw = "fn compute(n: u32) -> u32 {\n    let x = n * 2;\n    x\n}";
+        let result = condense(raw, "rs");
+        assert!(result.contains("fn compute(n: u32)"), "signature lost: {result}");
+        assert!(result.contains("{ /* ... */ }"), "placeholder missing: {result}");
+        assert!(!result.contains("n * 2"), "body leaked: {result}");
+    }
+
+    #[test]
+    fn condense_ruby_method_replaces_body_preserves_end() {
+        let raw = "def greet(name)\n  puts name\n  name.upcase\nend\n";
+        let result = condense(raw, "rb");
+        assert!(result.contains("def greet"), "signature lost: {result}");
+        assert!(result.contains("end"), "`end` keyword must be preserved: {result}");
+        assert!(result.contains("# ..."), "placeholder missing: {result}");
+        assert!(!result.contains("puts name"), "body leaked: {result}");
+    }
+
+    #[test]
+    fn condense_ruby_preserves_end_not_chopped() {
+        // Verifies the byte-range replacement does NOT consume the closing `end`.
+        let raw = "def foo\n  x = 1\nend\n";
+        let result = condense(raw, "rb");
+        assert!(result.ends_with("end\n"), "`end` must close the method: {result}");
     }
 }
