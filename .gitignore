@@ -7,3 +7,7 @@ TASK2.md
 docs/plans/
 .claude/
 .marrow/
+
+# npm
+node_modules/
+dist/
