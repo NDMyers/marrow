@@ -3,5 +3,7 @@
 Cargo.lock
 CLAUDE.md
 TASK.md
+TASK2.md
 docs/plans/
 .claude/
+.marrow/

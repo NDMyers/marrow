@@ -17,7 +17,7 @@ pub struct NodeInfo {
     pub symbol_type: String,
     pub file_path: String,
     pub language: String,
-    /// Full source for the pivot; skeletonized body for neighbors.
+    /// Full source for the pivot; condensed body for neighbors.
     pub text: String,
 }
 
@@ -46,7 +46,7 @@ pub struct ImpactResult {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Fetch the pivot node's full source and all depth-1 neighbors skeletonized.
+/// Fetch the pivot node's full source and all depth-1 neighbors condensed.
 pub fn get_context_capsule(
     conn: &Connection,
     symbol_name: &str,
@@ -120,7 +120,7 @@ pub fn get_context_capsule(
                 symbol_type: sym_type,
                 file_path,
                 language: lang.clone(),
-                text: skeletonize(&raw_text, &lang),
+                text: condense(&raw_text, &lang),
             },
             relationship: rel_type,
         })
@@ -188,26 +188,26 @@ pub fn analyze_impact(
     Ok(ImpactResult { pivot_id, affected })
 }
 
-// ── Skeletonization ───────────────────────────────────────────────────────────
+// ── Condensation ───────────────────────────────────────────────────────────
 
-/// Skeletonize `raw_text` for `lang`, replacing the body with a placeholder.
+/// Condense `raw_text` for `lang`, replacing the body with a placeholder.
 /// Returns the original text unchanged if no body block is detected
 /// (e.g., forward declarations, macro-defined structs, incomplete fragments).
-pub fn skeletonize(raw_text: &str, lang: &str) -> String {
+pub fn condense(raw_text: &str, lang: &str) -> String {
     match lang {
-        "cpp" | "cc" | "cxx" | "h" | "hpp" => skeletonize_braces(
+        "cpp" | "cc" | "cxx" | "h" | "hpp" => condense_braces(
             raw_text,
             tree_sitter_cpp::LANGUAGE.into(),
             // compound_statement = function body  |  field_declaration_list = class body
             "[(compound_statement) @body (field_declaration_list) @body]",
         ),
-        "py" => skeletonize_python(raw_text),
-        "ts" => skeletonize_braces(
+        "py" => condense_python(raw_text),
+        "ts" => condense_braces(
             raw_text,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "[(statement_block) @body (class_body) @body]",
         ),
-        "tsx" => skeletonize_braces(
+        "tsx" => condense_braces(
             raw_text,
             tree_sitter_typescript::LANGUAGE_TSX.into(),
             "[(statement_block) @body (class_body) @body]",
@@ -217,7 +217,7 @@ pub fn skeletonize(raw_text: &str, lang: &str) -> String {
 }
 
 /// Replace the outermost `{…}` body node with `{ /* ... */ }`.
-fn skeletonize_braces(raw_text: &str, lang: Language, query_src: &str) -> String {
+fn condense_braces(raw_text: &str, lang: Language, query_src: &str) -> String {
     match find_outermost_body(raw_text, lang, query_src) {
         Some((start, end)) => {
             format!("{}{{ /* ... */ }}{}", &raw_text[..start], &raw_text[end..])
@@ -229,7 +229,7 @@ fn skeletonize_braces(raw_text: &str, lang: Language, query_src: &str) -> String
 
 /// Replace the outermost Python `block` with an `    pass` placeholder,
 /// inferring indentation from the block's first non-empty line.
-fn skeletonize_python(raw_text: &str) -> String {
+fn condense_python(raw_text: &str) -> String {
     let lang: Language = tree_sitter_python::LANGUAGE.into();
     match find_outermost_body(raw_text, lang, "(block) @body") {
         Some((start, end)) => {
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn capsule_cpp_forward_decl_returns_full_text() {
         let conn = make_db();
-        // Forward declaration: no body block — skeletonize must return it unchanged.
+        // Forward declaration: no body block — condense must return it unchanged.
         let fwd = "class Widget;";
         insert_node(&conn, "r:w.h:Widget", "r", "w.h", "cpp", "Widget", "class", fwd);
         insert_node(
@@ -630,36 +630,36 @@ mod tests {
         assert!(analyze_impact(&conn, "ghost", "r").is_err());
     }
 
-    // ── skeletonize (unit tests on raw text) ──────────────────────────────────
+    // ── condense (unit tests on raw text) ──────────────────────────────────
 
     #[test]
-    fn skeletonize_cpp_function_replaces_body() {
+    fn condense_cpp_function_replaces_body() {
         let raw = "void process(int x) {\n    x += 1;\n    return;\n}";
-        let result = skeletonize(raw, "cpp");
+        let result = condense(raw, "cpp");
         assert!(result.contains("process(int x)"), "signature lost: {result}");
         assert!(result.contains("{ /* ... */ }"), "placeholder missing: {result}");
         assert!(!result.contains("x += 1"), "body leaked: {result}");
     }
 
     #[test]
-    fn skeletonize_cpp_forward_decl_unchanged() {
+    fn condense_cpp_forward_decl_unchanged() {
         let raw = "class Foo;";
-        assert_eq!(skeletonize(raw, "cpp"), raw);
+        assert_eq!(condense(raw, "cpp"), raw);
     }
 
     #[test]
-    fn skeletonize_py_function_replaces_body_with_pass() {
+    fn condense_py_function_replaces_body_with_pass() {
         let raw = "def compute(n):\n    total = 0\n    return total\n";
-        let result = skeletonize(raw, "py");
+        let result = condense(raw, "py");
         assert!(result.contains("def compute(n):"), "signature lost: {result}");
         assert!(result.contains("pass"), "pass placeholder missing: {result}");
         assert!(!result.contains("total"), "body leaked: {result}");
     }
 
     #[test]
-    fn skeletonize_ts_function_replaces_body() {
+    fn condense_ts_function_replaces_body() {
         let raw = "function greet(name: string): string {\n    return `Hello ${name}`;\n}";
-        let result = skeletonize(raw, "ts");
+        let result = condense(raw, "ts");
         assert!(result.contains("greet(name: string)"), "signature lost: {result}");
         assert!(result.contains("{ /* ... */ }"), "placeholder missing: {result}");
         assert!(!result.contains("Hello"), "body leaked: {result}");
