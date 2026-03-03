@@ -826,6 +826,7 @@ fn cmd_integrate() -> Result<()> {
     println!();
 
     // ── Agent menu ────────────────────────────────────────────────────
+    #[allow(clippy::type_complexity)]
     let agents: &[(&str, fn(&IntegrationCtx) -> Result<AgentOutcome>)] = &[
         ("Claude Code",          integrate_claude),
         ("Antigravity (Gemini)", integrate_antigravity),
