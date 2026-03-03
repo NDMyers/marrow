@@ -55,14 +55,12 @@ pub fn increment_stat(conn: &Connection, key: &str, delta: i64) -> Result<()> {
     Ok(())
 }
 
-/// Returns the current value of a stats counter, or 0 if not set.
-pub fn read_stat(conn: &Connection, key: &str) -> Result<i64> {
-    let val = conn
-        .query_row(
-            "SELECT value FROM stats WHERE key = ?1",
-            rusqlite::params![key],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0);
-    Ok(val)
+/// Returns the current value of a stats counter, or 0 if the key is absent or on error.
+pub fn read_stat(conn: &Connection, key: &str) -> i64 {
+    conn.query_row(
+        "SELECT value FROM stats WHERE key = ?1",
+        rusqlite::params![key],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
 }
