@@ -1,0 +1,20 @@
+{
+  "name": "marrow-mcp",
+  "version": "0.1.0",
+  "description": "A local, deterministic MCP server that parses multi-language codebases into an AST dependency graph.",
+  "keywords": ["mcp", "ast", "tree-sitter", "rust", "llm", "context"],
+  "license": "MIT",
+  "bin": {
+    "marrow": "bin/marrow.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "tar": "^7.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
