@@ -1,0 +1,7 @@
+/target
+.context_engine/
+Cargo.lock
+CLAUDE.md
+TASK.md
+docs/plans/
+.claude/
