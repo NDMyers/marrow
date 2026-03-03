@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     model::{
@@ -171,13 +171,13 @@ fn run_benchmark(
             )
         })?;
 
-    let abs_path = std::path::PathBuf::from(&root_path).join(&file_path);
-    let file_content = fs::read_to_string(&abs_path).map_err(|_| {
-        anyhow::anyhow!(
-            "Source file not found at {}. Re-ingest the repo to refresh.",
+    let abs_path = PathBuf::from(&root_path).join(&file_path);
+    let file_content = fs::read_to_string(&abs_path)
+        .with_context(|| format!(
+            "Could not read source file at {}. \
+             Check the file exists and is readable, or re-ingest the repo.",
             abs_path.display()
-        )
-    })?;
+        ))?;
 
     // ── Step 3: build and format the capsule ─────────────────────────
     let capsule = retrieval::get_context_capsule(conn, symbol, repo_id)?;
