@@ -37,3 +37,10 @@ anyhow = "1.0"
 
 # Tokenizer for token reduction delta quantifications
 tiktoken-rs = "0.5.9"
+
+# Respects .gitignore + custom ignore patterns for directory walking
+ignore = "0.4"
+
+# Interactive terminal UI for the integrate installer
+dialoguer = "0.11"
+console = "0.15"
