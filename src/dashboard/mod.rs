@@ -20,7 +20,7 @@ use axum::{
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use tokio_stream::{StreamExt as _, wrappers::BroadcastStream};
+use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 
 static INDEX_HTML: &str = include_str!("index.html");
@@ -41,6 +41,7 @@ pub enum DashboardEvent {
         capsule_tokens: usize,
         file_tokens: usize,
         tokens_saved: usize,
+        origin: String,
         ts: u64,
     },
     RepoIndexed {
@@ -112,7 +113,7 @@ async fn sse_handler(
     State(state): State<AppState>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|msg| async move {
+    let stream = tokio_stream::StreamExt::filter_map(BroadcastStream::new(rx), |msg: Result<DashboardEvent, _>| {
         let event = msg.ok()?;
         let json  = serde_json::to_string(&event).ok()?;
         Some(Ok::<Event, Infallible>(Event::default().data(json)))
