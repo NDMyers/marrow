@@ -525,14 +525,21 @@ async fn main() -> Result<()> {
     let db_path = std::env::var("MARROW_DB_PATH")
         .unwrap_or_else(|_| ".context_engine/graph.db".to_string());
 
+    // Ensure the DB parent directory exists for all code paths.
+    let db_parent = std::path::Path::new(&db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    fs::create_dir_all(db_parent)?;
+
     // ── CLI subcommand dispatch ────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("benchmark") {
         let symbol = args.get(2).ok_or_else(|| {
-            anyhow::anyhow!("Usage: marrow benchmark <symbol> <repo_id>")
+            anyhow::anyhow!("Usage: {} benchmark <symbol> <repo_id>", args[0])
         })?;
         let repo_id = args.get(3).ok_or_else(|| {
-            anyhow::anyhow!("Usage: marrow benchmark <symbol> <repo_id>")
+            anyhow::anyhow!("Usage: {} benchmark <symbol> <repo_id>", args[0])
         })?;
 
         // DB must exist before benchmarking (ingest first).
@@ -540,12 +547,6 @@ async fn main() -> Result<()> {
         run_benchmark(&conn, symbol, repo_id)?;
         return Ok(());
     }
-
-    let db_parent = std::path::Path::new(&db_path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    fs::create_dir_all(db_parent)?;
 
     let engine = ContextEngine::new(&db_path)?;
 
