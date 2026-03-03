@@ -25,6 +25,15 @@ use rmcp::{
     transport::stdio,
 };
 
+const DASHBOARD_EMIT_URL: &str = "http://127.0.0.1:8765/api/emit";
+
+/// Milliseconds to wait after the Axum server spawns before sending the
+/// first ServerStarted event. The listener is ready almost instantly but
+/// there is a brief window between `tokio::spawn` returning and the first
+/// `accept()` completing. A missed ServerStarted is cosmetic (dashboard UI
+/// only), so this is best-effort rather than a hard synchronisation point.
+const DASHBOARD_WARMUP_MS: u64 = 50;
+
 // ── Capsule formatting ────────────────────────────────────────────────────────
 
 /// Format a ContextCapsule as the plain-text string sent to the LLM.
@@ -409,7 +418,7 @@ impl ServerHandler for ContextEngine {
                             let capsule      = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id)?;
                             let file_path    = capsule.pivot.file_path.clone();
                             let out          = format_capsule_string(&capsule);
-                            let capsule_toks = count_tokens(&out).unwrap_or(0);
+                            let capsule_toks = count_tokens(&out)?;
 
                             // Count full-file tokens for the savings delta
                             let file_toks: usize = conn
@@ -453,7 +462,7 @@ impl ServerHandler for ContextEngine {
                     let http_client = self.http_client.clone();
                     tokio::spawn(async move {
                         let _ = http_client
-                            .post("http://127.0.0.1:8765/api/emit")
+                            .post(DASHBOARD_EMIT_URL)
                             .json(&event)
                             .send()
                             .await;
@@ -523,7 +532,7 @@ impl ServerHandler for ContextEngine {
                     let http_client = self.http_client.clone();
                     tokio::spawn(async move {
                         let _ = http_client
-                            .post("http://127.0.0.1:8765/api/emit")
+                            .post(DASHBOARD_EMIT_URL)
                             .json(&event)
                             .send()
                             .await;
@@ -561,7 +570,7 @@ impl ServerHandler for ContextEngine {
                     let http_client = self.http_client.clone();
                     tokio::spawn(async move {
                         let _ = http_client
-                            .post("http://127.0.0.1:8765/api/emit")
+                            .post(DASHBOARD_EMIT_URL)
                             .json(&event)
                             .send()
                             .await;
@@ -1166,6 +1175,9 @@ async fn main() -> Result<()> {
     // ── Dashboard Hub election ────────────────────────────────────────
     if show_dashboard {
         use tokio::sync::broadcast;
+        // The initial receiver is intentionally dropped: all SSE consumers call
+        // tx.subscribe() dynamically when a browser connects (see sse_handler).
+        // The channel stays open because AppState holds the cloned sender.
         let (tx, _) = broadcast::channel::<DashboardEvent>(256);
         let session = Arc::new(Mutex::new(dashboard::SessionStats::default()));
 
@@ -1184,9 +1196,9 @@ async fn main() -> Result<()> {
                 let db_path = db_path.clone();
                 tokio::spawn(async move {
                     // Brief yield so the Axum accept-loop is ready.
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(DASHBOARD_WARMUP_MS)).await;
                     let _ = client
-                        .post("http://127.0.0.1:8765/api/emit")
+                        .post(DASHBOARD_EMIT_URL)
                         .json(&DashboardEvent::ServerStarted { port: 8765, db_path })
                         .send()
                         .await;
