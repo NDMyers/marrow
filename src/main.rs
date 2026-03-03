@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use dashboard::{DashboardEvent, SessionStats};
+use dashboard::DashboardEvent;
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     model::{
@@ -24,7 +24,6 @@ use rmcp::{
     service::RequestContext,
     transport::stdio,
 };
-use tokio::sync::broadcast;
 
 // ── Capsule formatting ────────────────────────────────────────────────────────
 
@@ -207,25 +206,22 @@ fn run_benchmark(
 #[derive(Clone)]
 struct ContextEngine {
     db:          Arc<Mutex<rusqlite::Connection>>,
-    tx:          broadcast::Sender<DashboardEvent>,
-    session:     Arc<Mutex<SessionStats>>,
     client_name: Arc<Mutex<String>>,
+    http_client: reqwest::Client,
 }
 
 impl ContextEngine {
     #[allow(dead_code)]
     fn new(
         db_path:     &str,
-        tx:          broadcast::Sender<DashboardEvent>,
-        session:     Arc<Mutex<SessionStats>>,
         client_name: Arc<Mutex<String>>,
+        http_client: reqwest::Client,
     ) -> Result<Self> {
         let conn = db::init_db(db_path)?;
         Ok(Self {
-            db:          Arc::new(Mutex::new(conn)),
-            tx,
-            session,
+            db: Arc::new(Mutex::new(conn)),
             client_name,
+            http_client,
         })
     }
 
@@ -399,8 +395,6 @@ impl ServerHandler for ContextEngine {
                 "get_context_capsule" => {
                     let symbol_name  = Self::require_str(&args, "symbol_name")?.to_string();
                     let repo_id      = Self::require_str(&args, "repo_id")?.to_string();
-                    let tx           = self.tx.clone();
-                    let session      = Arc::clone(&self.session);
                     let client_name  = self.client_name.lock()
                                            .map(|g| g.clone())
                                            .unwrap_or_else(|_| "Unknown Client".to_string());
@@ -456,11 +450,14 @@ impl ServerHandler for ContextEngine {
                         origin:         client_name,
                         ts:             dashboard::now_ts(),
                     };
-                    {
-                        let mut sess = session.lock().unwrap_or_else(|e| e.into_inner());
-                        sess.record_capsule(capsule_tokens, file_tokens, event.clone());
-                    }
-                    let _ = tx.send(event);
+                    let http_client = self.http_client.clone();
+                    tokio::spawn(async move {
+                        let _ = http_client
+                            .post("http://127.0.0.1:8765/api/emit")
+                            .json(&event)
+                            .send()
+                            .await;
+                    });
 
                     Ok(CallToolResult::success(vec![Content::text(out)]))
                 }
@@ -517,11 +514,19 @@ impl ServerHandler for ContextEngine {
                         writeln!(out, "\n{} node(s) affected.", result.affected.len()).ok();
                     }
 
-                    let _ = self.tx.send(DashboardEvent::ImpactAnalyzed {
+                    let event = DashboardEvent::ImpactAnalyzed {
                         symbol:         sym_clone,
                         repo:           repo_clone,
                         affected_count: result.affected.len(),
                         ts:             dashboard::now_ts(),
+                    };
+                    let http_client = self.http_client.clone();
+                    tokio::spawn(async move {
+                        let _ = http_client
+                            .post("http://127.0.0.1:8765/api/emit")
+                            .json(&event)
+                            .send()
+                            .await;
                     });
 
                     Ok(CallToolResult::success(vec![Content::text(out)]))
@@ -547,11 +552,19 @@ impl ServerHandler for ContextEngine {
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-                    let _ = self.tx.send(DashboardEvent::RepoIndexed {
+                    let event = DashboardEvent::RepoIndexed {
                         repo_id: repo_id_for_event,
                         symbols,
                         edges,
                         ts: dashboard::now_ts(),
+                    };
+                    let http_client = self.http_client.clone();
+                    tokio::spawn(async move {
+                        let _ = http_client
+                            .post("http://127.0.0.1:8765/api/emit")
+                            .json(&event)
+                            .send()
+                            .await;
                     });
 
                     Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1130,55 +1143,66 @@ async fn main() -> Result<()> {
         .unwrap_or(Path::new("."));
     fs::create_dir_all(db_parent)?;
 
-    // ── Read show_dashboard from .marrowrc.json (default: true) ──────
-    let show_dashboard = fs::read_to_string(".marrowrc.json")
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.get("show_dashboard").and_then(|b| b.as_bool()))
-        .unwrap_or(true);
+    // ── Read both config flags in one pass ────────────────────────────
+    let (show_dashboard, auto_open_ui) = {
+        let cfg: serde_json::Value = fs::read_to_string(".marrowrc.json")
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let show = cfg.get("show_dashboard").and_then(|b| b.as_bool()).unwrap_or(true);
+        let open = cfg.get("auto_open_ui").and_then(|b| b.as_bool()).unwrap_or(true);
+        (show, open)
+    };
 
-    // ── Shared state ──────────────────────────────────────────────────
-    let (tx, _) = broadcast::channel::<DashboardEvent>(256);
-    let session     = Arc::new(Mutex::new(SessionStats::default()));
     let client_name = Arc::new(Mutex::new("Unknown Client".to_string()));
 
-    // ── Init DB (shared between dashboard and engine) ─────────────────
+    // ── Init DB ───────────────────────────────────────────────────────
     let conn   = db::init_db(&db_path)?;
     let db_arc = Arc::new(Mutex::new(conn));
 
-    // ── Read auto_open_ui from .marrowrc.json (default: true) ────────
-    let auto_open_ui = fs::read_to_string(".marrowrc.json")
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.get("auto_open_ui").and_then(|b| b.as_bool()))
-        .unwrap_or(true);
+    // ── Create the HTTP client once — shared by Hub startup and engine ─
+    let http_client = reqwest::Client::new();
 
-    // ── Spawn dashboard if enabled ────────────────────────────────────
+    // ── Dashboard Hub election ────────────────────────────────────────
     if show_dashboard {
-        let role = dashboard::start(
+        use tokio::sync::broadcast;
+        let (tx, _) = broadcast::channel::<DashboardEvent>(256);
+        let session = Arc::new(Mutex::new(dashboard::SessionStats::default()));
+
+        match dashboard::start(
             tx.clone(),
             Arc::clone(&session),
             Arc::clone(&db_arc),
             auto_open_ui,
         )
-        .await?;
-
-        if let dashboard::HubRole::Hub = role {
-            let _ = tx.send(DashboardEvent::ServerStarted {
-                port: 8765,
-                db_path: db_path.clone(),
-            });
+        .await?
+        {
+            dashboard::HubRole::Hub => {
+                // Fire-and-forget: POST ServerStarted to ourselves.
+                // Spawned so we don't block while the listener finishes binding.
+                let client  = http_client.clone();
+                let db_path = db_path.clone();
+                tokio::spawn(async move {
+                    // Brief yield so the Axum accept-loop is ready.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let _ = client
+                        .post("http://127.0.0.1:8765/api/emit")
+                        .json(&DashboardEvent::ServerStarted { port: 8765, db_path })
+                        .send()
+                        .await;
+                });
+            }
+            dashboard::HubRole::Spoke => {
+                eprintln!("Marrow running as Spoke (Hub already active on :8765).");
+            }
         }
     }
 
-    // ── Build engine (re-use the shared DB Arc) ───────────────────────
-    // Note: bypass ContextEngine::new (which would open a second conn)
-    // by constructing the struct directly — all fields are in the same module.
+    // ── Build engine ──────────────────────────────────────────────────
     let engine = ContextEngine {
         db:          Arc::clone(&db_arc),
-        tx:          tx.clone(),
-        session:     Arc::clone(&session),
         client_name: Arc::clone(&client_name),
+        http_client,
     };
 
     eprintln!("Marrow MCP server ready — listening on stdio.");
