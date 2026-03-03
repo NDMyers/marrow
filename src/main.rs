@@ -57,6 +57,7 @@ fn format_capsule_string(capsule: &retrieval::ContextCapsule) -> String {
 }
 
 /// Count cl100k_base tokens in `text`.
+#[allow(dead_code)] // removed in Task 5 when run_benchmark gains this caller
 fn count_tokens(text: &str) -> anyhow::Result<usize> {
     let bpe = tiktoken_rs::cl100k_base()?;
     Ok(bpe.encode_with_special_tokens(text).len())
