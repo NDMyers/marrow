@@ -26,7 +26,6 @@ use rmcp::{
 /// Format a ContextCapsule as the plain-text string sent to the LLM.
 /// Extracted from `call_tool` so the benchmark subcommand can reuse it.
 fn format_capsule_string(capsule: &retrieval::ContextCapsule) -> String {
-    use std::fmt::Write as FmtWrite;
     let mut out = String::new();
     writeln!(
         out,
