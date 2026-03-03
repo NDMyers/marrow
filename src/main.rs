@@ -56,6 +56,12 @@ fn format_capsule_string(capsule: &retrieval::ContextCapsule) -> String {
     out
 }
 
+/// Count cl100k_base tokens in `text`.
+fn count_tokens(text: &str) -> anyhow::Result<usize> {
+    let bpe = tiktoken_rs::cl100k_base()?;
+    Ok(bpe.encode_with_special_tokens(text).len())
+}
+
 // ── Server struct ─────────────────────────────────────────────────────────────
 
 /// Wraps the SQLite connection behind Arc<Mutex<_>> so the handler can be
@@ -319,6 +325,18 @@ impl ServerHandler for ContextEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_tokens_nonempty_returns_nonzero() {
+        let n = count_tokens("hello world").unwrap();
+        assert!(n > 0, "expected >0 tokens for 'hello world', got {n}");
+    }
+
+    #[test]
+    fn count_tokens_empty_returns_zero() {
+        let n = count_tokens("").unwrap();
+        assert_eq!(n, 0);
+    }
 
     #[test]
     fn format_capsule_string_includes_pivot_text_and_no_neighbor_marker() {
