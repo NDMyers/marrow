@@ -12,7 +12,7 @@ use axum::{
     Router,
     extract::State,
     response::{
-        IntoResponse, Response,
+        IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
     routing::get,
@@ -66,7 +66,7 @@ pub fn now_ts() -> u64 {
 
 // ── Session stats (in-memory, per-process) ────────────────────────────────────
 
-#[derive(Default, Serialize)]
+#[derive(Default)]
 pub struct SessionStats {
     pub total_requests:       usize,
     pub total_capsule_tokens: usize,
@@ -105,10 +105,7 @@ pub struct AppState {
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 async fn index_handler() -> impl IntoResponse {
-    Response::builder()
-        .header("Content-Type", "text/html; charset=utf-8")
-        .body(INDEX_HTML.to_string())
-        .unwrap()
+    axum::response::Html(INDEX_HTML)
 }
 
 async fn sse_handler(
@@ -147,8 +144,11 @@ struct LifetimeSnapshot {
     reduction_pct:      f64,
 }
 
-async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let sess = state.session.lock().unwrap();
+async fn stats_handler(State(state): State<AppState>) -> axum::response::Response {
+    let sess = match state.session.lock() {
+        Ok(g)  => g,
+        Err(_) => return axum::Json(serde_json::json!({"error": "lock poisoned"})).into_response(),
+    };
     let reduction_pct = if sess.total_file_tokens == 0 {
         0.0
     } else {
@@ -165,10 +165,13 @@ async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {
     drop(sess);
 
     let lifetime = {
-        let conn  = state.db.lock().unwrap();
-        let req   = crate::db::read_stat(&conn, "total_requests").unwrap_or(0);
-        let saved = crate::db::read_stat(&conn, "total_tokens_saved").unwrap_or(0);
-        let file  = crate::db::read_stat(&conn, "total_file_tokens").unwrap_or(0);
+        let conn = match state.db.lock() {
+            Ok(g)  => g,
+            Err(_) => return axum::Json(serde_json::json!({"error": "lock poisoned"})).into_response(),
+        };
+        let req   = crate::db::read_stat(&conn, "total_requests");
+        let saved = crate::db::read_stat(&conn, "total_tokens_saved");
+        let file  = crate::db::read_stat(&conn, "total_file_tokens");
         let rpct  = if file == 0 { 0.0 } else { (saved as f64 / file as f64) * 100.0 };
         LifetimeSnapshot {
             total_requests:     req,
@@ -178,7 +181,7 @@ async fn stats_handler(State(state): State<AppState>) -> impl IntoResponse {
         }
     };
 
-    axum::Json(StatsResponse { session, lifetime })
+    axum::Json(StatsResponse { session, lifetime }).into_response()
 }
 
 // ── Server startup ────────────────────────────────────────────────────────────
@@ -202,20 +205,17 @@ pub async fn start(
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let mut bound_port: Option<u16> = None;
-    let mut listener:   Option<TcpListener> = None;
-
-    for port in 8765u16..=8775 {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        if let Ok(l) = TcpListener::bind(addr).await {
-            bound_port = Some(port);
-            listener   = Some(l);
-            break;
+    let (listener, port) = {
+        let mut result = None;
+        for port in 8765u16..=8775 {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            if let Ok(l) = TcpListener::bind(addr).await {
+                result = Some((l, port));
+                break;
+            }
         }
-    }
-
-    let port     = bound_port.ok_or_else(|| anyhow::anyhow!("No ports available in 8765–8775"))?;
-    let listener = listener.unwrap();
+        result.ok_or_else(|| anyhow::anyhow!("No ports available in 8765–8775"))?
+    };
 
     let _ = fs::create_dir_all(".marrow")
         .and_then(|_| fs::write(".marrow/dashboard.port", port.to_string()));
