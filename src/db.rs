@@ -71,7 +71,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn init_db_sets_busy_timeout() {
+    fn init_db_applies_busy_timeout_pragma() {
         let conn = init_db(":memory:").expect("init_db failed");
         let timeout: i64 = conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
