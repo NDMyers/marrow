@@ -1,7 +1,6 @@
 use std::{
     collections::VecDeque,
     convert::Infallible,
-    fs,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -17,7 +16,7 @@ use axum::{
     },
     routing::get,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
@@ -27,7 +26,7 @@ static INDEX_HTML: &str = include_str!("index.html");
 
 // ── Event types ───────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DashboardEvent {
     ServerStarted {
@@ -56,6 +55,14 @@ pub enum DashboardEvent {
         affected_count: usize,
         ts: u64,
     },
+}
+
+/// Result of the Hub election attempt.
+pub enum HubRole {
+    /// This process bound 127.0.0.1:8765 and owns the Axum server.
+    Hub,
+    /// Port 8765 was already taken — running headless as a Spoke.
+    Spoke,
 }
 
 pub fn now_ts() -> u64 {
@@ -185,43 +192,58 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
     axum::Json(StatsResponse { session, lifetime }).into_response()
 }
 
+async fn emit_handler(
+    State(state): State<AppState>,
+    axum::Json(event): axum::Json<DashboardEvent>,
+) -> impl IntoResponse {
+    if let Ok(mut sess) = state.session.lock() {
+        match &event {
+            DashboardEvent::CapsuleServed { capsule_tokens, file_tokens, .. } => {
+                sess.record_capsule(*capsule_tokens, *file_tokens, event.clone());
+            }
+            other => {
+                sess.recent_events.push_front(other.clone());
+                if sess.recent_events.len() > 50 {
+                    sess.recent_events.pop_back();
+                }
+            }
+        }
+    }
+    let _ = state.tx.send(event);
+    axum::http::StatusCode::OK
+}
+
 // ── Server startup ────────────────────────────────────────────────────────────
 
-/// Spawns the Axum dashboard on the first available port in 8765–8775.
-/// Writes the bound port to `.marrow/dashboard.port`.
-/// Opens the browser if `open_browser` is true.
-/// Returns the bound port.
+/// Attempts to bind strictly to 127.0.0.1:8765.
+///
+/// Returns `HubRole::Hub` if this process won the election and the Axum
+/// server is running in the background. Returns `HubRole::Spoke` if the
+/// port is already taken — the caller continues in headless mode.
 pub async fn start(
     tx:           broadcast::Sender<DashboardEvent>,
     session:      Arc<Mutex<SessionStats>>,
     db:           Arc<Mutex<rusqlite::Connection>>,
-    open_browser: bool,
-) -> Result<u16> {
+    auto_open_ui: bool,
+) -> Result<HubRole> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8765));
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l)  => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            return Ok(HubRole::Spoke);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
     let state = AppState { tx, session, db };
 
     let router = Router::new()
-        .route("/",       get(index_handler))
-        .route("/stream", get(sse_handler))
-        .route("/stats",  get(stats_handler))
+        .route("/",          get(index_handler))
+        .route("/stream",    get(sse_handler))
+        .route("/stats",     get(stats_handler))
+        .route("/api/emit",  axum::routing::post(emit_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
-
-    let (listener, port) = {
-        let mut result = None;
-        for port in 8765u16..=8775 {
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            if let Ok(l) = TcpListener::bind(addr).await {
-                result = Some((l, port));
-                break;
-            }
-        }
-        result.ok_or_else(|| anyhow::anyhow!("No ports available in 8765–8775"))?
-    };
-
-    let _ = fs::create_dir_all(".marrow")
-        .and_then(|_| fs::write(".marrow/dashboard.port", port.to_string()));
-
-    let url = format!("http://localhost:{port}");
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router).await {
@@ -229,13 +251,13 @@ pub async fn start(
         }
     });
 
-    eprintln!("Marrow dashboard → {url}");
+    eprintln!("Marrow dashboard → http://127.0.0.1:8765");
 
-    if open_browser {
-        if let Err(e) = open::that(&url) {
+    if auto_open_ui {
+        if let Err(e) = open::that("http://127.0.0.1:8765") {
             eprintln!("Could not open browser: {e}");
         }
     }
 
-    Ok(port)
+    Ok(HubRole::Hub)
 }
