@@ -7,7 +7,8 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;",
+         PRAGMA synchronous=NORMAL;
+         PRAGMA busy_timeout=5000;",
     )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS repositories (
@@ -63,4 +64,18 @@ pub fn read_stat(conn: &Connection, key: &str) -> i64 {
         |row| row.get::<_, i64>(0),
     )
     .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_db_sets_busy_timeout() {
+        let conn = init_db(":memory:").expect("init_db failed");
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("PRAGMA busy_timeout failed");
+        assert_eq!(timeout, 5000, "busy_timeout should be 5000ms");
+    }
 }
