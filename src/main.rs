@@ -675,12 +675,16 @@ fn cmd_ui() -> Result<()> {
                     .ok()
                     .and_then(|raw| serde_json::from_str(&raw).ok())
                     .unwrap_or_else(|| serde_json::json!({}));
-                cfg["auto_open_ui"] = serde_json::Value::Bool(!auto_open);
-                fs::write(rc_path, serde_json::to_string_pretty(&cfg)?)?;
-                println!(
-                    "Auto-Open is now {}.",
-                    if !auto_open { "ON" } else { "OFF" }
-                );
+                // Read the current value from the fresh cfg, not the stale loop-top snapshot.
+                let current = cfg
+                    .get("auto_open_ui")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(true);
+                cfg["auto_open_ui"] = serde_json::Value::Bool(!current);
+                let tmp = rc_path.with_extension("json.tmp");
+                fs::write(&tmp, serde_json::to_string_pretty(&cfg)?)?;
+                fs::rename(&tmp, rc_path)?;
+                println!("Auto-Open is now {}.", if !current { "ON" } else { "OFF" });
             }
             _ => break,
         }
