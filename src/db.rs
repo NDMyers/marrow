@@ -99,7 +99,6 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
 /// Runs a WAL checkpoint (truncating the WAL file) and an incremental
 /// vacuum pass. Call this after every successful ingestion to keep the
 /// database file from growing unboundedly.
-#[allow(dead_code)] // TODO(Task 4): remove once wired into run_ingestion success path
 pub fn vacuum_and_checkpoint(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA wal_checkpoint(TRUNCATE);
@@ -180,6 +179,16 @@ pub fn read_stat(conn: &Connection, key: &str) -> i64 {
         |row| row.get::<_, i64>(0),
     )
     .unwrap_or(0)
+}
+
+/// FNV-1a hash of raw file bytes — used for change detection in the `files` table.
+pub fn hash_file_content(bytes: &[u8]) -> String {
+    let mut h: u64 = 14_695_981_039_346_656_037;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1_099_511_628_211);
+    }
+    format!("{h:016x}")
 }
 
 /// FNV-1a 64-bit hash of `text`, returned as a 16-character hex string.
@@ -502,6 +511,16 @@ mod tests {
     fn vacuum_and_checkpoint_runs_without_error() {
         let conn = init_db(":memory:").unwrap();
         vacuum_and_checkpoint(&conn).expect("vacuum_and_checkpoint should not error");
+    }
+
+    #[test]
+    fn hash_file_content_is_deterministic() {
+        let a = hash_file_content(b"hello world");
+        let b = hash_file_content(b"hello world");
+        let c = hash_file_content(b"different");
+        assert_eq!(a, b, "same input must produce same hash");
+        assert_ne!(a, c, "different input must produce different hash");
+        assert_eq!(a.len(), 16, "hash must be 16 hex chars");
     }
 
     #[test]

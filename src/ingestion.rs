@@ -375,11 +375,10 @@ pub fn collect_source_files(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Ingest an entire repository: parse all files in parallel, write nodes to DB,
-/// and create intra-repo CALLS edges.
-/// Returns `(symbol_count, calls_edge_count)`.
+/// Ingest an entire repository incrementally: only re-parse files whose
+/// content hash has changed since the last index run. First-time ingest
+/// is a full pass. Returns `(total_symbol_count, calls_edge_count)`.
 pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result<(usize, usize)> {
-    // Canonicalize so strip_prefix succeeds on macOS where /Users is a symlink to /private/var.
     let root_path = root_path
         .canonicalize()
         .unwrap_or_else(|_| root_path.to_path_buf());
@@ -389,25 +388,85 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
         rusqlite::params![repo_id, root_path.to_string_lossy().as_ref()],
     )?;
 
-    let files = collect_source_files(&root_path);
+    // ── Load existing file records ────────────────────────────────────────────
+    let known_files: std::collections::HashMap<String, (i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT file_path, mtime_secs, content_hash FROM files WHERE repo_id = ?1",
+        )?;
+        let rows: Vec<(String, i64, String)> = stmt
+            .query_map(rusqlite::params![repo_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows.into_iter().map(|(path, mtime, hash)| (path, (mtime, hash))).collect()
+    };
 
-    // Parse all files in parallel with rayon
-    let results: Vec<_> = files
-        .par_iter()
+    // ── Walk all source files on disk ─────────────────────────────────────────
+    let disk_files = collect_source_files(&root_path);
+
+    // Gather (abs_path, rel_path, mtime_ns) for every file on disk.
+    // We store nanosecond precision so sub-second writes (common in tests and
+    // fast editors) are correctly detected as mtime changes. The column is
+    // named mtime_secs but holds nanoseconds; SQLite INTEGER is 64-bit so
+    // values through year 2262 fit comfortably.
+    let disk_meta: Vec<(PathBuf, String, i64)> = disk_files
+        .iter()
         .filter_map(|path| {
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            let rel_path = match canonical.strip_prefix(&root_path) {
-                Ok(p)  => p.to_string_lossy().to_string(),
-                Err(_) => {
-                    // File resolved outside the repo root (e.g. via a symlink into
-                    // ~/Library/Application Support/Cursor/...). Skip it to prevent
-                    // absolute paths from being stored as node file_path values, which
-                    // causes incorrect path reconstruction on capsule serve.
-                    return None;
+            let rel = canonical.strip_prefix(&root_path).ok()?.to_string_lossy().to_string();
+            let mtime = std::fs::metadata(path).ok()?.modified().ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            Some((path.clone(), rel, mtime))
+        })
+        .collect();
+
+    // Determine which files need content-checking (mtime changed or new)
+    let candidates: Vec<(PathBuf, String, i64)> = disk_meta
+        .iter()
+        .filter(|(_, rel, mtime)| {
+            match known_files.get(rel) {
+                None => true,                           // new file
+                Some((km, _)) => km != mtime,          // mtime changed
+            }
+        })
+        .cloned()
+        .collect();
+
+    // Read + hash candidates; keep only those whose content hash changed.
+    // Returns (rel_path, abs_path, mtime, content_hash) for files to re-parse.
+    let changed: Vec<(String, PathBuf, i64, String)> = candidates
+        .par_iter()
+        .filter_map(|(path, rel, mtime)| {
+            let bytes = std::fs::read(path).ok()?;
+            let new_hash = crate::db::hash_file_content(&bytes);
+            // If known, compare hash; if hash is same, only mtime drifted (e.g. `touch`)
+            if let Some((_, known_hash)) = known_files.get(rel) {
+                if *known_hash == new_hash {
+                    return None; // content identical — skip re-parse, just update mtime
                 }
-            };
+            }
+            Some((rel.clone(), path.clone(), *mtime, new_hash))
+        })
+        .collect();
+
+    // Collect rel_paths of mtime-only-changed files (candidates not in `changed`)
+    let changed_rels: std::collections::HashSet<&str> =
+        changed.iter().map(|(r, _, _, _)| r.as_str()).collect();
+    let mtime_only: Vec<(String, i64)> = candidates
+        .iter()
+        .filter(|(_, rel, _)| !changed_rels.contains(rel.as_str()))
+        .map(|(_, rel, mtime)| (rel.clone(), *mtime))
+        .collect();
+
+    // ── Parallel parse of changed files ──────────────────────────────────────
+    let parsed: Vec<(String, String, Vec<Symbol>, String, i64)> = changed
+        .par_iter()
+        .filter_map(|(rel, path, mtime, hash)| {
             match parse_file(path) {
-                Ok((lang, symbols)) => Some((rel_path, lang, symbols)),
+                Ok((lang, symbols)) => Some((rel.clone(), lang, symbols, hash.clone(), *mtime)),
                 Err(e) => {
                     eprintln!("Warning: skipping {}: {}", path.display(), e);
                     None
@@ -416,89 +475,129 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
         })
         .collect();
 
-    let indexed_nodes: std::collections::HashSet<(String, String)> = results
-        .iter()
-        .flat_map(|(file_path, _lang, symbols)| {
-            symbols
-                .iter()
-                .map(move |sym| (sym.name.clone(), file_path.clone()))
-        })
+    // ── Detect removed files ──────────────────────────────────────────────────
+    let disk_rels: std::collections::HashSet<&str> =
+        disk_meta.iter().map(|(_, r, _)| r.as_str()).collect();
+    let removed_rels: Vec<String> = known_files
+        .keys()
+        .filter(|fp| !disk_rels.contains(fp.as_str()))
+        .cloned()
         .collect();
 
-    let existing_nodes: Vec<(String, String)> = conn
-        .prepare("SELECT symbol_name, file_path FROM nodes WHERE repo_id = ?1")?
-        .query_map(rusqlite::params![repo_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
-    let removed_nodes: Vec<(String, String)> = existing_nodes
-        .into_iter()
-        .filter(|node| !indexed_nodes.contains(node))
-        .collect();
-
-    // Batch insert into SQLite (single-threaded, inside a transaction)
+    // ── Single transaction: delete stale, insert fresh ────────────────────────
     let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM edges
-         WHERE source_id IN (SELECT id FROM nodes WHERE repo_id = ?1)
-            OR target_id IN (SELECT id FROM nodes WHERE repo_id = ?1)",
-        rusqlite::params![repo_id],
-    )?;
-    tx.execute(
-        "DELETE FROM nodes WHERE repo_id = ?1",
-        rusqlite::params![repo_id],
-    )?;
-    let mut count = 0;
-    for (file_path, lang, symbols) in &results {
+
+    // Remove nodes + files record for deleted files
+    for file_path in &removed_rels {
+        let syms: Vec<String> = {
+            let mut s = conn.prepare(
+                "SELECT symbol_name FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
+            )?;
+            let collected: Vec<String> = s
+                .query_map(rusqlite::params![repo_id, file_path], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            collected
+        };
+        for sym in &syms {
+            crate::db::mark_deleted_observation_stale(&tx, repo_id, sym, file_path)?;
+        }
+        tx.execute(
+            "DELETE FROM edges WHERE source_id IN (
+                SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)
+             OR target_id IN (
+                SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)",
+            rusqlite::params![repo_id, file_path],
+        )?;
+        tx.execute(
+            "DELETE FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
+            rusqlite::params![repo_id, file_path],
+        )?;
+        tx.execute(
+            "DELETE FROM files WHERE repo_id = ?1 AND file_path = ?2",
+            rusqlite::params![repo_id, file_path],
+        )?;
+    }
+
+    // Remove old nodes+edges for changed files (will be replaced)
+    for (file_path, _, _, _, _) in &parsed {
+        tx.execute(
+            "DELETE FROM edges WHERE source_id IN (
+                SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)
+             OR target_id IN (
+                SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)",
+            rusqlite::params![repo_id, file_path],
+        )?;
+        tx.execute(
+            "DELETE FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
+            rusqlite::params![repo_id, file_path],
+        )?;
+    }
+
+    // Insert new nodes for changed files
+    for (file_path, lang, symbols, hash, mtime) in &parsed {
         for sym in symbols {
             let node_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
             tx.execute(
-                "INSERT OR REPLACE INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+                "INSERT OR REPLACE INTO nodes \
+                 (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![node_id, repo_id, file_path, lang, sym.name, sym.symbol_type, sym.raw_text],
+                rusqlite::params![
+                    node_id, repo_id, file_path, lang,
+                    sym.name, sym.symbol_type, sym.raw_text
+                ],
             )?;
-
-            // Phase 3 — Staleness detection: if the node's raw_text changed,
-            // mark any linked observations stale so callers know to re-verify.
             let new_hash = crate::db::hash_raw_text(&sym.raw_text);
             crate::db::mark_stale_observations(&tx, repo_id, &sym.name, file_path, &new_hash)?;
-
-            count += 1;
         }
+        // Upsert files record for changed file
+        tx.execute(
+            "INSERT OR REPLACE INTO files (repo_id, file_path, mtime_secs, content_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![repo_id, file_path, mtime, hash],
+        )?;
     }
 
-    for (symbol_name, file_path) in removed_nodes {
-        crate::db::mark_deleted_observation_stale(&tx, repo_id, &symbol_name, &file_path)?;
+    // Update mtime-only files (content unchanged, mtime drifted)
+    for (rel, mtime) in &mtime_only {
+        tx.execute(
+            "UPDATE files SET mtime_secs = ?1 WHERE repo_id = ?2 AND file_path = ?3",
+            rusqlite::params![mtime, repo_id, rel],
+        )?;
     }
 
-    // ── Build intra-repo CALLS edges ─────────────────────────────────────
-    // 1. Build a lookup: symbol_name → Vec<node_id> for this repo
+    tx.commit()?;
+
+    // ── Build CALLS edges for changed files ───────────────────────────────────
+    // Load full name→ids map for this repo (needed for resolution)
     let mut name_to_ids: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    for (file_path, _lang, symbols) in &results {
-        for sym in symbols {
-            let node_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
-            name_to_ids
-                .entry(sym.name.clone())
-                .or_default()
-                .push(node_id);
-        }
+    {
+        let mut stmt = conn.prepare(
+            "SELECT symbol_name, id FROM nodes WHERE repo_id = ?1",
+        )?;
+        stmt.query_map(rusqlite::params![repo_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .for_each(|(name, id)| name_to_ids.entry(name).or_default().push(id));
     }
 
-    // 2. For each symbol, extract callees and insert CALLS edges
-    let mut calls_edge_count: usize = 0;
-    for (file_path, lang, symbols) in &results {
+    let edge_tx = conn.unchecked_transaction()?;
+    let mut calls_edge_count = 0usize;
+    for (file_path, lang, symbols, _, _) in &parsed {
         for sym in symbols {
             let callees = extract_calls_from_symbol(&sym.raw_text, lang);
             let source_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
             for callee_name in &callees {
-                // Skip self-calls
                 if callee_name == &sym.name {
                     continue;
                 }
                 if let Some(target_ids) = name_to_ids.get(callee_name.as_str()) {
                     for target_id in target_ids {
-                        tx.execute(
-                            "INSERT OR IGNORE INTO edges (source_id, target_id, relationship_type) \
+                        edge_tx.execute(
+                            "INSERT OR IGNORE INTO edges \
+                             (source_id, target_id, relationship_type) \
                              VALUES (?1, ?2, 'CALLS')",
                             rusqlite::params![source_id, target_id],
                         )?;
@@ -508,10 +607,16 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
             }
         }
     }
+    edge_tx.commit()?;
 
-    tx.commit()?;
+    // Total node count across the whole repo (unchanged + newly parsed)
+    let total: usize = conn.query_row(
+        "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
+        rusqlite::params![repo_id],
+        |row| row.get::<_, i64>(0),
+    )? as usize;
 
-    Ok((count, calls_edge_count))
+    Ok((total, calls_edge_count))
 }
 
 /// Combined ingestion pipeline: parse all files in `root_path` under `repo_id`,
@@ -523,6 +628,7 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
 pub fn run_ingestion(conn: &Connection, repo_id: &str, root_path: &Path) -> Result<(usize, usize)> {
     let (symbols, calls_edges) = ingest_repo(conn, repo_id, root_path)?;
     let import_edges = resolve_cross_repo_edges(conn)?;
+    crate::db::vacuum_and_checkpoint(conn)?;
     Ok((symbols, calls_edges + import_edges))
 }
 
@@ -820,6 +926,83 @@ function foo() {
         let small = "def foo\n  42\nend\n".to_string();
         let result = cap_raw_text(small.clone());
         assert_eq!(result, small, "small raw_text should be unchanged");
+    }
+
+    #[test]
+    fn second_ingest_skips_unchanged_files() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let dir = std::env::temp_dir().join("marrow_test_incremental_skip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("a.py"), "def alpha():\n    pass\n").unwrap();
+        std::fs::write(dir.join("b.py"), "def beta():\n    pass\n").unwrap();
+
+        // First ingest
+        ingest_repo(&conn, "test", &dir).unwrap();
+
+        // Count files records — should have 2
+        let file_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE repo_id = 'test'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(file_count, 2, "files table should have 2 entries after first ingest");
+
+        // Second ingest without changes — node count must be identical
+        let (syms, _) = ingest_repo(&conn, "test", &dir).unwrap();
+        assert_eq!(syms, 2, "second ingest should report same node count");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn modified_file_is_reindexed_on_second_ingest() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let dir = std::env::temp_dir().join("marrow_test_incremental_modify");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("a.py"), "def alpha():\n    pass\n").unwrap();
+        ingest_repo(&conn, "test", &dir).unwrap();
+
+        // Write new content (different hash) — force mtime change too
+        std::fs::write(dir.join("a.py"), "def alpha():\n    pass\ndef beta():\n    pass\n").unwrap();
+        let (syms, _) = ingest_repo(&conn, "test", &dir).unwrap();
+        assert_eq!(syms, 2, "modified file should result in 2 symbols (alpha + beta)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_file_nodes_removed_on_incremental_ingest() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let dir = std::env::temp_dir().join("marrow_test_incremental_delete2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("keep.py"), "def keeper():\n    pass\n").unwrap();
+        std::fs::write(dir.join("gone.py"), "def goner():\n    pass\n").unwrap();
+        ingest_repo(&conn, "test", &dir).unwrap();
+
+        std::fs::remove_file(dir.join("gone.py")).unwrap();
+        ingest_repo(&conn, "test", &dir).unwrap();
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test' AND file_path = 'gone.py'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0, "nodes for deleted file should be removed");
+
+        let files_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE repo_id = 'test' AND file_path = 'gone.py'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(files_count, 0, "files record for deleted file should be removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
