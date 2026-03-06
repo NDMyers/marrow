@@ -565,7 +565,13 @@ impl ServerHandler for ContextEngine {
         let db = Arc::clone(&self.db);
 
         async move {
-            let init_notice = try_auto_init().await;
+            // Skip auto-init when the agent is explicitly calling workspace_setup —
+            // that tool handles its own initialization messaging.
+            let init_notice = if request.name.as_ref() != "workspace_setup" {
+                try_auto_init().await
+            } else {
+                None
+            };
             let args = request.arguments.unwrap_or_default();
 
             let mut result = match request.name.as_ref() {
@@ -1744,7 +1750,7 @@ fn cmd_integrate() -> Result<()> {
         return Ok(());
     }
 
-    // Scope selection (carried over from add-skill)
+    // Scope selection: Global writes to ~/.agent/rules; Project writes to .agent/rules in CWD
     let scope_idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Installation scope for optimization rules")
         .items(&["Global (recommended — works in every project)", "Project (current directory only)"])
@@ -1752,7 +1758,7 @@ fn cmd_integrate() -> Result<()> {
         .interact()?;
     let scope = if scope_idx == 0 { skills::Scope::Global } else { skills::Scope::Project };
 
-    // Method selection (carried over from add-skill)
+    // Method selection: WriteFile copies the content; Symlink points to ~/.marrow/marrow-optimization.md
     let method_idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Installation method for optimization rules")
         .items(&["Write File (recommended)", "Symlink (auto-updates on Marrow upgrades)"])
