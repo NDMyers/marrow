@@ -266,27 +266,38 @@ impl ContextEngine {
 /// If not, creates it, writes project-scope rules files, and returns a notice
 /// string to prepend to the tool response. Non-fatal: errors are logged to stderr
 /// and `None` is returned so the tool call proceeds unblocked.
+///
+/// Note: there is a benign TOCTOU between the `.exists()` check and `create_dir_all`.
+/// This is acceptable for a single-user local server; `write_workspace_rules` is
+/// idempotent so a double-write from a concurrent call causes no harm.
 async fn try_auto_init() -> Option<String> {
     if std::path::Path::new(".marrow").exists() {
         return None;
     }
-    let result = tokio::task::spawn_blocking(|| {
+    let result = tokio::task::spawn_blocking(|| -> anyhow::Result<()> {
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        if let Err(e) = std::fs::create_dir_all(root.join(".marrow")) {
-            eprintln!("[MARROW AUTO-INIT] Warning: could not create .marrow/: {e}");
-        }
+        std::fs::create_dir_all(root.join(".marrow"))
+            .map_err(|e| {
+                eprintln!("[MARROW AUTO-INIT] Warning: could not create .marrow/: {e}");
+                e
+            })?;
         if let Err(e) = write_workspace_rules(&root) {
             eprintln!("[MARROW AUTO-INIT] Warning: could not write workspace rules: {e}");
         }
         if let Err(e) = write_vscode_mcp_config(&root) {
             eprintln!("[MARROW AUTO-INIT] Warning: could not write .vscode/mcp.json: {e}");
         }
+        Ok(())
     })
     .await;
 
-    if let Err(e) = result {
-        eprintln!("[MARROW AUTO-INIT] spawn_blocking failed: {e}");
-        return None;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return None, // create_dir_all failed, already logged
+        Err(e) => {
+            eprintln!("[MARROW AUTO-INIT] spawn_blocking failed: {e}");
+            return None;
+        }
     }
 
     Some(
@@ -1273,12 +1284,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_init_creates_marrow_dir() {
+    async fn auto_init_fires_when_marrow_absent_then_skips() {
         let tmp = tempfile::tempdir().unwrap();
-        let marker = tmp.path().join(".marrow");
-        assert!(!marker.exists());
-        std::fs::create_dir_all(&marker).unwrap();
-        assert!(marker.is_dir());
+        // Point the process CWD at our temp dir so try_auto_init writes there.
+        // NOTE: set_current_dir is process-global; this test must not run in parallel
+        // with other tests that depend on CWD.
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        // First call: .marrow/ absent → should return Some(notice)
+        let notice = try_auto_init().await;
+        assert!(notice.is_some(), "expected Some notice on first call");
+        let notice_str = notice.unwrap();
+        assert!(
+            notice_str.contains("[MARROW AUTO-INIT]"),
+            "notice should contain MARROW AUTO-INIT tag"
+        );
+        assert!(tmp.path().join(".marrow").is_dir(), ".marrow/ should exist after init");
+
+        // Second call: .marrow/ now exists → should return None
+        let second = try_auto_init().await;
+        assert!(second.is_none(), "expected None on second call when .marrow/ exists");
+
+        // Restore CWD
+        std::env::set_current_dir(original).unwrap();
     }
 }
 
