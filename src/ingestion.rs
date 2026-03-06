@@ -644,42 +644,91 @@ pub fn run_ingestion(conn: &Connection, repo_id: &str, root_path: &Path) -> Resu
 /// Scans node raw_text for import-like patterns and creates IMPORTS edges
 /// when the imported symbol exists in another repo's nodes.
 pub fn resolve_cross_repo_edges(conn: &Connection) -> Result<usize> {
+    // Load all nodes once
     let mut stmt = conn.prepare("SELECT id, repo_id, raw_text, language FROM nodes")?;
     let rows: Vec<(String, String, String, String)> = stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
         .filter_map(|r| r.ok())
         .collect();
 
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    // Pass 1 — collect all imports in memory
+    // import_name -> Vec<(source_id, source_repo_id)>
+    let mut import_map: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    for (source_id, source_repo, raw_text, lang) in &rows {
+        for name in extract_imports(raw_text, lang) {
+            import_map
+                .entry(name)
+                .or_default()
+                .push((source_id.clone(), source_repo.clone()));
+        }
+    }
+
+    if import_map.is_empty() {
+        return Ok(0);
+    }
+
+    // Pass 2 — single bulk query per 999-name chunk
+    // target_name -> Vec<(node_id, repo_id)>
+    let mut target_map: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+
+    let all_names: Vec<&String> = import_map.keys().collect();
+    for chunk in all_names.chunks(999) {
+        let placeholders = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT symbol_name, id, repo_id FROM nodes WHERE symbol_name IN ({placeholders})"
+        );
+        let params: Vec<rusqlite::types::Value> = chunk
+            .iter()
+            .map(|s| rusqlite::types::Value::Text(s.to_string()))
+            .collect();
+        conn.prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .for_each(|(name, id, repo)| {
+                target_map.entry(name).or_default().push((id, repo));
+            });
+    }
+
+    // Pass 3 — resolve edges in memory, insert in one transaction
     let tx = conn.unchecked_transaction()?;
     let mut edge_count = 0;
 
-    for (source_id, source_repo, raw_text, lang) in &rows {
-        let imports = extract_imports(raw_text, lang);
-        for imported_name in imports {
-            // Look for this symbol in OTHER repos
-            let mut find = conn.prepare_cached(
-                "SELECT id FROM nodes WHERE symbol_name = ?1 AND repo_id != ?2 ORDER BY repo_id, file_path, id",
-            )?;
-            let target_ids: Vec<String> = find
-                .query_map(rusqlite::params![imported_name, source_repo], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .filter_map(|r| r.ok())
+    for (import_name, sources) in &import_map {
+        let Some(targets) = target_map.get(import_name) else {
+            continue;
+        };
+        for (source_id, source_repo) in sources {
+            // Only cross-repo targets
+            let cross_repo: Vec<&String> = targets
+                .iter()
+                .filter(|(_, target_repo)| target_repo != source_repo)
+                .map(|(id, _)| id)
                 .collect();
-
-            if target_ids.len() == 1 {
-                let target_id = &target_ids[0];
+            // Skip ambiguous (multiple targets across repos)
+            if cross_repo.len() == 1 {
                 tx.execute(
                     "INSERT OR IGNORE INTO edges (source_id, target_id, relationship_type)
                      VALUES (?1, ?2, 'IMPORTS')",
-                    rusqlite::params![source_id, target_id],
+                    rusqlite::params![source_id, cross_repo[0]],
                 )?;
                 edge_count += 1;
             }
         }
     }
+
     tx.commit()?;
     Ok(edge_count)
 }
