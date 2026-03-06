@@ -140,7 +140,7 @@ pub fn install_skill(agent: Agent, scope: Scope, method: Method, home: &Path) ->
 // ── File-system helpers ───────────────────────────────────────────────────────
 
 /// Low-level filesystem primitive. Only call via [`install_skill`]. The `central` parameter is only meaningful for [`Method::Symlink`].
-pub(crate) fn install(target: &Path, method: Method, central: &Path) -> Result<()> {
+fn install(target: &Path, method: Method, central: &Path) -> Result<()> {
     // Ensure parent directory exists (bare-root files like .clinerules have no parent dir to create).
     if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
