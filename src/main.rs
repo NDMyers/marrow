@@ -2,12 +2,14 @@ mod db;
 mod dashboard;
 mod ingestion;
 mod retrieval;
+mod skills;
+mod watcher;
 
 use std::{
     fmt::Write as FmtWrite,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
 
@@ -27,6 +29,34 @@ use rmcp::{
 
 const DASHBOARD_EMIT_URL: &str = "http://127.0.0.1:8765/api/emit";
 
+/// Stores the MCP client's name captured during the `initialize` handshake.
+/// Safe to use as a singleton because stdio spawns one process per session.
+static CLIENT_NAME: OnceLock<String> = OnceLock::new();
+
+/// Appends a timestamped error line to `~/.marrow/debug.log`.
+/// All failures are silently swallowed so callers never panic or write to stdout.
+fn log_emit_error(msg: &str) {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let Some(home) = dirs::home_dir() else { return };
+    let log_dir = home.join(".marrow");
+    let _ = fs::create_dir_all(&log_dir);
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("debug.log"))
+    {
+        let _ = writeln!(file, "[{ts}] telemetry POST error: {msg}");
+    }
+}
+
 /// Milliseconds to wait after the Axum server spawns before sending the
 /// first ServerStarted event. The listener is ready almost instantly but
 /// there is a brief window between `tokio::spawn` returning and the first
@@ -37,8 +67,9 @@ const DASHBOARD_WARMUP_MS: u64 = 50;
 // ── Capsule formatting ────────────────────────────────────────────────────────
 
 /// Format a ContextCapsule as the plain-text string sent to the LLM.
-/// Extracted from `call_tool` so the benchmark subcommand can reuse it.
-fn format_capsule_string(capsule: &retrieval::ContextCapsule) -> String {
+/// Retained for tests; production code uses `CapsuleResult::optimized_text`.
+#[cfg(test)]
+pub(crate) fn format_capsule_string(capsule: &retrieval::ContextCapsule) -> String {
     let mut out = String::new();
     writeln!(
         out,
@@ -157,7 +188,7 @@ fn run_benchmark(
     symbol:  &str,
     repo_id: &str,
 ) -> anyhow::Result<()> {
-    // ── Step 1: resolve file path ────────────────────────────────────
+    // ── Step 1: resolve file path for display ────────────────────────
     let file_path: String = conn
         .query_row(
             "SELECT file_path FROM nodes \
@@ -169,38 +200,15 @@ fn run_benchmark(
             anyhow::anyhow!("Symbol '{}' not found in repo '{}'.", symbol, repo_id)
         })?;
 
-    // ── Step 2: resolve repo root and read the full source file ──────
-    let root_path: String = conn
-        .query_row(
-            "SELECT root_path FROM repositories WHERE id = ?1",
-            rusqlite::params![repo_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Repo '{}' not found in the database. Has it been ingested?",
-                repo_id
-            )
-        })?;
+    // ── Step 2: build capsule (original_text populated by the engine) ─
+    let result = retrieval::get_context_capsule(conn, symbol, repo_id)?;
 
-    let abs_path = PathBuf::from(&root_path).join(&file_path);
-    let file_content = fs::read_to_string(&abs_path)
-        .with_context(|| format!(
-            "Could not read source file at {}. \
-             Check the file exists and is readable, or re-ingest the repo.",
-            abs_path.display()
-        ))?;
+    // ── Step 3: count tokens ──────────────────────────────────────────
+    let file_tokens    = count_tokens(&result.original_text)?;
+    let capsule_tokens = count_tokens(&result.optimized_text)?;
 
-    // ── Step 3: build and format the capsule ─────────────────────────
-    let capsule = retrieval::get_context_capsule(conn, symbol, repo_id)?;
-    let capsule_str = format_capsule_string(&capsule);
-
-    // ── Step 4: count tokens ─────────────────────────────────────────
-    let file_tokens    = count_tokens(&file_content)?;
-    let capsule_tokens = count_tokens(&capsule_str)?;
-
-    // ── Step 5: print table ──────────────────────────────────────────
-    println!(
+    // ── Step 4: print table ───────────────────────────────────────────
+    eprintln!(
         "{}",
         format_benchmark_table(symbol, repo_id, &file_path, file_tokens, capsule_tokens)
     );
@@ -215,7 +223,6 @@ fn run_benchmark(
 #[derive(Clone)]
 struct ContextEngine {
     db:          Arc<Mutex<rusqlite::Connection>>,
-    client_name: Arc<Mutex<String>>,
     http_client: reqwest::Client,
 }
 
@@ -223,13 +230,11 @@ impl ContextEngine {
     #[allow(dead_code)]
     fn new(
         db_path:     &str,
-        client_name: Arc<Mutex<String>>,
         http_client: reqwest::Client,
     ) -> Result<Self> {
         let conn = db::init_db(db_path)?;
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
-            client_name,
             http_client,
         })
     }
@@ -292,10 +297,8 @@ impl ServerHandler for ContextEngine {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<InitializeResult, rmcp::ErrorData>> + Send + '_ {
-        // Capture the connecting client's name from the MCP handshake.
-        if let Ok(mut name) = self.client_name.lock() {
-            *name = request.client_info.name.clone();
-        }
+        // Capture the connecting client's name from the MCP handshake (best-effort).
+        let _ = CLIENT_NAME.set(request.client_info.name.clone());
 
         // Delegate to the default peer-info storage behaviour and return our ServerInfo.
         if context.peer.peer_info().is_none() {
@@ -324,9 +327,13 @@ impl ServerHandler for ContextEngine {
         let tools = vec![
             Tool::new(
                 "get_context_capsule",
-                "Fetch the full source of a pivot symbol plus condensed signatures of its \
-                 depth-1 neighbors (callers, callees, imports). Returns a Context Capsule \
-                 optimised for LLM consumption.",
+                "CRITICAL: ALWAYS use this tool first when asked to explain, modify, or \
+                 interact with any code symbol or file. NEVER use default file-reading tools \
+                 (read_file, cat, grep, etc.) as a substitute. This returns a highly optimized \
+                 AST graph capsule — the pivot symbol's full source plus condensed signatures \
+                 of every depth-1 caller, callee, and import — saving tokens and providing \
+                 the exact dependency context you need. If the repo is not yet indexed, run \
+                 ingest_repo first, then retry.",
                 Self::schema(json!({
                     "type": "object",
                     "properties": {
@@ -344,9 +351,11 @@ impl ServerHandler for ContextEngine {
             ),
             Tool::new(
                 "analyze_impact",
-                "Map the blast radius of a proposed change. Recursively traverses the \
-                 dependency graph to find every transitive caller/importer across all \
-                 repos up to depth 10.",
+                "MANDATORY: Use this tool BEFORE proposing any code changes, refactors, or \
+                 deletions. It recursively maps the blast radius of a proposed change by \
+                 traversing the dependency graph to find every transitive caller/importer \
+                 across all repos up to depth 10. Skipping this step risks breaking \
+                 downstream dependents you cannot see.",
                 Self::schema(json!({
                     "type": "object",
                     "properties": {
@@ -364,9 +373,12 @@ impl ServerHandler for ContextEngine {
             ),
             Tool::new(
                 "ingest_repo",
-                "Parse a local repository with tree-sitter and populate (or refresh) \
-                 the AST dependency graph in the SQLite database. Run this before \
-                 querying a repo for the first time, or after significant code changes.",
+                "Use this to build or refresh the AST dependency graph for a repository. \
+                 Run immediately if any other Marrow tool fails with an empty or missing \
+                 database error, or when the user asks you to map/index the codebase. \
+                 After ingestion completes, resume the original task using get_context_capsule \
+                 or analyze_impact. If the path is outside the current workspace, the server \
+                 will intercept and require explicit user confirmation via `user_confirmed: true`.",
                 Self::schema(json!({
                     "type": "object",
                     "properties": {
@@ -377,9 +389,115 @@ impl ServerHandler for ContextEngine {
                         "root_path": {
                             "type": "string",
                             "description": "Absolute or relative path to the repository root on disk."
+                        },
+                        "user_confirmed": {
+                            "type": "boolean",
+                            "description": "Set to true only after the user has explicitly granted permission to index a path outside the current workspace. Defaults to false."
                         }
                     },
                     "required": ["repo_id", "root_path"]
+                })),
+            ),
+            Tool::new(
+                "save_observation",
+                "Save a session memory (observation) about a specific code symbol. \
+                 The observation is hash-linked to the symbol's current AST node so \
+                 Marrow can automatically flag it as stale if the code changes after \
+                 the next ingest_repo run. Use the relative file path as stored in the \
+                 graph (e.g. 'src/main.rs').",
+                Self::schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "symbol_name": {
+                            "type": "string",
+                            "description": "Exact name of the symbol to link the memory to (e.g. 'ingest_repo')."
+                        },
+                        "filepath": {
+                            "type": "string",
+                            "description": "Relative file path of the symbol as stored in the graph (e.g. 'src/ingestion.rs')."
+                        },
+                        "observation": {
+                            "type": "string",
+                            "description": "The observation or memory text to save."
+                        }
+                    },
+                    "required": ["symbol_name", "filepath", "observation"]
+                })),
+            ),
+            Tool::new(
+                "get_session_context",
+                "Retrieve stored session memories (observations) for a symbol or file. \
+                 Memories that have gone stale — because the underlying code changed \
+                 since they were recorded — are returned with a prominent warning so \
+                 the caller knows to re-verify them before trusting.",
+                Self::schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "symbol_name": {
+                            "type": "string",
+                            "description": "Filter memories by this symbol name."
+                        },
+                        "filepath": {
+                            "type": "string",
+                            "description": "Filter memories by this relative file path."
+                        }
+                    }
+                })),
+            ),
+            Tool::new(
+                "get_skeleton",
+                "Return a token-efficient Markdown map of the repository's high-level \
+                 architecture: every function, class, struct, trait, and interface grouped \
+                 by file. Use this as your first call when asked to understand or navigate \
+                 an unfamiliar codebase. Hard-capped at 2,000 symbols for token safety; \
+                 drill into specific files with get_context_capsule afterwards.",
+                Self::schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "target_dir": {
+                            "type": "string",
+                            "description": "Optional path prefix to restrict the skeleton to a \
+                                            subdirectory (e.g. 'src/api'). Omit to map the entire repo."
+                        }
+                    }
+                })),
+            ),
+            Tool::new(
+                "run_pipeline",
+                "PRIMARY TOOL. ALWAYS USE THIS FIRST. Pass your goal/intent, and Marrow \
+                 will auto-detect and return the optimal context (skeleton, capsule, or \
+                 impact graph). Use intent 'analyze_repo' to map the full codebase, \
+                 'explore_symbol' to understand a specific symbol, or 'refactor_symbol' \
+                 to assess the blast radius of a change.",
+                Self::schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "intent": {
+                            "type": "string",
+                            "description": "Must be exactly 'analyze_repo', 'explore_symbol', or 'refactor_symbol'."
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": "The symbol name or directory path relevant to the intent. \
+                                            Required for explore_symbol and refactor_symbol."
+                        },
+                        "repo_id": {
+                            "type": "string",
+                            "description": "The repository identifier. Auto-detected if omitted."
+                        }
+                    },
+                    "required": ["intent"]
+                })),
+            ),
+            Tool::new(
+                "workspace_setup",
+                "CRITICAL: Run this tool when the user asks you to initialize, set up, or \
+                 configure Marrow for the workspace. It generates the necessary agent \
+                 instruction files (.cursorrules and .clinerules) that enforce the \
+                 Marrow-First workflow protocol for all future sessions.",
+                Self::schema(json!({
+                    "type": "object",
+                    "properties": {}
                 })),
             ),
         ];
@@ -404,44 +522,61 @@ impl ServerHandler for ContextEngine {
                 "get_context_capsule" => {
                     let symbol_name  = Self::require_str(&args, "symbol_name")?.to_string();
                     let repo_id      = Self::require_str(&args, "repo_id")?.to_string();
-                    let client_name  = self.client_name.lock()
-                                           .map(|g| g.clone())
-                                           .unwrap_or_else(|_| "Unknown Client".to_string());
+                    let client_name  = CLIENT_NAME.get()
+                                           .cloned()
+                                           .unwrap_or_else(|| "Unknown Agent".to_string());
 
                     let sym_for_event  = symbol_name.clone();
                     let repo_for_event = repo_id.clone();
 
-                    let (out, capsule_tokens, file_tokens, file_path) =
+                    let (out, original_text, capsule_tokens, file_tokens, abs_file_path, auto_indexed) =
                         tokio::task::spawn_blocking(move || {
                             let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
 
-                            let capsule      = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id)?;
-                            let file_path    = capsule.pivot.file_path.clone();
-                            let out          = format_capsule_string(&capsule);
-                            let capsule_toks = count_tokens(&out)?;
+                            let auto_indexed = if !db::is_workspace_indexed(&conn)? {
+                                let cwd = std::env::current_dir()
+                                    .unwrap_or_else(|_| PathBuf::from("."));
+                                ingestion::run_ingestion(&conn, &repo_id, &cwd)?;
+                                true
+                            } else {
+                                false
+                            };
 
-                            // Count full-file tokens for the savings delta
-                            let file_toks: usize = conn
+                            let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id)?;
+
+                            // Both token counts use the same len()/4 heuristic so
+                            // telemetry and the compare endpoint are always in sync.
+                            let full_file_tokens  = capsule_result.original_text.len() / 4;
+                            let optimized_tokens  = capsule_result.optimized_text.len() / 4;
+                            let original_text_out = capsule_result.original_text;
+                            let out               = capsule_result.optimized_text;
+
+                            // Derive the absolute pivot file path for the dashboard event.
+                            let abs_path_str: String = conn
                                 .query_row(
-                                    "SELECT root_path FROM repositories WHERE id = ?1",
-                                    rusqlite::params![repo_id],
-                                    |row| row.get::<_, String>(0),
+                                    "SELECT n.file_path, r.root_path \
+                                     FROM nodes n \
+                                     JOIN repositories r ON r.id = n.repo_id \
+                                     WHERE n.symbol_name = ?1 AND n.repo_id = ?2 LIMIT 1",
+                                    rusqlite::params![symbol_name, repo_id],
+                                    |row| {
+                                        let fp: String = row.get(0)?;
+                                        let rp: String = row.get(1)?;
+                                        Ok(std::path::PathBuf::from(&rp)
+                                            .join(&fp)
+                                            .to_string_lossy()
+                                            .to_string())
+                                    },
                                 )
-                                .ok()
-                                .and_then(|root| {
-                                    let abs = std::path::PathBuf::from(&root).join(&file_path);
-                                    std::fs::read_to_string(abs).ok()
-                                })
-                                .and_then(|content| count_tokens(&content).ok())
-                                .unwrap_or(0);
+                                .unwrap_or_else(|_| symbol_name.clone());
 
                             // Persist to lifetime stats
-                            let saved = file_toks.saturating_sub(capsule_toks) as i64;
+                            let saved = (full_file_tokens as i64).saturating_sub(optimized_tokens as i64);
                             let _ = db::increment_stat(&conn, "total_requests",     1);
-                            let _ = db::increment_stat(&conn, "total_file_tokens",  file_toks as i64);
+                            let _ = db::increment_stat(&conn, "total_file_tokens",  full_file_tokens as i64);
                             let _ = db::increment_stat(&conn, "total_tokens_saved", saved);
 
-                            Ok::<_, anyhow::Error>((out, capsule_toks, file_toks, file_path))
+                            Ok::<_, anyhow::Error>((out, original_text_out, optimized_tokens, full_file_tokens, abs_path_str, auto_indexed))
                         })
                         .await
                         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -452,21 +587,41 @@ impl ServerHandler for ContextEngine {
                     let event = DashboardEvent::CapsuleServed {
                         symbol:         sym_for_event,
                         repo:           repo_for_event,
-                        file:           file_path,
+                        file:           abs_file_path,
                         capsule_tokens,
                         file_tokens,
                         tokens_saved,
                         origin:         client_name,
                         ts:             dashboard::now_ts(),
+                        original_text:  Some(original_text),
+                        optimized_text: Some(out.clone()),
                     };
                     let http_client = self.http_client.clone();
                     tokio::spawn(async move {
-                        let _ = http_client
+                        match http_client
                             .post(DASHBOARD_EMIT_URL)
                             .json(&event)
                             .send()
-                            .await;
+                            .await
+                        {
+                            Err(e) => log_emit_error(&e.to_string()),
+                            Ok(resp) if !resp.status().is_success() => {
+                                let status = resp.status();
+                                let body = resp.text().await.unwrap_or_default();
+                                log_emit_error(&format!("status={status} body={body}"));
+                            }
+                            Ok(_) => {}
+                        }
                     });
+
+                    let out = if auto_indexed {
+                        format!(
+                            "[SYSTEM NOTE: The repository was automatically indexed prior to executing this query.]\n{}",
+                            out
+                        )
+                    } else {
+                        out
+                    };
 
                     Ok(CallToolResult::success(vec![Content::text(out)]))
                 }
@@ -479,11 +634,22 @@ impl ServerHandler for ContextEngine {
                     let sym_clone  = symbol_name.clone();
                     let repo_clone = repo_id.clone();
 
-                    let result = tokio::task::spawn_blocking(move || {
+                    let (result, auto_indexed) = tokio::task::spawn_blocking(move || {
                         let conn = db
                             .lock()
                             .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
-                        retrieval::analyze_impact(&conn, &symbol_name, &repo_id)
+
+                        let auto_indexed = if !db::is_workspace_indexed(&conn)? {
+                            let cwd = std::env::current_dir()
+                                .unwrap_or_else(|_| PathBuf::from("."));
+                            ingestion::run_ingestion(&conn, &repo_id, &cwd)?;
+                            true
+                        } else {
+                            false
+                        };
+
+                        let result = retrieval::analyze_impact(&conn, &symbol_name, &repo_id)?;
+                        Ok::<_, anyhow::Error>((result, auto_indexed))
                     })
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -531,12 +697,30 @@ impl ServerHandler for ContextEngine {
                     };
                     let http_client = self.http_client.clone();
                     tokio::spawn(async move {
-                        let _ = http_client
+                        match http_client
                             .post(DASHBOARD_EMIT_URL)
                             .json(&event)
                             .send()
-                            .await;
+                            .await
+                        {
+                            Err(e) => log_emit_error(&e.to_string()),
+                            Ok(resp) if !resp.status().is_success() => {
+                                let status = resp.status();
+                                let body = resp.text().await.unwrap_or_default();
+                                log_emit_error(&format!("status={status} body={body}"));
+                            }
+                            Ok(_) => {}
+                        }
                     });
+
+                    let out = if auto_indexed {
+                        format!(
+                            "[SYSTEM NOTE: The repository was automatically indexed prior to executing this query.]\n{}",
+                            out
+                        )
+                    } else {
+                        out
+                    };
 
                     Ok(CallToolResult::success(vec![Content::text(out)]))
                 }
@@ -544,18 +728,69 @@ impl ServerHandler for ContextEngine {
                 // ── ingest_repo ───────────────────────────────────────────────
                 "ingest_repo" => {
                     let repo_id   = Self::require_str(&args, "repo_id")?.to_string();
-                    let root_path: PathBuf =
-                        Self::require_str(&args, "root_path")?.to_string().into();
+                    let raw_path  = Self::require_str(&args, "root_path")?.to_string();
+                    let user_confirmed = args
+                        .get("user_confirmed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
 
+                    // Phase 3: canonicalize (resolves relative paths like ../frontend)
+                    let root_path: PathBuf = {
+                        let p = PathBuf::from(&raw_path);
+                        if p.is_absolute() {
+                            p
+                        } else {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| PathBuf::from("."))
+                                .join(p)
+                        }
+                    };
+                    let root_path = root_path
+                        .canonicalize()
+                        .unwrap_or_else(|_| root_path.clone());
+
+                    let current_dir = std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."));
+                    let current_dir = current_dir
+                        .canonicalize()
+                        .unwrap_or(current_dir);
+
+                    // Phase 2 — Rule 2: Hard system blocklist
+                    let path_str = root_path.to_string_lossy();
+                    let blocked_segments = ["/Library/", "/.Trash/", "/etc/", "/System/", "/usr/bin/"];
+                    for seg in blocked_segments {
+                        if path_str.contains(seg) || path_str.ends_with(seg.trim_end_matches('/')) {
+                            return Ok(CallToolResult::success(vec![Content::text(
+                                "CRITICAL SECURITY: Cannot index protected system directories."
+                            )]));
+                        }
+                    }
+
+                    let is_inside_workspace = root_path.starts_with(&current_dir);
+
+                    // Phase 2 — Rule 3: Double opt-in for out-of-bounds paths
+                    if !is_inside_workspace && !user_confirmed {
+                        let msg = format!(
+                            "[SYSTEM INTERCEPT: OUT OF BOUNDS REQUEST]\n\
+                             The requested path '{target_path}' is outside the primary workspace boundary.\n\
+                             YOUR INSTRUCTIONS:\n\
+                             1. Stop your current task.\n\
+                             2. Ask the user for explicit permission. Say exactly: \"You requested context that requires indexing an external directory: {target_path}. Do you want me to index this directory into the Marrow graph?\"\n\
+                             3. Wait for the user to reply.\n\
+                             4. If the user replies \"yes\", re-run the `ingest_repo` tool with the exact same path, but add the parameter `\"user_confirmed\": true`.",
+                            target_path = root_path.display()
+                        );
+                        return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                    }
+
+                    // Rule 1 (inside workspace) or Rule 4 (outside + confirmed): proceed
                     let repo_id_for_event = repo_id.clone();
 
                     let (symbols, edges) = tokio::task::spawn_blocking(move || {
                         let conn = db
                             .lock()
                             .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
-                        let symbols = ingestion::ingest_repo(&conn, &repo_id, &root_path)?;
-                        let edges = ingestion::resolve_cross_repo_edges(&conn)?;
-                        Ok::<_, anyhow::Error>((symbols, edges))
+                        ingestion::run_ingestion(&conn, &repo_id, &root_path)
                     })
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -569,15 +804,340 @@ impl ServerHandler for ContextEngine {
                     };
                     let http_client = self.http_client.clone();
                     tokio::spawn(async move {
-                        let _ = http_client
+                        match http_client
                             .post(DASHBOARD_EMIT_URL)
                             .json(&event)
                             .send()
-                            .await;
+                            .await
+                        {
+                            Err(e) => log_emit_error(&e.to_string()),
+                            Ok(resp) if !resp.status().is_success() => {
+                                let status = resp.status();
+                                let body = resp.text().await.unwrap_or_default();
+                                log_emit_error(&format!("status={status} body={body}"));
+                            }
+                            Ok(_) => {}
+                        }
                     });
 
                     Ok(CallToolResult::success(vec![Content::text(format!(
                         "Ingested {symbols} symbols; resolved {edges} cross-repo edges."
+                    ))]))
+                }
+
+                // ── save_observation ──────────────────────────────────────────
+                "save_observation" => {
+                    let symbol_name      = Self::require_str(&args, "symbol_name")?.to_string();
+                    let filepath         = Self::require_str(&args, "filepath")?.to_string();
+                    let observation_text = Self::require_str(&args, "observation")?.to_string();
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                        db::save_observation(&conn, &symbol_name, &filepath, &observation_text)
+                    })
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                    Ok(CallToolResult::success(vec![Content::text(result)]))
+                }
+
+                // ── get_session_context ───────────────────────────────────────
+                "get_session_context" => {
+                    let symbol_name = args.get("symbol_name").and_then(|v| v.as_str()).map(str::to_string);
+                    let filepath    = args.get("filepath").and_then(|v| v.as_str()).map(str::to_string);
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                        db::get_session_context(
+                            &conn,
+                            symbol_name.as_deref(),
+                            filepath.as_deref(),
+                        )
+                    })
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                    Ok(CallToolResult::success(vec![Content::text(result)]))
+                }
+
+                // ── get_skeleton ──────────────────────────────────────────────
+                "get_skeleton" => {
+                    let target_dir = args
+                        .get("target_dir")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                        retrieval::get_project_skeleton(&conn, target_dir.as_deref())
+                    })
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                    Ok(CallToolResult::success(vec![Content::text(result)]))
+                }
+
+                // ── run_pipeline ──────────────────────────────────────────────
+                "run_pipeline" => {
+                    let intent = Self::require_str(&args, "intent")?.to_string();
+                    let target = args.get("target").and_then(|v| v.as_str()).map(str::to_string);
+                    let repo_id_arg = args.get("repo_id").and_then(|v| v.as_str()).map(str::to_string);
+                    let client_name = CLIENT_NAME.get()
+                        .cloned()
+                        .unwrap_or_else(|| "Unknown Agent".to_string());
+
+                    match intent.as_str() {
+                        "analyze_repo" => {
+                            let target_dir = target.clone();
+                            let target_dir_label = target_dir.clone().unwrap_or_else(|| "(workspace)".to_string());
+                            let result = tokio::task::spawn_blocking(move || {
+                                let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                retrieval::get_project_skeleton(&conn, target_dir.as_deref())
+                            })
+                            .await
+                            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                            let node_count = result.lines().count();
+                            let event = DashboardEvent::SkeletonGenerated {
+                                target_dir: target_dir_label,
+                                node_count,
+                                ts: dashboard::now_ts(),
+                            };
+                            let http_client = self.http_client.clone();
+                            tokio::spawn(async move {
+                                match http_client
+                                    .post(DASHBOARD_EMIT_URL)
+                                    .json(&event)
+                                    .send()
+                                    .await
+                                {
+                                    Err(e) => log_emit_error(&e.to_string()),
+                                    Ok(resp) if !resp.status().is_success() => {
+                                        let status = resp.status();
+                                        let body = resp.text().await.unwrap_or_default();
+                                        log_emit_error(&format!("status={status} body={body}"));
+                                    }
+                                    Ok(_) => {}
+                                }
+                            });
+
+                            Ok(CallToolResult::success(vec![Content::text(result)]))
+                        }
+
+                        "explore_symbol" => {
+                            let symbol_name = target.ok_or_else(|| {
+                                rmcp::ErrorData::invalid_params(
+                                    "intent 'explore_symbol' requires a 'target' (symbol name)".to_string(),
+                                    None,
+                                )
+                            })?;
+                            let sym_for_event  = symbol_name.clone();
+
+                            let (out, original_text, capsule_tokens, file_tokens, abs_file_path, auto_indexed, repo_used) =
+                                tokio::task::spawn_blocking(move || {
+                                    let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+
+                                    // Auto-detect repo_id if not supplied.
+                                    let repo_id = repo_id_arg.unwrap_or_else(|| {
+                                        conn.query_row(
+                                            "SELECT id FROM repositories LIMIT 1",
+                                            [],
+                                            |row| row.get::<_, String>(0),
+                                        )
+                                        .unwrap_or_else(|_| {
+                                            std::env::current_dir()
+                                                .ok()
+                                                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                                                .unwrap_or_else(|| "workspace".to_string())
+                                        })
+                                    });
+
+                                    let auto_indexed = if !db::is_workspace_indexed(&conn)? {
+                                        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                                        ingestion::run_ingestion(&conn, &repo_id, &cwd)?;
+                                        true
+                                    } else {
+                                        false
+                                    };
+
+                                    let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id)?;
+                                    let full_file_tokens  = capsule_result.original_text.len() / 4;
+                                    let optimized_tokens  = capsule_result.optimized_text.len() / 4;
+                                    let original_text_out = capsule_result.original_text;
+                                    let out               = capsule_result.optimized_text;
+
+                                    let abs_path_str: String = conn
+                                        .query_row(
+                                            "SELECT n.file_path, r.root_path \
+                                             FROM nodes n \
+                                             JOIN repositories r ON r.id = n.repo_id \
+                                             WHERE n.symbol_name = ?1 AND n.repo_id = ?2 LIMIT 1",
+                                            rusqlite::params![symbol_name, repo_id],
+                                            |row| {
+                                                let fp: String = row.get(0)?;
+                                                let rp: String = row.get(1)?;
+                                                Ok(std::path::PathBuf::from(&rp).join(&fp).to_string_lossy().to_string())
+                                            },
+                                        )
+                                        .unwrap_or_else(|_| symbol_name.clone());
+
+                                    let saved = (full_file_tokens as i64).saturating_sub(optimized_tokens as i64);
+                                    let _ = db::increment_stat(&conn, "total_requests",     1);
+                                    let _ = db::increment_stat(&conn, "total_file_tokens",  full_file_tokens as i64);
+                                    let _ = db::increment_stat(&conn, "total_tokens_saved", saved);
+
+                                    Ok::<_, anyhow::Error>((out, original_text_out, optimized_tokens, full_file_tokens, abs_path_str, auto_indexed, repo_id))
+                                })
+                                .await
+                                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                            let tokens_saved = file_tokens.saturating_sub(capsule_tokens);
+                            let event = DashboardEvent::CapsuleServed {
+                                symbol:         sym_for_event,
+                                repo:           repo_used,
+                                file:           abs_file_path,
+                                capsule_tokens,
+                                file_tokens,
+                                tokens_saved,
+                                origin:         client_name,
+                                ts:             dashboard::now_ts(),
+                                original_text:  Some(original_text),
+                                optimized_text: Some(out.clone()),
+                            };
+                            let http_client = self.http_client.clone();
+                            tokio::spawn(async move {
+                                match http_client.post(DASHBOARD_EMIT_URL).json(&event).send().await {
+                                    Err(e) => log_emit_error(&e.to_string()),
+                                    Ok(resp) if !resp.status().is_success() => {
+                                        let status = resp.status();
+                                        let body = resp.text().await.unwrap_or_default();
+                                        log_emit_error(&format!("status={status} body={body}"));
+                                    }
+                                    Ok(_) => {}
+                                }
+                            });
+
+                            let out = if auto_indexed {
+                                format!("[SYSTEM NOTE: The repository was automatically indexed prior to executing this query.]\n{out}")
+                            } else {
+                                out
+                            };
+                            Ok(CallToolResult::success(vec![Content::text(out)]))
+                        }
+
+                        "refactor_symbol" => {
+                            let symbol_name = target.ok_or_else(|| {
+                                rmcp::ErrorData::invalid_params(
+                                    "intent 'refactor_symbol' requires a 'target' (symbol name)".to_string(),
+                                    None,
+                                )
+                            })?;
+                            let sym_clone = symbol_name.clone();
+
+                            let (result, auto_indexed, repo_used) = tokio::task::spawn_blocking(move || {
+                                let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+
+                                let repo_id = repo_id_arg.unwrap_or_else(|| {
+                                    conn.query_row(
+                                        "SELECT id FROM repositories LIMIT 1",
+                                        [],
+                                        |row| row.get::<_, String>(0),
+                                    )
+                                    .unwrap_or_else(|_| {
+                                        std::env::current_dir()
+                                            .ok()
+                                            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                                            .unwrap_or_else(|| "workspace".to_string())
+                                    })
+                                });
+
+                                let auto_indexed = if !db::is_workspace_indexed(&conn)? {
+                                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                                    ingestion::run_ingestion(&conn, &repo_id, &cwd)?;
+                                    true
+                                } else {
+                                    false
+                                };
+
+                                let result = retrieval::analyze_impact(&conn, &symbol_name, &repo_id)?;
+                                Ok::<_, anyhow::Error>((result, auto_indexed, repo_id))
+                            })
+                            .await
+                            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                            let mut out = String::new();
+                            writeln!(out, "IMPACT ANALYSIS — pivot id: {}", result.pivot_id).ok();
+                            if result.affected.is_empty() {
+                                writeln!(out, "No downstream dependents found. Symbol is safe to change in isolation.").ok();
+                            } else {
+                                writeln!(out, "{:>5}  {:>10}  {:<20}  {:<10}  {:<14}  FILE", "DEPTH", "REL_TYPE", "SYMBOL", "SYM_TYPE", "REPO").ok();
+                                writeln!(out, "{}", "─".repeat(80)).ok();
+                                for n in &result.affected {
+                                    writeln!(out, "{depth:>5}  {rel:>10}  {sym:<20}  {typ:<10}  {repo:<14}  {file}",
+                                        depth = n.depth, rel = n.relationship_type, sym = n.symbol_name,
+                                        typ = n.symbol_type, repo = n.repo_id, file = n.file_path).ok();
+                                }
+                                writeln!(out, "\n{} node(s) affected.", result.affected.len()).ok();
+                            }
+
+                            let event = DashboardEvent::ImpactAnalyzed {
+                                symbol:         sym_clone,
+                                repo:           repo_used,
+                                affected_count: result.affected.len(),
+                                ts:             dashboard::now_ts(),
+                            };
+                            let http_client = self.http_client.clone();
+                            tokio::spawn(async move {
+                                match http_client.post(DASHBOARD_EMIT_URL).json(&event).send().await {
+                                    Err(e) => log_emit_error(&e.to_string()),
+                                    Ok(resp) if !resp.status().is_success() => {
+                                        let status = resp.status();
+                                        let body = resp.text().await.unwrap_or_default();
+                                        log_emit_error(&format!("status={status} body={body}"));
+                                    }
+                                    Ok(_) => {}
+                                }
+                            });
+
+                            let out = if auto_indexed {
+                                format!("[SYSTEM NOTE: The repository was automatically indexed prior to executing this query.]\n{out}")
+                            } else {
+                                out
+                            };
+                            Ok(CallToolResult::success(vec![Content::text(out)]))
+                        }
+
+                        _ => Err(rmcp::ErrorData::invalid_params(
+                            "Invalid intent. Must be 'analyze_repo', 'explore_symbol', or 'refactor_symbol'.".to_string(),
+                            None,
+                        )),
+                    }
+                }
+
+                // ── workspace_setup ───────────────────────────────────────────
+                "workspace_setup" => {
+                    tokio::task::spawn_blocking(move || {
+                        let workspace_root = std::env::current_dir()
+                            .unwrap_or_else(|_| PathBuf::from("."));
+                        write_workspace_rules(&workspace_root)?;
+                        write_vscode_mcp_config(&workspace_root)
+                    })
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                    Ok(CallToolResult::success(vec![Content::text(format!(
+                        "[MARROW] Successfully integrated! Workspace rules appended, and VS Code / Copilot MCP configuration automatically generated.\n\
+                         Path: {}\n\
+                         You MUST now use run_pipeline for all tasks. Agents using this workspace will now follow the Marrow-First workflow protocol.",
+                        cwd.display()
                     ))]))
                 }
 
@@ -703,10 +1263,12 @@ fn cmd_ui() -> Result<()> {
                     .and_then(|b| b.as_bool())
                     .unwrap_or(true);
                 cfg["auto_open_ui"] = serde_json::Value::Bool(!current);
-                let tmp = rc_path.with_extension("json.tmp");
-                fs::write(&tmp, serde_json::to_string_pretty(&cfg)?)?;
-                fs::rename(&tmp, rc_path)?;
-                println!("Auto-Open is now {}.", if !current { "ON" } else { "OFF" });
+                // Best-effort write — silently ignore failures on read-only filesystems.
+                if let Ok(pretty) = serde_json::to_string_pretty(&cfg) {
+                    let tmp = rc_path.with_extension("json.tmp");
+                    let _ = fs::write(&tmp, &pretty).and_then(|_| fs::rename(&tmp, rc_path));
+                }
+                eprintln!("Auto-Open is now {}.", if !current { "ON" } else { "OFF" });
             }
             _ => break,
         }
@@ -715,25 +1277,172 @@ fn cmd_ui() -> Result<()> {
     Ok(())
 }
 
+const WORKSPACE_RULES_CONTENT: &str = r#"# MARROW AST CONTEXT ENGINE - STRICT WORKFLOW PROTOCOL
+You are equipped with the 'marrow' MCP server. You MUST adhere to the following strict workflow. Do NOT rely on your default file-reading tools.
+## THE OMNI-TOOL (ALWAYS FIRST)
+For EVERY coding task, exploration, or question, you MUST call the `run_pipeline` tool first.
+* IF USER SAYS: "Analyze this repo", "Explain the codebase"
+* ACTION: Call `run_pipeline` with `intent: "analyze_repo"`.
+* IF USER SAYS: "How does <function/file> work?", "Fix a bug in <file>"
+* ACTION: Call `run_pipeline` with `intent: "explore_symbol"` and the target.
+* IF USER SAYS: "Refactor <function>", "Delete <file>"
+* ACTION: Call `run_pipeline` with `intent: "refactor_symbol"` and the target.
+If any tool states the database is empty, immediately run `ingest_repo`.
+"#;
+
+/// `marrow rules` — write Marrow-first workflow rules into the target workspace.
+/// Writes rule files for Cursor, Cline, Roo/Antigravity, and Windsurf so all
+/// AI agent variants default to Marrow tools.
+///
+/// This function is append-only and idempotent: if the Marrow header is already
+/// present in a file it is skipped entirely, preventing duplicate entries and
+/// preserving any user-authored content that precedes the Marrow block.
+/// Creates or merges `.vscode/mcp.json` so that GitHub Copilot / VS Code
+/// can discover the Marrow MCP server. Existing `mcpServers` entries are
+/// preserved — only the `"marrow"` key is inserted/updated.
+pub fn write_vscode_mcp_config(workspace_root: &Path) -> Result<()> {
+    let vscode_dir = workspace_root.join(".vscode");
+    fs::create_dir_all(&vscode_dir)
+        .with_context(|| format!("could not create {}", vscode_dir.display()))?;
+
+    let mcp_path = vscode_dir.join("mcp.json");
+
+    let marrow_entry = serde_json::json!({
+        "command": "marrow",
+        "args": ["mcp"]
+    });
+
+    let mut config: serde_json::Value = if mcp_path.exists() {
+        let raw = fs::read_to_string(&mcp_path)
+            .with_context(|| format!("could not read {}", mcp_path.display()))?;
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // VS Code workspace mcp.json uses "servers" (not "mcpServers" which is the Cline/Claude format).
+    if !config["servers"].is_object() {
+        config["servers"] = serde_json::json!({});
+    }
+    config["servers"]["marrow"] = marrow_entry;
+
+    let pretty = serde_json::to_string_pretty(&config)
+        .context("could not serialize mcp.json")?;
+    fs::write(&mcp_path, pretty)
+        .with_context(|| format!("could not write {}", mcp_path.display()))?;
+
+    eprintln!("Wrote VS Code MCP config to {}", mcp_path.display());
+    Ok(())
+}
+
+pub fn write_workspace_rules(root_dir: &Path) -> Result<()> {
+    use std::io::Write;
+    const MARROW_HEADER: &str = "# MARROW AST CONTEXT ENGINE";
+    let targets = [".cursorrules", ".clinerules", ".roomrules", ".windsurfrules"];
+    for filename in &targets {
+        let path = root_dir.join(filename);
+        if path.exists() {
+            let existing = fs::read_to_string(&path)
+                .with_context(|| format!("could not read {}", path.display()))?;
+            if existing.contains(MARROW_HEADER) {
+                eprintln!("Skipped {} (Marrow rules already present)", path.display());
+                continue;
+            }
+            // File exists but lacks the Marrow block — append.
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("could not open {}", path.display()))?;
+            write!(file, "\n\n{WORKSPACE_RULES_CONTENT}")?;
+            eprintln!("Appended to {}", path.display());
+        } else {
+            // File does not exist — create and write.
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("could not create {}", path.display()))?;
+            write!(file, "{WORKSPACE_RULES_CONTENT}")?;
+            eprintln!("Created {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_rules() -> Result<()> {
+    let root = std::env::current_dir().context("could not determine current directory")?;
+    write_workspace_rules(&root)?;
+    write_vscode_mcp_config(&root)?;
+    eprintln!("[MARROW] Successfully integrated! Workspace rules appended, and VS Code / Copilot MCP configuration automatically generated.");
+    Ok(())
+}
+
 /// `marrow init` — scaffold a `.marrow/` directory and `.marrowrc.json` config.
 fn cmd_init() -> Result<()> {
     let marrow_dir = Path::new(".marrow");
-    fs::create_dir_all(marrow_dir)?;
+    if let Err(e) = fs::create_dir_all(marrow_dir) {
+        eprintln!("Warning: could not create .marrow/ directory ({e}). Continuing.");
+    }
 
     let rc_path = Path::new(".marrowrc.json");
     if rc_path.exists() {
-        println!(".marrowrc.json already exists — skipping.");
+        eprintln!(".marrowrc.json already exists — skipping.");
     } else {
         let default_config = serde_json::json!({
             "ignore": ["node_modules", "target", "dist", ".git"],
             "show_dashboard": true,
             "auto_open_ui": true
         });
-        fs::write(rc_path, serde_json::to_string_pretty(&default_config)?)?;
-        println!("Created .marrowrc.json with default ignore patterns.");
+        if let Ok(pretty) = serde_json::to_string_pretty(&default_config) {
+            if let Err(e) = fs::write(rc_path, pretty) {
+                eprintln!("Warning: could not write .marrowrc.json ({e}). Using defaults.");
+            } else {
+                eprintln!("Created .marrowrc.json with default ignore patterns.");
+            }
+        }
     }
 
-    println!("Initialized .marrow/ workspace.");
+    eprintln!("Initialized .marrow/ workspace.");
+    Ok(())
+}
+
+/// `marrow test-capsules` — run get_context_capsule for every (repo_id, symbol)
+/// in the graph. Reports success/failure counts.
+fn cmd_test_capsules() -> Result<()> {
+    let db_path = std::env::var("MARROW_DB_PATH")
+        .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+    let conn = db::init_db_or_memory(&db_path)?;
+
+    let pairs: Vec<(String, String)> = conn.prepare(
+        "SELECT DISTINCT repo_id, symbol_name FROM nodes ORDER BY repo_id, symbol_name",
+    )?
+    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    let total = pairs.len();
+    let mut ok = 0usize;
+    let mut err = 0usize;
+
+    for (repo_id, symbol_name) in &pairs {
+        match retrieval::get_context_capsule(&conn, symbol_name, repo_id) {
+            Ok(_) => {
+                ok += 1;
+                eprintln!("OK  {repo_id}:{symbol_name}");
+            }
+            Err(e) => {
+                err += 1;
+                eprintln!("ERR {repo_id}:{symbol_name} — {e}");
+            }
+        }
+    }
+
+    eprintln!("\n--- test-capsules complete ---");
+    eprintln!("total: {total}  ok: {ok}  err: {err}");
+    if err > 0 {
+        anyhow::bail!("{err} capsule(s) failed");
+    }
     Ok(())
 }
 
@@ -750,9 +1459,8 @@ const MARROW_BANNER: &str = r#"
 
 /// Paths + binary string resolved once and threaded into every per-agent fn.
 struct IntegrationCtx {
-    binary:  String,
-    db_path: String,
-    home:    String,
+    binary: String,
+    home:   String,
 }
 
 /// What a per-agent function reports back.
@@ -782,25 +1490,19 @@ fn save_json(path: &Path, val: &serde_json::Value) -> Result<()> {
 
 // ── Per-agent helpers ─────────────────────────────────────────────────────────
 
-/// ~/Library/Application Support/claude-code/config.json
+/// ~/.claude.json (global Claude Code config)
 fn integrate_claude(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
-    let path = PathBuf::from(&ctx.home)
-        .join("Library/Application Support/claude-code/config.json");
-    if !path.exists() {
-        return Ok(AgentOutcome::NotFound);
-    }
+    let path = PathBuf::from(&ctx.home).join(".claude.json");
     let mut cfg = load_json_or_empty(&path)?;
     cfg["mcpServers"]["marrow"] = serde_json::json!({
         "command": ctx.binary,
-        "args":    [],
-        "env":     { "MARROW_DB_PATH": ctx.db_path }
+        "args":    ["mcp"]
     });
     save_json(&path, &cfg)?;
     Ok(AgentOutcome::Installed)
 }
 
 /// ~/.gemini/antigravity/mcp_config.json
-/// The `env` block is mandatory — it bypasses the macOS sandbox (os error 30).
 fn integrate_antigravity(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     let path = PathBuf::from(&ctx.home)
         .join(".gemini/antigravity/mcp_config.json");
@@ -810,8 +1512,7 @@ fn integrate_antigravity(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     let mut cfg = load_json_or_empty(&path)?;
     cfg["mcpServers"]["marrow"] = serde_json::json!({
         "command": ctx.binary,
-        "args":    [],
-        "env":     { "MARROW_DB_PATH": ctx.db_path }
+        "args":    ["mcp"]
     });
     save_json(&path, &cfg)?;
     Ok(AgentOutcome::Installed)
@@ -830,17 +1531,30 @@ fn integrate_cursor(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
 }
 
 /// GitHub Copilot — writes two config files:
-///   ~/.mcp.json          (VS Code global MCP, uses "servers" key)
-///   ~/.copilot/mcp-config.json  (Copilot CLI, uses "mcpServers" key)
+///   ~/Library/Application Support/Code/User/mcp.json  (VS Code global MCP, macOS)
+///   ~/.copilot/mcp-config.json                         (Copilot CLI, uses "mcpServers" key)
 fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
-    // 1. ~/.mcp.json — VS Code / global MCP
+    // 1. VS Code global MCP config — location is platform-specific.
+    //    macOS: ~/Library/Application Support/Code/User/mcp.json
+    //    Linux: ~/.config/Code/User/mcp.json
+    //    Windows: %APPDATA%\Code\User\mcp.json
+    #[cfg(target_os = "macos")]
+    let vscode_path = PathBuf::from(&ctx.home).join("Library/Application Support/Code/User/mcp.json");
+    #[cfg(target_os = "linux")]
+    let vscode_path = PathBuf::from(&ctx.home).join(".config/Code/User/mcp.json");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let vscode_path = PathBuf::from(&ctx.home).join(".mcp.json");
-    let mut vscode_cfg = load_json_or_empty(&vscode_path)?;
-    vscode_cfg["servers"]["marrow"] = serde_json::json!({
-        "command": ctx.binary,
-        "args":    ["mcp"]
-    });
-    save_json(&vscode_path, &vscode_cfg)?;
+
+    if let Some(parent) = vscode_path.parent() {
+        if parent.exists() {
+            let mut vscode_cfg = load_json_or_empty(&vscode_path)?;
+            vscode_cfg["servers"]["marrow"] = serde_json::json!({
+                "command": ctx.binary,
+                "args":    ["mcp"]
+            });
+            save_json(&vscode_path, &vscode_cfg)?;
+        }
+    }
 
     // 2. ~/.copilot/mcp-config.json — Copilot CLI
     let cli_path = PathBuf::from(&ctx.home).join(".copilot/mcp-config.json");
@@ -867,8 +1581,7 @@ fn integrate_cline(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     let mut cfg = load_json_or_empty(&path)?;
     cfg["mcpServers"]["marrow"] = serde_json::json!({
         "command":     ctx.binary,
-        "args":        [],
-        "env":         { "MARROW_DB_PATH": ctx.db_path },
+        "args":        ["mcp"],
         "disabled":    false,
         "autoApprove": []
     });
@@ -887,8 +1600,7 @@ fn integrate_zed(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     cfg["context_servers"]["marrow"] = serde_json::json!({
         "command": {
             "path": ctx.binary,
-            "args": [],
-            "env":  { "MARROW_DB_PATH": ctx.db_path }
+            "args": ["mcp"]
         },
         "settings": {}
     });
@@ -904,12 +1616,12 @@ fn cmd_integrate() -> Result<()> {
     use dialoguer::{MultiSelect, theme::ColorfulTheme};
 
     // ── Banner ────────────────────────────────────────────────────────
-    println!("{}", style(MARROW_BANNER).cyan().bold());
-    println!(
+    eprintln!("{}", style(MARROW_BANNER).cyan().bold());
+    eprintln!(
         "  {}",
         style("AST Context Engine  ·  MCP Server Installer").dim()
     );
-    println!();
+    eprintln!();
 
     // ── Agent menu ────────────────────────────────────────────────────
     #[allow(clippy::type_complexity)]
@@ -930,42 +1642,40 @@ fn cmd_integrate() -> Result<()> {
         .interact()?;
 
     if selections.is_empty() {
-        println!("\n{}", style("No agents selected — nothing to do.").dim());
+        eprintln!("\n{}", style("No agents selected — nothing to do.").dim());
         return Ok(());
     }
 
     // ── Resolve shared paths once ─────────────────────────────────────
+    // current_exe() gives the absolute path to the running binary.
+    // GUI Electron apps (Cursor, VS Code) do not inherit $PATH, so PATH-based
+    // resolution would fail. Absolute paths are required for reliable startup.
     let binary = std::env::current_exe()
         .context("Could not resolve current executable path")?
         .to_string_lossy()
         .to_string();
 
-    let db_path = std::env::current_dir()?
-        .join(".marrow/graph.db")
-        .to_string_lossy()
-        .to_string();
-
     let home = std::env::var("HOME").context("$HOME is not set")?;
 
-    let ctx = IntegrationCtx { binary, db_path, home };
+    let ctx = IntegrationCtx { binary, home };
 
     // ── Run each selected agent ───────────────────────────────────────
-    println!();
+    eprintln!();
     for idx in selections {
         let (name, integrate_fn) = agents[idx];
         match integrate_fn(&ctx) {
-            Ok(AgentOutcome::Installed) => println!(
+            Ok(AgentOutcome::Installed) => eprintln!(
                 "  {}  {}",
                 style("✓").green().bold(),
                 style(name).bold(),
             ),
-            Ok(AgentOutcome::NotFound) => println!(
+            Ok(AgentOutcome::NotFound) => eprintln!(
                 "  {}  {}  {}",
                 style("⚠").yellow().bold(),
                 style(name).dim(),
                 style("(not installed — skipped)").dim(),
             ),
-            Err(e) => println!(
+            Err(e) => eprintln!(
                 "  {}  {}  {}",
                 style("✗").red().bold(),
                 style(name).bold(),
@@ -974,8 +1684,8 @@ fn cmd_integrate() -> Result<()> {
         }
     }
 
-    println!();
-    println!("  {}", style("Done.").bold());
+    eprintln!();
+    eprintln!("  {}", style("Done.").bold());
     Ok(())
 }
 
@@ -1027,7 +1737,7 @@ fn cmd_index() -> Result<()> {
     }
     builder.overrides(overrides.build()?);
 
-    let supported_exts = ["cpp", "cc", "cxx", "h", "hpp", "py", "ts", "tsx"];
+    let supported_exts = ["cpp", "cc", "cxx", "h", "hpp", "py", "ts", "tsx", "rs", "rb"];
 
     let files: Vec<PathBuf> = builder
         .build()
@@ -1043,9 +1753,9 @@ fn cmd_index() -> Result<()> {
         .map(|entry| entry.into_path())
         .collect();
 
-    println!("Repo:  {repo_id}");
-    println!("Root:  {}", cwd.display());
-    println!("Files: {}", files.len());
+    eprintln!("Repo:  {repo_id}");
+    eprintln!("Root:  {}", cwd.display());
+    eprintln!("Files: {}", files.len());
 
     // ── Parse all files in parallel with rayon ───────────────────────
     use rayon::prelude::*;
@@ -1070,8 +1780,7 @@ fn cmd_index() -> Result<()> {
 
     // ── Initialize DB and insert inside a single transaction ─────────
     let db_path = ".marrow/graph.db";
-    fs::create_dir_all(".marrow")?;
-    let conn = db::init_db(db_path)?;
+    let conn = db::init_db_or_memory(db_path)?;
 
     conn.execute(
         "INSERT OR REPLACE INTO repositories (id, root_path) VALUES (?1, ?2)",
@@ -1102,11 +1811,11 @@ fn cmd_index() -> Result<()> {
     let edge_count = ingestion::resolve_cross_repo_edges(&conn)?;
 
     let elapsed = t0.elapsed();
-    println!("\n── Index complete ──────────────────────────────────────────");
-    println!("  Symbols: {}", fmt_num(symbol_count));
-    println!("  Edges:   {}", fmt_num(edge_count));
-    println!("  Time:    {:.2?}", elapsed);
-    println!("  DB:      {db_path}");
+    eprintln!("\n── Index complete ──────────────────────────────────────────");
+    eprintln!("  Symbols: {}", fmt_num(symbol_count));
+    eprintln!("  Edges:   {}", fmt_num(edge_count));
+    eprintln!("  Time:    {:.2?}", elapsed);
+    eprintln!("  DB:      {db_path}");
 
     Ok(())
 }
@@ -1115,15 +1824,33 @@ fn cmd_index() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ── Global panic hook – writes panics to ~/.marrow/debug.log ──────
+    std::panic::set_hook(Box::new(|panic_info| {
+        use std::io::Write;
+        if let Some(home) = dirs::home_dir() {
+            let log_dir = home.join(".marrow");
+            let _ = std::fs::create_dir_all(&log_dir);
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join("debug.log"))
+            {
+                let _ = writeln!(file, "[FATAL PANIC] {}", panic_info);
+            }
+        }
+    }));
+
     // ── CLI subcommand dispatch ────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(|s| s.as_str()) {
-        Some("ui")   => return cmd_ui(),
-        Some("init") => return cmd_init(),
-        Some("index") => return cmd_index(),
+        Some("ui")        => return cmd_ui(),
+        Some("init")      => return cmd_init(),
+        Some("rules")     => return cmd_rules(),
+        Some("index")     => return cmd_index(),
+        Some("test-capsules") => return cmd_test_capsules(),
         Some("integrate") => return cmd_integrate(),
-        Some("benchmark") => {
+Some("benchmark") => {
             let symbol = args.get(2).ok_or_else(|| {
                 anyhow::anyhow!("Usage: {} benchmark <symbol> <repo_id>", args[0])
             })?;
@@ -1133,14 +1860,35 @@ async fn main() -> Result<()> {
 
             let db_path = std::env::var("MARROW_DB_PATH")
                 .unwrap_or_else(|_| ".marrow/graph.db".to_string());
-            let db_parent = Path::new(&db_path)
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            fs::create_dir_all(db_parent)?;
 
-            let conn = db::init_db(&db_path)?;
+            let conn = db::init_db_or_memory(&db_path)?;
             run_benchmark(&conn, symbol, repo_id)?;
+            return Ok(());
+        }
+        Some("query") => {
+            let symbol = args.get(2).ok_or_else(|| {
+                anyhow::anyhow!("Usage: {} query <symbol> <repo_id>", args[0])
+            })?;
+            let repo_id = args.get(3).ok_or_else(|| {
+                anyhow::anyhow!("Usage: {} query <symbol> <repo_id>", args[0])
+            })?;
+
+            let db_path = std::env::var("MARROW_DB_PATH")
+                .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+
+            let conn = db::init_db_or_memory(&db_path)?;
+            let result = retrieval::get_context_capsule(&conn, symbol, repo_id)?;
+            println!("{}", result.optimized_text);
+
+            let impact = retrieval::analyze_impact(&conn, symbol, repo_id)?;
+            println!("\nIMPACT ANALYSIS:");
+            if impact.affected.is_empty() {
+                println!("  No downstream dependents found.");
+            } else {
+                for n in impact.affected {
+                    println!("  [Depth {}] {} ({}) in {}", n.depth, n.symbol_name, n.symbol_type, n.file_path);
+                }
+            }
             return Ok(());
         }
         _ => {}
@@ -1150,41 +1898,36 @@ async fn main() -> Result<()> {
     let db_path = std::env::var("MARROW_DB_PATH")
         .unwrap_or_else(|_| ".marrow/graph.db".to_string());
 
-    let db_parent = Path::new(&db_path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(db_parent)?;
-
-    // ── Read both config flags in one pass ────────────────────────────
-    let (show_dashboard, auto_open_ui) = {
+    // ── Read config flags in one pass ───────────────────────────────
+    // Config read is always best-effort; a missing/unreadable file is not fatal.
+    let (show_dashboard, auto_open_ui, enable_watcher, watch_debounce_ms) = {
         let cfg: serde_json::Value = fs::read_to_string(".marrowrc.json")
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_else(|| serde_json::json!({}));
-        let show = cfg.get("show_dashboard").and_then(|b| b.as_bool()).unwrap_or(true);
-        let open = cfg.get("auto_open_ui").and_then(|b| b.as_bool()).unwrap_or(true);
-        (show, open)
+        let show      = cfg.get("show_dashboard").and_then(|b| b.as_bool()).unwrap_or(true);
+        let open      = cfg.get("auto_open_ui").and_then(|b| b.as_bool()).unwrap_or(true);
+        let watcher   = cfg.get("enable_watcher").and_then(|b| b.as_bool()).unwrap_or(false);
+        let debounce  = cfg.get("watch_debounce_ms").and_then(|v| v.as_u64()).unwrap_or(500);
+        (show, open, watcher, debounce)
     };
 
-    let client_name = Arc::new(Mutex::new("Unknown Client".to_string()));
 
-    // ── Init DB ───────────────────────────────────────────────────────
-    let conn   = db::init_db(&db_path)?;
+    // ── Init DB (falls back to :memory: on read-only filesystems) ─────
+    let conn   = db::init_db_or_memory(&db_path)?;
     let db_arc = Arc::new(Mutex::new(conn));
 
     // ── Create the HTTP client once — shared by Hub startup and engine ─
     let http_client = reqwest::Client::new();
 
+    // ── Broadcast channel (shared by dashboard + watcher) ─────────────
+    // Hoisted outside `if show_dashboard` so the watcher can use it even
+    // when the dashboard UI is disabled.
+    let (tx, _) = tokio::sync::broadcast::channel::<DashboardEvent>(256);
+    let session = Arc::new(Mutex::new(dashboard::SessionStats::default()));
+
     // ── Dashboard Hub election ────────────────────────────────────────
     if show_dashboard {
-        use tokio::sync::broadcast;
-        // The initial receiver is intentionally dropped: all SSE consumers call
-        // tx.subscribe() dynamically when a browser connects (see sse_handler).
-        // The channel stays open because AppState holds the cloned sender.
-        let (tx, _) = broadcast::channel::<DashboardEvent>(256);
-        let session = Arc::new(Mutex::new(dashboard::SessionStats::default()));
-
         match dashboard::start(
             tx.clone(),
             Arc::clone(&session),
@@ -1201,11 +1944,20 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     // Brief yield so the Axum accept-loop is ready.
                     tokio::time::sleep(std::time::Duration::from_millis(DASHBOARD_WARMUP_MS)).await;
-                    let _ = client
+                    match client
                         .post(DASHBOARD_EMIT_URL)
                         .json(&DashboardEvent::ServerStarted { port: 8765, db_path })
                         .send()
-                        .await;
+                        .await
+                    {
+                        Err(e) => log_emit_error(&e.to_string()),
+                        Ok(resp) if !resp.status().is_success() => {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            log_emit_error(&format!("status={status} body={body}"));
+                        }
+                        Ok(_) => {}
+                    }
                 });
             }
             dashboard::HubRole::Spoke => {
@@ -1214,10 +1966,17 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ── Background file watcher (opt-in) ──────────────────────────────
+    if enable_watcher {
+        match watcher::spawn_watcher(Arc::clone(&db_arc), tx.clone(), watch_debounce_ms) {
+            Ok(_) => eprintln!("Marrow file watcher active (debounce: {watch_debounce_ms}ms)"),
+            Err(e) => eprintln!("Marrow file watcher failed: {e}"),
+        }
+    }
+
     // ── Build engine ──────────────────────────────────────────────────
     let engine = ContextEngine {
         db:          Arc::clone(&db_arc),
-        client_name: Arc::clone(&client_name),
         http_client,
     };
 
