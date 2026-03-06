@@ -490,7 +490,7 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
     // Remove nodes + files record for deleted files
     for file_path in &removed_rels {
         let syms: Vec<String> = {
-            let mut s = conn.prepare(
+            let mut s = tx.prepare(
                 "SELECT symbol_name FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
             )?;
             let collected: Vec<String> = s
@@ -566,24 +566,31 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
         )?;
     }
 
-    tx.commit()?;
-
-    // ── Build CALLS edges for changed files ───────────────────────────────────
-    // Load full name→ids map for this repo (needed for resolution)
+    // ── Build CALLS edges for changed files (same transaction) ───────────────
+    // Build name→ids map from in-memory parsed data first (no DB query needed
+    // for newly inserted nodes since the transaction hasn't committed yet).
     let mut name_to_ids: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    for (file_path, _, symbols, _, _) in &parsed {
+        for sym in symbols {
+            let node_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
+            name_to_ids.entry(sym.name.clone()).or_default().push(node_id);
+        }
+    }
+    // Also load existing unchanged nodes for cross-file call resolution
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = tx.prepare(
             "SELECT symbol_name, id FROM nodes WHERE repo_id = ?1",
         )?;
         stmt.query_map(rusqlite::params![repo_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .filter_map(|r| r.ok())
-        .for_each(|(name, id)| name_to_ids.entry(name).or_default().push(id));
+        .for_each(|(name, id)| {
+            name_to_ids.entry(name).or_default().push(id);
+        });
     }
 
-    let edge_tx = conn.unchecked_transaction()?;
     let mut calls_edge_count = 0usize;
     for (file_path, lang, symbols, _, _) in &parsed {
         for sym in symbols {
@@ -595,7 +602,7 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
                 }
                 if let Some(target_ids) = name_to_ids.get(callee_name.as_str()) {
                     for target_id in target_ids {
-                        edge_tx.execute(
+                        tx.execute(
                             "INSERT OR IGNORE INTO edges \
                              (source_id, target_id, relationship_type) \
                              VALUES (?1, ?2, 'CALLS')",
@@ -607,7 +614,8 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
             }
         }
     }
-    edge_tx.commit()?;
+
+    tx.commit()?;
 
     // Total node count across the whole repo (unchanged + newly parsed)
     let total: usize = conn.query_row(
