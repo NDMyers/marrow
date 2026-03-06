@@ -9,7 +9,10 @@ use std::{
     fmt::Write as FmtWrite,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
@@ -224,6 +227,7 @@ fn run_benchmark(
 struct ContextEngine {
     db:          Arc<Mutex<rusqlite::Connection>>,
     http_client: reqwest::Client,
+    is_indexing: Arc<AtomicBool>,
 }
 
 impl ContextEngine {
@@ -236,6 +240,7 @@ impl ContextEngine {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             http_client,
+            is_indexing: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -243,6 +248,69 @@ impl ContextEngine {
     /// `Arc<serde_json::Map<String, Value>>` that `Tool::new` expects.
     fn schema(v: serde_json::Value) -> Arc<serde_json::Map<String, serde_json::Value>> {
         Arc::new(v.as_object().expect("schema must be a JSON object").clone())
+    }
+
+    /// Checks if the workspace is indexed. If not, spawns a background ingest
+    /// and returns `Some(message)` so the caller can return early.
+    /// Returns `None` if the workspace is already indexed (proceed normally).
+    fn maybe_jit_index(
+        &self,
+        repo_id: &str,
+        root_path: &std::path::Path,
+    ) -> Option<String> {
+        // Fast path: already indexed
+        {
+            let conn = self.db.lock().unwrap();
+            if crate::db::is_repo_indexed(&conn, repo_id, root_path).unwrap_or(false) {
+                return None;
+            }
+        }
+
+        // Guard against concurrent indexing
+        if self
+            .is_indexing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Some(
+                "[MARROW] Workspace indexing is already in progress. \
+                 Re-invoke your query in a moment once indexing completes."
+                    .to_string(),
+            );
+        }
+
+        // Spawn background ingest
+        let db = self.db.clone();
+        let is_indexing = self.is_indexing.clone();
+        let repo_id = repo_id.to_string();
+        let root_path = root_path.to_path_buf();
+
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let conn = db.lock().unwrap();
+                crate::ingestion::run_ingestion(&conn, &repo_id, &root_path)
+            })
+            .await;
+
+            is_indexing.store(false, Ordering::SeqCst);
+
+            match result {
+                Ok(Ok((syms, edges))) => {
+                    eprintln!(
+                        "[MARROW] Background indexing complete: {syms} symbols, {edges} edges."
+                    );
+                }
+                Ok(Err(e)) => eprintln!("[MARROW] Background indexing failed: {e}"),
+                Err(e) => eprintln!("[MARROW] Background indexing task panicked: {e}"),
+            }
+        });
+
+        Some(
+            "[MARROW] Workspace indexing started in the background. \
+             This is a one-time operation (typically 30-60s for large codebases). \
+             Re-invoke your query in a moment to proceed with full context."
+                .to_string(),
+        )
     }
 
     /// Pull a required string argument out of the tool arguments map, returning
@@ -262,6 +330,316 @@ impl ContextEngine {
     }
 }
 
+fn current_workspace_root() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn fallback_repo_id_for_path(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "workspace".to_string())
+}
+
+fn resolve_request_repo_id(
+    conn: &rusqlite::Connection,
+    explicit_repo_id: Option<&str>,
+    workspace_root: &Path,
+) -> anyhow::Result<String> {
+    if let Some(repo_id) = explicit_repo_id {
+        return Ok(repo_id.to_string());
+    }
+
+    if let Some(repo_id) = db::repo_id_for_root(conn, workspace_root)? {
+        return Ok(repo_id);
+    }
+
+    Ok(fallback_repo_id_for_path(workspace_root))
+}
+
+fn ensure_repo_ready(
+    conn: &rusqlite::Connection,
+    explicit_repo_id: Option<&str>,
+    workspace_root: &Path,
+) -> anyhow::Result<String> {
+    let repo_id = resolve_request_repo_id(conn, explicit_repo_id, workspace_root)?;
+    if explicit_repo_id.is_some() {
+        let expected_repo_id = db::repo_id_for_root(conn, workspace_root)?
+            .unwrap_or_else(|| fallback_repo_id_for_path(workspace_root));
+        if expected_repo_id != repo_id {
+            return Err(anyhow::anyhow!(
+                "Repo '{}' does not match the current workspace. Run ingest_repo with the correct root_path before querying it from this session.",
+                repo_id
+            ));
+        }
+    }
+    Ok(repo_id)
+}
+
+fn path_contains_marrow_marker(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let lowercase = contents.to_lowercase();
+    lowercase.contains("marrow")
+        || lowercase.contains("run_pipeline")
+        || lowercase.contains("\"marrow\"")
+}
+
+fn workspace_is_initialized(root: &Path) -> bool {
+    let rules = [".cursorrules", ".clinerules", ".roomrules", ".windsurfrules"];
+    root.join(".marrow").is_dir()
+        && root.join(".marrowrc.json").exists()
+        && root.join(".vscode/mcp.json").exists()
+        && rules
+            .iter()
+            .all(|rule| path_contains_marrow_marker(&root.join(rule)))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnforcementMode {
+    Default,
+    Strict,
+}
+
+impl EnforcementMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Strict => "strict",
+        }
+    }
+
+    fn from_config_value(value: Option<&str>) -> Self {
+        match value {
+            Some("strict") => Self::Strict,
+            _ => Self::Default,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComplianceAction {
+    None,
+    AutoRouted,
+}
+
+#[derive(Debug)]
+struct ComplianceRewrite {
+    tool_name: String,
+    args: serde_json::Map<String, serde_json::Value>,
+    notice: Option<String>,
+    action: ComplianceAction,
+}
+
+fn read_workspace_config() -> serde_json::Value {
+    fs::read_to_string(".marrowrc.json")
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn read_enforcement_mode() -> EnforcementMode {
+    let cfg = read_workspace_config();
+    EnforcementMode::from_config_value(
+        cfg.get("enforcement_mode").and_then(|v| v.as_str()),
+    )
+}
+
+fn apply_compliance_gate(
+    tool_name: &str,
+    mut args: serde_json::Map<String, serde_json::Value>,
+    mode: EnforcementMode,
+) -> Result<ComplianceRewrite, rmcp::ErrorData> {
+    let (intent, target_key) = match tool_name {
+        "get_context_capsule" => ("explore_symbol", Some("symbol_name")),
+        "analyze_impact" => ("refactor_symbol", Some("symbol_name")),
+        "get_skeleton" => ("analyze_repo", Some("target_dir")),
+        _ => {
+            return Ok(ComplianceRewrite {
+                tool_name: tool_name.to_string(),
+                args,
+                notice: None,
+                action: ComplianceAction::None,
+            })
+        }
+    };
+
+    match mode {
+        EnforcementMode::Strict => Err(rmcp::ErrorData::invalid_params(
+            format!(
+                "Direct calls to '{}' are blocked in strict mode. Use `run_pipeline` first.",
+                tool_name
+            ),
+            None,
+        )),
+        EnforcementMode::Default => {
+            let mut routed = serde_json::Map::new();
+            routed.insert("intent".to_string(), serde_json::Value::String(intent.to_string()));
+            if let Some(key) = target_key {
+                if let Some(value) = args.remove(key) {
+                    routed.insert("target".to_string(), value);
+                }
+            }
+            if let Some(repo_id) = args.remove("repo_id") {
+                routed.insert("repo_id".to_string(), repo_id);
+            }
+            Ok(ComplianceRewrite {
+                tool_name: "run_pipeline".to_string(),
+                args: routed,
+                notice: Some(format!(
+                    "[MARROW COMPLIANCE] Direct '{}' call was auto-routed through `run_pipeline`. Use `run_pipeline` first to avoid this warning.\n",
+                    tool_name
+                )),
+                action: ComplianceAction::AutoRouted,
+            })
+        }
+    }
+}
+
+fn ensure_workspace_config(enforcement_mode: Option<EnforcementMode>) -> Result<EnforcementMode> {
+    let mut cfg = read_workspace_config();
+    if !cfg.is_object() {
+        cfg = serde_json::json!({});
+    }
+
+    if cfg.get("ignore").is_none() {
+        cfg["ignore"] = serde_json::json!(["node_modules", "target", "dist", ".git"]);
+    }
+    if cfg.get("show_dashboard").is_none() {
+        cfg["show_dashboard"] = serde_json::Value::Bool(true);
+    }
+    if cfg.get("auto_open_ui").is_none() {
+        cfg["auto_open_ui"] = serde_json::Value::Bool(true);
+    }
+
+    let resolved_mode = enforcement_mode.unwrap_or_else(|| {
+        EnforcementMode::from_config_value(cfg.get("enforcement_mode").and_then(|v| v.as_str()))
+    });
+    cfg["enforcement_mode"] = serde_json::Value::String(resolved_mode.as_str().to_string());
+
+    fs::write(".marrowrc.json", serde_json::to_string_pretty(&cfg)?)?;
+    Ok(resolved_mode)
+}
+
+fn fallback_paths_for_agent(agent: skills::Agent, workspace_root: &Path) -> Vec<PathBuf> {
+    match agent {
+        skills::Agent::Cursor => vec![
+            workspace_root.join(".cursorrules"),
+            workspace_root.join(".vscode/mcp.json"),
+        ],
+        skills::Agent::GitHubCopilot => vec![workspace_root.join(".vscode/mcp.json")],
+        skills::Agent::Antigravity => vec![workspace_root.join(".roomrules")],
+        _ => Vec::new(),
+    }
+}
+
+fn coverage_status_for_agent(
+    agent: skills::Agent,
+    workspace_root: &Path,
+    home: &Path,
+) -> (&'static str, String) {
+    let project_target = workspace_root.join(agent.target_path(skills::Scope::Project, home));
+    let global_target = agent.target_path(skills::Scope::Global, home);
+
+    if project_target.exists() && path_contains_marrow_marker(&project_target) {
+        return ("protected", format!("project instructions at {}", project_target.display()));
+    }
+    if global_target.exists() && path_contains_marrow_marker(&global_target) {
+        return ("protected", format!("global instructions at {}", global_target.display()));
+    }
+
+    let fallback_hits: Vec<String> = fallback_paths_for_agent(agent, workspace_root)
+        .into_iter()
+        .filter(|path| path_contains_marrow_marker(path))
+        .map(|path| path.display().to_string())
+        .collect();
+    if !fallback_hits.is_empty() {
+        return (
+            "partial",
+            format!("fallback workspace files present: {}", fallback_hits.join(", ")),
+        );
+    }
+
+    (
+        "unprotected",
+        "no agent-specific Marrow instruction target found".to_string(),
+    )
+}
+
+fn format_agent_coverage_summary(workspace_root: &Path, home: &Path) -> String {
+    let agents = [
+        ("Claude Code", skills::Agent::ClaudeCode),
+        ("Antigravity", skills::Agent::Antigravity),
+        ("Cursor", skills::Agent::Cursor),
+        ("GitHub Copilot", skills::Agent::GitHubCopilot),
+        ("Cline", skills::Agent::Cline),
+        ("Zed", skills::Agent::Zed),
+    ];
+
+    let mut out = String::new();
+    writeln!(out, "Agent coverage:").ok();
+    for (name, agent) in agents {
+        let (status, detail) = coverage_status_for_agent(agent, workspace_root, home);
+        writeln!(out, "- {name}: {status} ({detail})").ok();
+    }
+    let windsurf_rules = workspace_root.join(".windsurfrules");
+    if path_contains_marrow_marker(&windsurf_rules) {
+        writeln!(
+            out,
+            "- Windsurf: partial (workspace fallback rules at {})",
+            windsurf_rules.display()
+        )
+        .ok();
+    }
+    out.trim_end().to_string()
+}
+
+fn format_validation_report(
+    workspace_root: &Path,
+    home: &Path,
+    mode: EnforcementMode,
+    conn: &rusqlite::Connection,
+) -> String {
+    let pipeline = db::read_stat(conn, "pipeline_requests");
+    let autorouted = db::read_stat(conn, "direct_low_level_autorouted");
+    let rejected = db::read_stat(conn, "direct_low_level_rejected");
+    let ambiguous = db::read_stat(conn, "ambiguous_symbol_requests");
+    let stale = db::read_stat(conn, "stale_capsule_prevented");
+    let compliance_total = pipeline + autorouted + rejected;
+    let compliance_pct = if compliance_total == 0 {
+        0.0
+    } else {
+        (pipeline as f64 / compliance_total as f64) * 100.0
+    };
+
+    format!(
+        "[MARROW] Validation report\n\
+         Path: {}\n\
+         Enforcement mode: {}\n\
+         {}\n\
+         Compliance stats:\n\
+         - run_pipeline requests: {}\n\
+         - direct low-level auto-routed: {}\n\
+         - direct low-level rejected: {}\n\
+         - ambiguous symbol requests: {}\n\
+         - stale capsule preventions: {}\n\
+         - run_pipeline compliance rate: {:.1}%",
+        workspace_root.display(),
+        mode.as_str(),
+        format_agent_coverage_summary(workspace_root, home),
+        pipeline,
+        autorouted,
+        rejected,
+        ambiguous,
+        stale,
+        compliance_pct
+    )
+}
+
 /// Checks whether the current workspace has been initialized (`.marrow/` exists).
 /// If not, creates it, writes project-scope rules files, and returns a notice
 /// string to prepend to the tool response. Non-fatal: errors are logged to stderr
@@ -271,7 +649,8 @@ impl ContextEngine {
 /// This is acceptable for a single-user local server; `write_workspace_rules` is
 /// idempotent so a double-write from a concurrent call causes no harm.
 async fn try_auto_init() -> Option<String> {
-    if std::path::Path::new(".marrow").exists() {
+    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if workspace_is_initialized(&root) {
         return None;
     }
     let result = tokio::task::spawn_blocking(|| -> anyhow::Result<()> {
@@ -286,6 +665,9 @@ async fn try_auto_init() -> Option<String> {
         }
         if let Err(e) = write_vscode_mcp_config(&root) {
             eprintln!("[MARROW AUTO-INIT] Warning: could not write .vscode/mcp.json: {e}");
+        }
+        if let Err(e) = ensure_workspace_config(Some(EnforcementMode::Default)) {
+            eprintln!("[MARROW AUTO-INIT] Warning: could not write .marrowrc.json: {e}");
         }
         Ok(())
     })
@@ -333,6 +715,12 @@ impl ServerHandler for ContextEngine {
                 tools: Some(ToolsCapability { list_changed: None }),
                 ..Default::default()
             },
+            instructions: Some(
+                "Use `run_pipeline` first for code exploration, dependency tracing, and refactor impact. \
+                 Direct low-level calls may be auto-routed or rejected depending on the workspace \
+                 enforcement mode."
+                    .to_string(),
+            ),
             ..Default::default()
         }
     }
@@ -374,13 +762,9 @@ impl ServerHandler for ContextEngine {
         let tools = vec![
             Tool::new(
                 "get_context_capsule",
-                "Prefer this over reading raw files. CRITICAL: ALWAYS use this tool first when asked to explain, modify, or \
-                 interact with any code symbol or file. NEVER use default file-reading tools \
-                 (read_file, cat, grep, etc.) as a substitute. This returns a highly optimized \
-                 AST graph capsule — the pivot symbol's full source plus condensed signatures \
-                 of every depth-1 caller, callee, and import — saving tokens and providing \
-                 the exact dependency context you need. If the repo is not yet indexed, run \
-                 ingest_repo first, then retry.",
+                "Advanced tool. Prefer `run_pipeline` first. Direct calls may be auto-routed in \
+                 default mode or rejected in strict mode. Returns the pivot symbol's full source \
+                 plus condensed depth-1 callers, callees, and imports.",
                 Self::schema(json!({
                     "type": "object",
                     "properties": {
@@ -398,11 +782,9 @@ impl ServerHandler for ContextEngine {
             ),
             Tool::new(
                 "analyze_impact",
-                "Prefer this over reading raw files. MANDATORY: Use this tool BEFORE proposing any code changes, refactors, or \
-                 deletions. It recursively maps the blast radius of a proposed change by \
-                 traversing the dependency graph to find every transitive caller/importer \
-                 across all repos up to depth 10. Skipping this step risks breaking \
-                 downstream dependents you cannot see.",
+                "Advanced tool. Prefer `run_pipeline` first. Direct calls may be auto-routed in \
+                 default mode or rejected in strict mode. Recursively maps the blast radius of \
+                 a proposed change across callers and importers.",
                 Self::schema(json!({
                     "type": "object",
                     "properties": {
@@ -451,10 +833,15 @@ impl ServerHandler for ContextEngine {
                  The observation is hash-linked to the symbol's current AST node so \
                  Marrow can automatically flag it as stale if the code changes after \
                  the next ingest_repo run. Use the relative file path as stored in the \
-                 graph (e.g. 'src/main.rs').",
+                 graph (e.g. 'src/main.rs'). Supply `repo_id` when you want to target a \
+                 repo other than the current workspace.",
                 Self::schema(json!({
                     "type": "object",
                     "properties": {
+                        "repo_id": {
+                            "type": "string",
+                            "description": "Optional repo override. Defaults to the current workspace repo."
+                        },
                         "symbol_name": {
                             "type": "string",
                             "description": "Exact name of the symbol to link the memory to (e.g. 'ingest_repo')."
@@ -476,10 +863,15 @@ impl ServerHandler for ContextEngine {
                 "Retrieve stored session memories (observations) for a symbol or file. \
                  Memories that have gone stale — because the underlying code changed \
                  since they were recorded — are returned with a prominent warning so \
-                 the caller knows to re-verify them before trusting.",
+                 the caller knows to re-verify them before trusting. Supply `repo_id` \
+                 to inspect memories outside the current workspace repo.",
                 Self::schema(json!({
                     "type": "object",
                     "properties": {
+                        "repo_id": {
+                            "type": "string",
+                            "description": "Optional repo override. Defaults to the current workspace repo."
+                        },
                         "symbol_name": {
                             "type": "string",
                             "description": "Filter memories by this symbol name."
@@ -493,14 +885,16 @@ impl ServerHandler for ContextEngine {
             ),
             Tool::new(
                 "get_skeleton",
-                "Prefer this over reading raw files. Return a token-efficient Markdown map of the repository's high-level \
-                 architecture: every function, class, struct, trait, and interface grouped \
-                 by file. Use this as your first call when asked to understand or navigate \
-                 an unfamiliar codebase. Hard-capped at 2,000 symbols for token safety; \
-                 drill into specific files with get_context_capsule afterwards.",
+                "Advanced tool. Prefer `run_pipeline` first. Direct calls may be auto-routed in \
+                 default mode or rejected in strict mode. Returns a token-efficient Markdown \
+                 map of one repo's high-level architecture, grouped by file.",
                 Self::schema(json!({
                     "type": "object",
                     "properties": {
+                        "repo_id": {
+                            "type": "string",
+                            "description": "Optional repo override. Defaults to the current workspace repo."
+                        },
                         "target_dir": {
                             "type": "string",
                             "description": "Optional path prefix to restrict the skeleton to a \
@@ -542,12 +936,16 @@ impl ServerHandler for ContextEngine {
                 "workspace_setup",
                 "CRITICAL: Run this tool when the user asks you to initialize Marrow, OR \
                  automatically if `.marrow/` does not exist in the current workspace and \
-                 auto-init has not already run. Generates agent instruction files \
-                 (.cursorrules and .clinerules) that enforce the Marrow-First workflow. \
-                 Notify the user after calling it.",
+                 auto-init has not already run. Generates workspace rule files, writes \
+                 `.vscode/mcp.json`, and persists the workspace enforcement mode.",
                 Self::schema(json!({
                     "type": "object",
-                    "properties": {}
+                    "properties": {
+                        "enforcement_mode": {
+                            "type": "string",
+                            "description": "Optional. Set to 'default' to warn and auto-route low-level calls, or 'strict' to reject them."
+                        }
+                    }
                 })),
             ),
         ];
@@ -572,9 +970,24 @@ impl ServerHandler for ContextEngine {
             } else {
                 None
             };
+            let original_tool_name = request.name.to_string();
+            let stats_db = Arc::clone(&db);
             let args = request.arguments.unwrap_or_default();
+            let enforcement_mode = read_enforcement_mode();
+            let compliance = match apply_compliance_gate(&original_tool_name, args, enforcement_mode) {
+                Ok(rewrite) => rewrite,
+                Err(err) => {
+                    if let Ok(conn) = db.lock() {
+                        let _ = db::increment_stat(&conn, "direct_low_level_rejected", 1);
+                    }
+                    return Err(err);
+                }
+            };
+            let compliance_notice = compliance.notice;
+            let compliance_action = compliance.action;
+            let args = compliance.args;
 
-            let mut result = match request.name.as_ref() {
+            let mut result = match compliance.tool_name.as_str() {
                 // ── get_context_capsule ───────────────────────────────────────
                 "get_context_capsule" => {
                     let symbol_name  = Self::require_str(&args, "symbol_name")?.to_string();
@@ -583,21 +996,20 @@ impl ServerHandler for ContextEngine {
                                            .cloned()
                                            .unwrap_or_else(|| "Unknown Agent".to_string());
 
+                    let cwd = current_workspace_root();
+                    if let Some(msg) = self.maybe_jit_index(&repo_id, &cwd) {
+                        return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                    }
+
                     let sym_for_event  = symbol_name.clone();
                     let repo_for_event = repo_id.clone();
 
-                    let (out, original_text, capsule_tokens, file_tokens, abs_file_path, auto_indexed) =
+                    let (out, original_text, capsule_tokens, file_tokens, abs_file_path) =
                         tokio::task::spawn_blocking(move || {
                             let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
-
-                            let auto_indexed = if !db::is_workspace_indexed(&conn)? {
-                                let cwd = std::env::current_dir()
-                                    .unwrap_or_else(|_| PathBuf::from("."));
-                                ingestion::run_ingestion(&conn, &repo_id, &cwd)?;
-                                true
-                            } else {
-                                false
-                            };
+                            let cwd = current_workspace_root();
+                            let _resolved_repo_id =
+                                ensure_repo_ready(&conn, Some(&repo_id), &cwd)?;
 
                             let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id)?;
 
@@ -614,7 +1026,8 @@ impl ServerHandler for ContextEngine {
                                     "SELECT n.file_path, r.root_path \
                                      FROM nodes n \
                                      JOIN repositories r ON r.id = n.repo_id \
-                                     WHERE n.symbol_name = ?1 AND n.repo_id = ?2 LIMIT 1",
+                                     WHERE n.symbol_name = ?1 AND n.repo_id = ?2 \
+                                     ORDER BY n.file_path ASC LIMIT 1",
                                     rusqlite::params![symbol_name, repo_id],
                                     |row| {
                                         let fp: String = row.get(0)?;
@@ -633,7 +1046,7 @@ impl ServerHandler for ContextEngine {
                             let _ = db::increment_stat(&conn, "total_file_tokens",  full_file_tokens as i64);
                             let _ = db::increment_stat(&conn, "total_tokens_saved", saved);
 
-                            Ok::<_, anyhow::Error>((out, original_text_out, optimized_tokens, full_file_tokens, abs_path_str, auto_indexed))
+                            Ok::<_, anyhow::Error>((out, original_text_out, optimized_tokens, full_file_tokens, abs_path_str))
                         })
                         .await
                         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -671,15 +1084,6 @@ impl ServerHandler for ContextEngine {
                         }
                     });
 
-                    let out = if auto_indexed {
-                        format!(
-                            "[SYSTEM NOTE: The repository was automatically indexed prior to executing this query.]\n{}",
-                            out
-                        )
-                    } else {
-                        out
-                    };
-
                     Ok(CallToolResult::success(vec![Content::text(out)]))
                 }
 
@@ -688,25 +1092,23 @@ impl ServerHandler for ContextEngine {
                     let symbol_name = Self::require_str(&args, "symbol_name")?.to_string();
                     let repo_id     = Self::require_str(&args, "repo_id")?.to_string();
 
+                    let cwd = current_workspace_root();
+                    if let Some(msg) = self.maybe_jit_index(&repo_id, &cwd) {
+                        return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                    }
+
                     let sym_clone  = symbol_name.clone();
                     let repo_clone = repo_id.clone();
 
-                    let (result, auto_indexed) = tokio::task::spawn_blocking(move || {
+                    let result = tokio::task::spawn_blocking(move || {
                         let conn = db
                             .lock()
                             .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                        let cwd = current_workspace_root();
+                        let _resolved_repo_id =
+                            ensure_repo_ready(&conn, Some(&repo_id), &cwd)?;
 
-                        let auto_indexed = if !db::is_workspace_indexed(&conn)? {
-                            let cwd = std::env::current_dir()
-                                .unwrap_or_else(|_| PathBuf::from("."));
-                            ingestion::run_ingestion(&conn, &repo_id, &cwd)?;
-                            true
-                        } else {
-                            false
-                        };
-
-                        let result = retrieval::analyze_impact(&conn, &symbol_name, &repo_id)?;
-                        Ok::<_, anyhow::Error>((result, auto_indexed))
+                        retrieval::analyze_impact(&conn, &symbol_name, &repo_id)
                     })
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -770,15 +1172,6 @@ impl ServerHandler for ContextEngine {
                         }
                     });
 
-                    let out = if auto_indexed {
-                        format!(
-                            "[SYSTEM NOTE: The repository was automatically indexed prior to executing this query.]\n{}",
-                            out
-                        )
-                    } else {
-                        out
-                    };
-
                     Ok(CallToolResult::success(vec![Content::text(out)]))
                 }
 
@@ -813,10 +1206,15 @@ impl ServerHandler for ContextEngine {
                         .unwrap_or(current_dir);
 
                     // Phase 2 — Rule 2: Hard system blocklist
-                    let path_str = root_path.to_string_lossy();
-                    let blocked_segments = ["/Library/", "/.Trash/", "/etc/", "/System/", "/usr/bin/"];
-                    for seg in blocked_segments {
-                        if path_str.contains(seg) || path_str.ends_with(seg.trim_end_matches('/')) {
+                    let blocked_roots = [
+                        Path::new("/Library"),
+                        Path::new("/.Trash"),
+                        Path::new("/etc"),
+                        Path::new("/System"),
+                        Path::new("/usr/bin"),
+                    ];
+                    for blocked_root in blocked_roots {
+                        if root_path == blocked_root || root_path.starts_with(blocked_root) {
                             return Ok(CallToolResult::success(vec![Content::text(
                                 "CRITICAL SECURITY: Cannot index protected system directories."
                             )]));
@@ -887,10 +1285,13 @@ impl ServerHandler for ContextEngine {
                     let symbol_name      = Self::require_str(&args, "symbol_name")?.to_string();
                     let filepath         = Self::require_str(&args, "filepath")?.to_string();
                     let observation_text = Self::require_str(&args, "observation")?.to_string();
+                    let repo_id_arg      = args.get("repo_id").and_then(|v| v.as_str()).map(str::to_string);
 
                     let result = tokio::task::spawn_blocking(move || {
                         let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
-                        db::save_observation(&conn, &symbol_name, &filepath, &observation_text)
+                        let cwd = current_workspace_root();
+                        let repo_id = resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)?;
+                        db::save_observation(&conn, &repo_id, &symbol_name, &filepath, &observation_text)
                     })
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -901,13 +1302,20 @@ impl ServerHandler for ContextEngine {
 
                 // ── get_session_context ───────────────────────────────────────
                 "get_session_context" => {
+                    let repo_id     = args.get("repo_id").and_then(|v| v.as_str()).map(str::to_string);
                     let symbol_name = args.get("symbol_name").and_then(|v| v.as_str()).map(str::to_string);
                     let filepath    = args.get("filepath").and_then(|v| v.as_str()).map(str::to_string);
 
                     let result = tokio::task::spawn_blocking(move || {
                         let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                        let cwd = current_workspace_root();
+                        let resolved_repo_id = match repo_id {
+                            Some(ref repo) => Some(repo.clone()),
+                            None => resolve_request_repo_id(&conn, None, &cwd).ok(),
+                        };
                         db::get_session_context(
                             &conn,
+                            resolved_repo_id.as_deref(),
                             symbol_name.as_deref(),
                             filepath.as_deref(),
                         )
@@ -925,10 +1333,25 @@ impl ServerHandler for ContextEngine {
                         .get("target_dir")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
+                    let repo_id_arg = args.get("repo_id").and_then(|v| v.as_str()).map(str::to_string);
+
+                    let cwd = current_workspace_root();
+                    // Resolve the repo_id for JIT check (may be None → fallback)
+                    let jit_repo_id = {
+                        let conn = db.lock().map_err(|_| rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None))?;
+                        resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
+                            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                    };
+                    if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
+                        return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                    }
 
                     let result = tokio::task::spawn_blocking(move || {
                         let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
-                        retrieval::get_project_skeleton(&conn, target_dir.as_deref())
+                        let cwd = current_workspace_root();
+                        let repo_id =
+                            ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
+                        retrieval::get_project_skeleton(&conn, &repo_id, target_dir.as_deref())
                     })
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -950,17 +1373,35 @@ impl ServerHandler for ContextEngine {
                         "analyze_repo" => {
                             let target_dir = target.clone();
                             let target_dir_label = target_dir.clone().unwrap_or_else(|| "(workspace)".to_string());
-                            let result = tokio::task::spawn_blocking(move || {
+
+                            let cwd = current_workspace_root();
+                            let jit_repo_id = {
+                                let conn = db.lock().map_err(|_| rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None))?;
+                                resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
+                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                            };
+                            if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
+                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                            }
+
+                            let (result, repo_used) = tokio::task::spawn_blocking(move || {
                                 let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
-                                retrieval::get_project_skeleton(&conn, target_dir.as_deref())
+                                let cwd = current_workspace_root();
+                                let repo_id =
+                                    ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
+                                let skeleton = retrieval::get_project_skeleton(&conn, &repo_id, target_dir.as_deref())?;
+                                Ok::<_, anyhow::Error>((skeleton, repo_id))
                             })
                             .await
                             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-                            let node_count = result.lines().count();
+                            let node_count = result
+                                .lines()
+                                .filter(|line| line.trim_start().starts_with("- ["))
+                                .count();
                             let event = DashboardEvent::SkeletonGenerated {
-                                target_dir: target_dir_label,
+                                target_dir: format!("{repo_used}:{target_dir_label}"),
                                 node_count,
                                 ts: dashboard::now_ts(),
                             };
@@ -994,32 +1435,23 @@ impl ServerHandler for ContextEngine {
                             })?;
                             let sym_for_event  = symbol_name.clone();
 
-                            let (out, original_text, capsule_tokens, file_tokens, abs_file_path, auto_indexed, repo_used) =
+                            let cwd = current_workspace_root();
+                            let jit_repo_id = {
+                                let conn = db.lock().map_err(|_| rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None))?;
+                                resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
+                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                            };
+                            if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
+                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                            }
+
+                            let (out, original_text, capsule_tokens, file_tokens, abs_file_path, repo_used) =
                                 tokio::task::spawn_blocking(move || {
                                     let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
 
-                                    // Auto-detect repo_id if not supplied.
-                                    let repo_id = repo_id_arg.unwrap_or_else(|| {
-                                        conn.query_row(
-                                            "SELECT id FROM repositories LIMIT 1",
-                                            [],
-                                            |row| row.get::<_, String>(0),
-                                        )
-                                        .unwrap_or_else(|_| {
-                                            std::env::current_dir()
-                                                .ok()
-                                                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                                                .unwrap_or_else(|| "workspace".to_string())
-                                        })
-                                    });
-
-                                    let auto_indexed = if !db::is_workspace_indexed(&conn)? {
-                                        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                                        ingestion::run_ingestion(&conn, &repo_id, &cwd)?;
-                                        true
-                                    } else {
-                                        false
-                                    };
+                                    let cwd = current_workspace_root();
+                                    let repo_id =
+                                        ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
 
                                     let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id)?;
                                     let full_file_tokens  = capsule_result.original_text.len() / 4;
@@ -1032,7 +1464,8 @@ impl ServerHandler for ContextEngine {
                                             "SELECT n.file_path, r.root_path \
                                              FROM nodes n \
                                              JOIN repositories r ON r.id = n.repo_id \
-                                             WHERE n.symbol_name = ?1 AND n.repo_id = ?2 LIMIT 1",
+                                             WHERE n.symbol_name = ?1 AND n.repo_id = ?2 \
+                                             ORDER BY n.file_path ASC LIMIT 1",
                                             rusqlite::params![symbol_name, repo_id],
                                             |row| {
                                                 let fp: String = row.get(0)?;
@@ -1047,7 +1480,7 @@ impl ServerHandler for ContextEngine {
                                     let _ = db::increment_stat(&conn, "total_file_tokens",  full_file_tokens as i64);
                                     let _ = db::increment_stat(&conn, "total_tokens_saved", saved);
 
-                                    Ok::<_, anyhow::Error>((out, original_text_out, optimized_tokens, full_file_tokens, abs_path_str, auto_indexed, repo_id))
+                                    Ok::<_, anyhow::Error>((out, original_text_out, optimized_tokens, full_file_tokens, abs_path_str, repo_id))
                                 })
                                 .await
                                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -1079,11 +1512,6 @@ impl ServerHandler for ContextEngine {
                                 }
                             });
 
-                            let out = if auto_indexed {
-                                format!("[SYSTEM NOTE: The repository was automatically indexed prior to executing this query.]\n{out}")
-                            } else {
-                                out
-                            };
                             Ok(CallToolResult::success(vec![Content::text(out)]))
                         }
 
@@ -1096,33 +1524,25 @@ impl ServerHandler for ContextEngine {
                             })?;
                             let sym_clone = symbol_name.clone();
 
-                            let (result, auto_indexed, repo_used) = tokio::task::spawn_blocking(move || {
+                            let cwd = current_workspace_root();
+                            let jit_repo_id = {
+                                let conn = db.lock().map_err(|_| rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None))?;
+                                resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
+                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                            };
+                            if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
+                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                            }
+
+                            let (result, repo_used) = tokio::task::spawn_blocking(move || {
                                 let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
 
-                                let repo_id = repo_id_arg.unwrap_or_else(|| {
-                                    conn.query_row(
-                                        "SELECT id FROM repositories LIMIT 1",
-                                        [],
-                                        |row| row.get::<_, String>(0),
-                                    )
-                                    .unwrap_or_else(|_| {
-                                        std::env::current_dir()
-                                            .ok()
-                                            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                                            .unwrap_or_else(|| "workspace".to_string())
-                                    })
-                                });
-
-                                let auto_indexed = if !db::is_workspace_indexed(&conn)? {
-                                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                                    ingestion::run_ingestion(&conn, &repo_id, &cwd)?;
-                                    true
-                                } else {
-                                    false
-                                };
+                                let cwd = current_workspace_root();
+                                let repo_id =
+                                    ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
 
                                 let result = retrieval::analyze_impact(&conn, &symbol_name, &repo_id)?;
-                                Ok::<_, anyhow::Error>((result, auto_indexed, repo_id))
+                                Ok::<_, anyhow::Error>((result, repo_id))
                             })
                             .await
                             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -1162,11 +1582,6 @@ impl ServerHandler for ContextEngine {
                                 }
                             });
 
-                            let out = if auto_indexed {
-                                format!("[SYSTEM NOTE: The repository was automatically indexed prior to executing this query.]\n{out}")
-                            } else {
-                                out
-                            };
                             Ok(CallToolResult::success(vec![Content::text(out)]))
                         }
 
@@ -1179,23 +1594,31 @@ impl ServerHandler for ContextEngine {
 
                 // ── workspace_setup ───────────────────────────────────────────
                 "workspace_setup" => {
+                    let enforcement_mode = EnforcementMode::from_config_value(
+                        args.get("enforcement_mode").and_then(|v| v.as_str()),
+                    );
                     tokio::task::spawn_blocking(move || {
                         let workspace_root = std::env::current_dir()
                             .unwrap_or_else(|_| PathBuf::from("."));
                         write_workspace_rules(&workspace_root)?;
-                        write_vscode_mcp_config(&workspace_root)
+                        write_vscode_mcp_config(&workspace_root)?;
+                        ensure_workspace_config(Some(enforcement_mode))?;
+                        Ok::<_, anyhow::Error>(workspace_root)
                     })
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                    Ok(CallToolResult::success(vec![Content::text(format!(
-                        "[MARROW] Successfully integrated! Workspace rules appended, and VS Code / Copilot MCP configuration automatically generated.\n\
-                         Path: {}\n\
-                         You MUST now use run_pipeline for all tasks. Agents using this workspace will now follow the Marrow-First workflow protocol.",
-                        cwd.display()
-                    ))]))
+                    let cwd = std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .canonicalize()
+                        .unwrap_or_else(|_| PathBuf::from("."));
+                    let home = std::env::var("HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|_| PathBuf::from("."));
+                    Ok(CallToolResult::success(vec![Content::text(
+                        format_workspace_setup_summary(&cwd, enforcement_mode, &home),
+                    )]))
                 }
 
                 _ => Err(rmcp::ErrorData::method_not_found::<
@@ -1203,7 +1626,19 @@ impl ServerHandler for ContextEngine {
                 >()),
             };
 
-            // Prepend auto-init notice to successful responses
+            if let Ok(conn) = stats_db.lock() {
+                if original_tool_name == "run_pipeline" {
+                    let _ = db::increment_stat(&conn, "pipeline_requests", 1);
+                }
+                if matches!(compliance_action, ComplianceAction::AutoRouted) {
+                    let _ = db::increment_stat(&conn, "direct_low_level_autorouted", 1);
+                }
+            }
+
+            // Prepend compliance notice and auto-init notice to successful responses
+            if let (Some(notice), Ok(ref mut tool_result)) = (&compliance_notice, &mut result) {
+                tool_result.content.insert(0, Content::text(notice.as_str()));
+            }
             if let (Some(notice), Ok(ref mut tool_result)) = (&init_notice, &mut result) {
                 tool_result.content.insert(0, Content::text(notice.as_str()));
             }
@@ -1213,11 +1648,60 @@ impl ServerHandler for ContextEngine {
     }
 }
 
+fn rule_install_note() -> &'static str {
+    "Rule files strengthen Marrow-first behavior for each agent's native instruction surface. Existing files are preserved. Choose default enforcement to auto-route bypasses or strict enforcement to reject them."
+}
+
+fn format_rule_plan_line(
+    name: &str,
+    agent: skills::Agent,
+    scope: skills::Scope,
+    method: skills::Method,
+    home: &Path,
+) -> String {
+    let target = agent.target_path(scope, home);
+    let source = skills::install_source_description(method, home);
+    format!("{name} -> {} ({source})", target.display())
+}
+
+fn format_rule_install_status_line(
+    name: &str,
+    status: skills::InstallStatus,
+    target: &Path,
+) -> String {
+    let action = match status {
+        skills::InstallStatus::Written => "rules written",
+        skills::InstallStatus::PreservedExisting => "rules preserved",
+    };
+    format!("{name} {action} -> {}", target.display())
+}
+
+fn format_workspace_setup_summary(
+    workspace_root: &Path,
+    enforcement_mode: EnforcementMode,
+    home: &Path,
+) -> String {
+    format!(
+        "[MARROW] Workspace setup complete.\n\
+         Path: {}\n\
+         Files: .cursorrules, .clinerules, .roomrules, .windsurfrules, .vscode/mcp.json\n\
+         Enforcement mode: {}\n\
+         Existing files are preserved when Marrow rules are already present.\n\
+         Root-level files provide fallback coverage, but primary agent-specific instruction targets still matter.\n\
+         {}\n\
+         Run `marrow integrate` to install agent-specific instruction files where coverage is still partial or unprotected.",
+        workspace_root.display(),
+        enforcement_mode.as_str(),
+        format_agent_coverage_summary(workspace_root, home)
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn count_tokens_nonempty_returns_nonzero() {
@@ -1292,6 +1776,82 @@ mod tests {
         assert_eq!(skill_agents.len(), 6);
     }
 
+    #[test]
+    fn rule_install_note_mentions_optional_rules_and_preservation() {
+        let note = rule_install_note();
+        assert!(
+            note.contains("native instruction surface"),
+            "expected Marrow usage guidance: {note}"
+        );
+        assert!(
+            note.contains("Existing files are preserved"),
+            "expected preservation guidance: {note}"
+        );
+        assert!(
+            note.contains("strict enforcement"),
+            "expected strict enforcement guidance: {note}"
+        );
+    }
+
+    #[test]
+    fn format_rule_plan_line_includes_target_and_source() {
+        let line = format_rule_plan_line(
+            "GitHub Copilot",
+            skills::Agent::GitHubCopilot,
+            skills::Scope::Project,
+            skills::Method::Symlink,
+            Path::new("/tmp/home"),
+        );
+        assert!(line.contains("GitHub Copilot"), "agent name missing: {line}");
+        assert!(
+            line.contains(".github/instructions/marrow-optimization.instructions.md"),
+            "target path missing: {line}"
+        );
+        assert!(
+            line.contains("/tmp/home/.marrow/marrow-optimization.md"),
+            "source path missing: {line}"
+        );
+    }
+
+    #[test]
+    fn format_rule_install_status_line_reports_preserved_targets() {
+        let line = format_rule_install_status_line(
+            "Cursor",
+            skills::InstallStatus::PreservedExisting,
+            Path::new("/tmp/home/.cursor/rules/marrow-optimization.mdc"),
+        );
+        assert!(line.contains("rules preserved"), "status missing: {line}");
+        assert!(
+            line.contains(".cursor/rules/marrow-optimization.mdc"),
+            "target path missing: {line}"
+        );
+    }
+
+    #[test]
+    fn workspace_setup_summary_matches_newer_installer_expectations() {
+        let summary = format_workspace_setup_summary(
+            Path::new("/tmp/workspace"),
+            EnforcementMode::Default,
+            Path::new("/tmp/home"),
+        );
+        assert!(
+            summary.contains("Existing files are preserved"),
+            "preservation guidance missing: {summary}"
+        );
+        assert!(
+            summary.contains("Agent coverage"),
+            "agent coverage summary missing: {summary}"
+        );
+        assert!(
+            summary.contains("/tmp/workspace"),
+            "workspace path missing: {summary}"
+        );
+        assert!(
+            summary.contains("Enforcement mode: default"),
+            "summary should describe the current enforcement mode: {summary}"
+        );
+    }
+
     #[tokio::test]
     async fn auto_init_fires_when_marrow_absent_then_skips() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1317,6 +1877,113 @@ mod tests {
 
         // Restore CWD
         std::env::set_current_dir(original).unwrap();
+    }
+
+    #[test]
+    fn compliance_gate_autoroutes_direct_capsule_call_in_default_mode() {
+        let args = json!({
+            "symbol_name": "bulk_update",
+            "repo_id": "accrualify-rails"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let routed = apply_compliance_gate("get_context_capsule", args, EnforcementMode::Default)
+            .expect("default mode should auto-route direct low-level calls");
+
+        assert_eq!(routed.tool_name, "run_pipeline");
+        assert_eq!(routed.args.get("intent").and_then(|v| v.as_str()), Some("explore_symbol"));
+        assert_eq!(routed.args.get("target").and_then(|v| v.as_str()), Some("bulk_update"));
+        assert_eq!(routed.args.get("repo_id").and_then(|v| v.as_str()), Some("accrualify-rails"));
+        assert!(
+            routed.notice.as_deref().unwrap_or_default().contains("auto-routed"),
+            "expected compliance warning notice"
+        );
+    }
+
+    #[test]
+    fn compliance_gate_rejects_direct_low_level_call_in_strict_mode() {
+        let args = json!({
+            "symbol_name": "bulk_update",
+            "repo_id": "accrualify-rails"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let err = apply_compliance_gate("analyze_impact", args, EnforcementMode::Strict)
+            .expect_err("strict mode should reject direct low-level calls");
+        assert!(
+            err.message.contains("run_pipeline"),
+            "strict mode error should instruct callers to use run_pipeline: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn validation_report_includes_compliance_counters() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        crate::db::increment_stat(&conn, "pipeline_requests", 5).unwrap();
+        crate::db::increment_stat(&conn, "direct_low_level_autorouted", 2).unwrap();
+        crate::db::increment_stat(&conn, "direct_low_level_rejected", 1).unwrap();
+        crate::db::increment_stat(&conn, "ambiguous_symbol_requests", 3).unwrap();
+        crate::db::increment_stat(&conn, "stale_capsule_prevented", 4).unwrap();
+
+        let report = format_validation_report(
+            Path::new("/tmp/workspace"),
+            Path::new("/tmp/home"),
+            EnforcementMode::Strict,
+            &conn,
+        );
+
+        assert!(report.contains("run_pipeline requests: 5"), "pipeline count missing: {report}");
+        assert!(report.contains("direct low-level auto-routed: 2"), "autoroute count missing: {report}");
+        assert!(report.contains("direct low-level rejected: 1"), "reject count missing: {report}");
+        assert!(report.contains("Enforcement mode: strict"), "mode missing: {report}");
+    }
+
+    #[test]
+    fn agent_coverage_summary_reports_partial_for_cursor_fallback_files() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join(".cursorrules"), "marrow").unwrap();
+        fs::create_dir_all(workspace.path().join(".vscode")).unwrap();
+        fs::write(workspace.path().join(".vscode/mcp.json"), "{}").unwrap();
+
+        let summary = format_agent_coverage_summary(workspace.path(), home.path());
+        assert!(summary.contains("Cursor: partial"), "cursor fallback coverage should be partial: {summary}");
+    }
+
+    #[test]
+    fn agent_coverage_ignores_unrelated_instruction_file_contents() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = workspace.path().join(".cursor/rules/marrow-optimization.mdc");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "unrelated content").unwrap();
+
+        let (status, _) = coverage_status_for_agent(skills::Agent::Cursor, workspace.path(), home.path());
+        assert_eq!(status, "unprotected", "non-Marrow files should not count as protected");
+    }
+
+    #[test]
+    fn ensure_repo_ready_rejects_explicit_repo_id_for_other_workspace() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let indexed_root = tempfile::tempdir().unwrap();
+        let current_root = tempfile::tempdir().unwrap();
+        let indexed_root_path = indexed_root.path().canonicalize().unwrap();
+        let current_root_path = current_root.path().canonicalize().unwrap();
+
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params!["other_repo", indexed_root_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        let err = ensure_repo_ready(&conn, Some("other_repo"), &current_root_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Run ingest_repo"), "expected explicit guidance to ingest the correct repo: {msg}");
     }
 }
 
@@ -1480,7 +2147,8 @@ fn cmd_rules() -> Result<()> {
     let root = std::env::current_dir().context("could not determine current directory")?;
     write_workspace_rules(&root)?;
     write_vscode_mcp_config(&root)?;
-    eprintln!("[MARROW] Successfully integrated! Workspace rules appended, and VS Code / Copilot MCP configuration automatically generated.");
+    ensure_workspace_config(Some(EnforcementMode::Default))?;
+    eprintln!("[MARROW] Successfully integrated! Workspace rules appended, VS Code / Copilot MCP configuration generated, and workspace enforcement set to default.");
     Ok(())
 }
 
@@ -1491,22 +2159,9 @@ fn cmd_init() -> Result<()> {
         eprintln!("Warning: could not create .marrow/ directory ({e}). Continuing.");
     }
 
-    let rc_path = Path::new(".marrowrc.json");
-    if rc_path.exists() {
-        eprintln!(".marrowrc.json already exists — skipping.");
-    } else {
-        let default_config = serde_json::json!({
-            "ignore": ["node_modules", "target", "dist", ".git"],
-            "show_dashboard": true,
-            "auto_open_ui": true
-        });
-        if let Ok(pretty) = serde_json::to_string_pretty(&default_config) {
-            if let Err(e) = fs::write(rc_path, pretty) {
-                eprintln!("Warning: could not write .marrowrc.json ({e}). Using defaults.");
-            } else {
-                eprintln!("Created .marrowrc.json with default ignore patterns.");
-            }
-        }
+    match ensure_workspace_config(Some(EnforcementMode::Default)) {
+        Ok(_) => eprintln!("Ensured .marrowrc.json with default settings."),
+        Err(e) => eprintln!("Warning: could not write .marrowrc.json ({e}). Using defaults."),
     }
 
     eprintln!("Initialized .marrow/ workspace.");
@@ -1750,21 +2405,13 @@ fn cmd_integrate() -> Result<()> {
         return Ok(());
     }
 
-    // Scope selection: Global writes to ~/.agent/rules; Project writes to .agent/rules in CWD
-    let scope_idx = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Installation scope for optimization rules")
-        .items(&["Global (recommended — works in every project)", "Project (current directory only)"])
+    eprintln!("  {}", style(rule_install_note()).dim());
+    let install_rules = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Create Marrow rule files for the selected agents?")
+        .items(&["Yes (recommended)", "No"])
         .default(0)
-        .interact()?;
-    let scope = if scope_idx == 0 { skills::Scope::Global } else { skills::Scope::Project };
-
-    // Method selection: WriteFile copies the content; Symlink points to ~/.marrow/marrow-optimization.md
-    let method_idx = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Installation method for optimization rules")
-        .items(&["Write File (recommended)", "Symlink (auto-updates on Marrow upgrades)"])
-        .default(0)
-        .interact()?;
-    let method = if method_idx == 0 { skills::Method::WriteFile } else { skills::Method::Symlink };
+        .interact()?
+        == 0;
 
     let binary = std::env::current_exe()
         .context("Could not resolve current executable path")?
@@ -1773,6 +2420,75 @@ fn cmd_integrate() -> Result<()> {
     let home = std::env::var("HOME").context("$HOME is not set")?;
     let home_path = PathBuf::from(&home);
     let ctx = IntegrationCtx { binary, home };
+
+    let rule_config = if install_rules {
+        // Scope selection: Global writes to ~/.agent/rules; Project writes to .agent/rules in CWD
+        let scope_idx = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Rule file scope")
+            .items(&["Global (recommended)", "Project"])
+            .default(0)
+            .interact()?;
+        let scope = if scope_idx == 0 {
+            skills::Scope::Global
+        } else {
+            skills::Scope::Project
+        };
+
+        // Method selection: WriteFile copies the content; Symlink points to ~/.marrow/marrow-optimization.md
+        let method_idx = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Rule file method")
+            .items(&["Write File", "Symlink"])
+            .default(0)
+            .interact()?;
+        let method = if method_idx == 0 {
+            skills::Method::WriteFile
+        } else {
+            skills::Method::Symlink
+        };
+
+        eprintln!();
+        eprintln!("  {}", style("Rule files to create:").dim());
+        for idx in &selections {
+            let (name, _, skill_agent) = agents[*idx];
+            eprintln!(
+                "    {}",
+                style(format_rule_plan_line(name, skill_agent, scope, method, &home_path)).dim()
+            );
+        }
+        eprintln!(
+            "  {}",
+            style("Edit/remove the target paths above later if you want to disable implicit Marrow guidance.").dim()
+        );
+        Some((scope, method))
+    } else {
+        eprintln!(
+            "  {}",
+            style(
+                "Rule files skipped. Marrow will still be available via MCP, but some agents may need explicit prompts to use it."
+            )
+            .dim()
+        );
+        None
+    };
+
+    let enforcement_idx = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Workspace enforcement mode")
+        .items(&[
+            "Default (warn + auto-route low-level bypasses)",
+            "Strict (reject low-level bypasses)",
+        ])
+        .default(0)
+        .interact()?;
+    let enforcement_mode = if enforcement_idx == 0 {
+        EnforcementMode::Default
+    } else {
+        EnforcementMode::Strict
+    };
+    ensure_workspace_config(Some(enforcement_mode))?;
+    eprintln!(
+        "  {}",
+        style(format!("Workspace enforcement mode set to '{}'.", enforcement_mode.as_str())).dim()
+    );
 
     eprintln!();
     for idx in selections {
@@ -1801,27 +2517,55 @@ fn cmd_integrate() -> Result<()> {
             ),
         }
 
-        // 2. Optimization skill (new)
+        // 2. Optional rule files
         if matches!(mcp_result, Ok(AgentOutcome::Installed)) {
-            match skills::install_skill(skill_agent, scope, method, &home_path) {
-                Ok(()) => eprintln!(
-                    "  {}  {}  {}",
-                    style("✓").green().bold(),
-                    style(name).bold(),
-                    style("skill written").dim(),
-                ),
-                Err(e) => eprintln!(
-                    "  {}  {}  {}",
-                    style("✗").red().bold(),
-                    style(name).bold(),
-                    style(format!("skill — {e}")).red(),
-                ),
+            if let Some((scope, method)) = rule_config {
+                let target = skill_agent.target_path(scope, &home_path);
+                match skills::install_skill(skill_agent, scope, method, &home_path) {
+                    Ok(status) => {
+                        eprintln!(
+                            "  {}  {}",
+                            style("✓").green().bold(),
+                            style(format_rule_install_status_line(name, status, &target)).dim(),
+                        );
+                        eprintln!(
+                            "      {}",
+                            style(skills::install_source_description(method, &home_path)).dim(),
+                        );
+                    }
+                    Err(e) => eprintln!(
+                        "  {}  {}  {}",
+                        style("✗").red().bold(),
+                        style(name).bold(),
+                        style(format!("rules — {e}")).red(),
+                    ),
+                }
             }
         }
     }
 
     eprintln!();
+    eprintln!(
+        "  {}",
+        style(format_agent_coverage_summary(&current_workspace_root(), &home_path)).dim()
+    );
     eprintln!("  {}", style("Done.").bold());
+    Ok(())
+}
+
+fn cmd_validate() -> Result<()> {
+    let workspace_root = current_workspace_root();
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .context("$HOME is not set")?;
+    let mode = read_enforcement_mode();
+    let db_path = std::env::var("MARROW_DB_PATH")
+        .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+    let conn = db::init_db(&db_path)?;
+    println!(
+        "{}",
+        format_validation_report(&workspace_root, &home, mode, &conn)
+    );
     Ok(())
 }
 
@@ -1986,6 +2730,7 @@ async fn main() -> Result<()> {
         Some("index")     => return cmd_index(),
         Some("test-capsules") => return cmd_test_capsules(),
         Some("integrate") => return cmd_integrate(),
+        Some("validate")  => return cmd_validate(),
 Some("benchmark") => {
             let symbol = args.get(2).ok_or_else(|| {
                 anyhow::anyhow!("Usage: {} benchmark <symbol> <repo_id>", args[0])
@@ -2037,10 +2782,7 @@ Some("benchmark") => {
     // ── Read config flags in one pass ───────────────────────────────
     // Config read is always best-effort; a missing/unreadable file is not fatal.
     let (show_dashboard, auto_open_ui, enable_watcher, watch_debounce_ms) = {
-        let cfg: serde_json::Value = fs::read_to_string(".marrowrc.json")
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
+        let cfg = read_workspace_config();
         let show      = cfg.get("show_dashboard").and_then(|b| b.as_bool()).unwrap_or(true);
         let open      = cfg.get("auto_open_ui").and_then(|b| b.as_bool()).unwrap_or(true);
         let watcher   = cfg.get("enable_watcher").and_then(|b| b.as_bool()).unwrap_or(false);
@@ -2114,6 +2856,7 @@ Some("benchmark") => {
     let engine = ContextEngine {
         db:          Arc::clone(&db_arc),
         http_client,
+        is_indexing: Arc::new(AtomicBool::new(false)),
     };
 
     eprintln!("Marrow MCP server ready — listening on stdio.");
