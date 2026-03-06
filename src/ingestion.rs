@@ -231,6 +231,28 @@ pub fn extract_calls_from_symbol(raw_text: &str, lang_ext: &str) -> Vec<String> 
     })
 }
 
+const RAW_TEXT_MAX_BYTES: usize = 50_000; // ~50 KB (leaves room for sentinel)
+
+/// Truncates `text` to `RAW_TEXT_MAX_BYTES` if it exceeds that threshold,
+/// appending a sentinel comment so callers know the body is incomplete.
+/// Full source is always available on disk via the node's `file_path`.
+fn cap_raw_text(text: String) -> String {
+    if text.len() <= RAW_TEXT_MAX_BYTES {
+        return text;
+    }
+    // Truncate at a char boundary to avoid splitting UTF-8 sequences
+    let end = text
+        .char_indices()
+        .take_while(|(i, _)| *i < RAW_TEXT_MAX_BYTES)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(RAW_TEXT_MAX_BYTES);
+    format!(
+        "{}\n# [MARROW: body truncated at 50KB — full source available in file]",
+        &text[..end]
+    )
+}
+
 /// Parse a single file and return its language tag plus extracted symbols.
 pub fn parse_file(path: &Path) -> Result<(String, Vec<Symbol>)> {
     let ext = path
@@ -268,7 +290,7 @@ pub fn parse_file(path: &Path) -> Result<(String, Vec<Symbol>)> {
                 let node = capture.node;
                 let capture_name = query.capture_names()[capture.index as usize];
                 let name = extract_symbol_name(&node, source_bytes);
-                let raw_text = node.utf8_text(source_bytes).unwrap_or("").to_string();
+                let raw_text = cap_raw_text(node.utf8_text(source_bytes).unwrap_or("").to_string());
                 syms.push(Symbol {
                     name,
                     symbol_type: capture_name.to_string(),
@@ -776,6 +798,28 @@ function foo() {
         assert_eq!(second, third, "repeated calls must return same result");
         assert!(first.contains(&"bar".to_string()), "bar must be detected: {first:?}");
         assert!(first.contains(&"baz".to_string()), "baz must be detected: {first:?}");
+    }
+
+    #[test]
+    fn raw_text_cap_applied_to_oversized_symbols() {
+        // Build a string just over 50KB
+        let big_body = "x".repeat(51_200);
+        let capped = cap_raw_text(big_body.clone());
+        assert!(
+            capped.len() < big_body.len(),
+            "oversized raw_text should be truncated"
+        );
+        assert!(
+            capped.contains("[MARROW: body truncated"),
+            "truncated text should contain sentinel: {capped}"
+        );
+    }
+
+    #[test]
+    fn raw_text_cap_passes_small_symbols_unchanged() {
+        let small = "def foo\n  42\nend\n".to_string();
+        let result = cap_raw_text(small.clone());
+        assert_eq!(result, small, "small raw_text should be unchanged");
     }
 
     #[test]
