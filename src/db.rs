@@ -85,14 +85,12 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_obs_filepath ON observations(filepath);
 
         CREATE TABLE IF NOT EXISTS files (
-            repo_id      TEXT NOT NULL,
+            repo_id      TEXT NOT NULL REFERENCES repositories(id),
             file_path    TEXT NOT NULL,
             mtime_secs   INTEGER NOT NULL,
             content_hash TEXT NOT NULL,
             PRIMARY KEY (repo_id, file_path)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_files_repo ON files(repo_id);",
+        );",
     )?;
     ensure_observations_repo_id(&conn)?;
     Ok(conn)
@@ -101,7 +99,7 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
 /// Runs a WAL checkpoint (truncating the WAL file) and an incremental
 /// vacuum pass. Call this after every successful ingestion to keep the
 /// database file from growing unboundedly.
-#[allow(dead_code)]
+#[allow(dead_code)] // TODO(Task 4): remove once wired into run_ingestion success path
 pub fn vacuum_and_checkpoint(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA wal_checkpoint(TRUNCATE);
