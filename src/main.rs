@@ -1212,6 +1212,21 @@ mod tests {
         assert!(table.contains("Tokens Saved"), "label missing:\n{table}");
         assert!(table.contains("0.0%"),         "reduction should be 0.0%:\n{table}");
     }
+
+    #[test]
+    fn integrate_agent_list_covers_all_skill_agents() {
+        // Ensures the integrate agent table and skills::Agent enum stay in sync.
+        use crate::skills::Agent;
+        let skill_agents = [
+            Agent::ClaudeCode,
+            Agent::Antigravity,
+            Agent::Cursor,
+            Agent::GitHubCopilot,
+            Agent::Cline,
+            Agent::Zed,
+        ];
+        assert_eq!(skill_agents.len(), 6);
+    }
 }
 
 // ── CLI subcommands ───────────────────────────────────────────────────────────
@@ -1613,9 +1628,8 @@ fn integrate_zed(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
 /// `marrow integrate` — launch the interactive TUI installer.
 fn cmd_integrate() -> Result<()> {
     use console::style;
-    use dialoguer::{MultiSelect, theme::ColorfulTheme};
+    use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
 
-    // ── Banner ────────────────────────────────────────────────────────
     eprintln!("{}", style(MARROW_BANNER).cyan().bold());
     eprintln!(
         "  {}",
@@ -1623,18 +1637,17 @@ fn cmd_integrate() -> Result<()> {
     );
     eprintln!();
 
-    // ── Agent menu ────────────────────────────────────────────────────
     #[allow(clippy::type_complexity)]
-    let agents: &[(&str, fn(&IntegrationCtx) -> Result<AgentOutcome>)] = &[
-        ("Claude Code",          integrate_claude),
-        ("Antigravity (Gemini)", integrate_antigravity),
-        ("Cursor",               integrate_cursor),
-        ("GitHub Copilot",       integrate_copilot),
-        ("Cline",                integrate_cline),
-        ("Zed",                  integrate_zed),
+    let agents: &[(&str, fn(&IntegrationCtx) -> Result<AgentOutcome>, skills::Agent)] = &[
+        ("Claude Code",          integrate_claude,       skills::Agent::ClaudeCode),
+        ("Antigravity (Gemini)", integrate_antigravity,  skills::Agent::Antigravity),
+        ("Cursor",               integrate_cursor,       skills::Agent::Cursor),
+        ("GitHub Copilot",       integrate_copilot,      skills::Agent::GitHubCopilot),
+        ("Cline",                integrate_cline,        skills::Agent::Cline),
+        ("Zed",                  integrate_zed,          skills::Agent::Zed),
     ];
 
-    let labels: Vec<&str> = agents.iter().map(|(name, _)| *name).collect();
+    let labels: Vec<&str> = agents.iter().map(|(name, _, _)| *name).collect();
 
     let selections = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt("Select agents to configure  (space to toggle, enter to confirm)")
@@ -1646,28 +1659,42 @@ fn cmd_integrate() -> Result<()> {
         return Ok(());
     }
 
-    // ── Resolve shared paths once ─────────────────────────────────────
-    // current_exe() gives the absolute path to the running binary.
-    // GUI Electron apps (Cursor, VS Code) do not inherit $PATH, so PATH-based
-    // resolution would fail. Absolute paths are required for reliable startup.
+    // Scope selection (carried over from add-skill)
+    let scope_idx = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Installation scope for optimization rules")
+        .items(&["Global (recommended — works in every project)", "Project (current directory only)"])
+        .default(0)
+        .interact()?;
+    let scope = if scope_idx == 0 { skills::Scope::Global } else { skills::Scope::Project };
+
+    // Method selection (carried over from add-skill)
+    let method_idx = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Installation method for optimization rules")
+        .items(&["Write File (recommended)", "Symlink (auto-updates on Marrow upgrades)"])
+        .default(0)
+        .interact()?;
+    let method = if method_idx == 0 { skills::Method::WriteFile } else { skills::Method::Symlink };
+
     let binary = std::env::current_exe()
         .context("Could not resolve current executable path")?
         .to_string_lossy()
         .to_string();
-
     let home = std::env::var("HOME").context("$HOME is not set")?;
-
+    let home_path = PathBuf::from(&home);
     let ctx = IntegrationCtx { binary, home };
 
-    // ── Run each selected agent ───────────────────────────────────────
     eprintln!();
     for idx in selections {
-        let (name, integrate_fn) = agents[idx];
-        match integrate_fn(&ctx) {
+        let (name, integrate_fn, skill_agent) = agents[idx];
+
+        // 1. MCP registration (existing behaviour)
+        let mcp_result = integrate_fn(&ctx);
+        match &mcp_result {
             Ok(AgentOutcome::Installed) => eprintln!(
-                "  {}  {}",
+                "  {}  {}  {}",
                 style("✓").green().bold(),
                 style(name).bold(),
+                style("MCP registered").dim(),
             ),
             Ok(AgentOutcome::NotFound) => eprintln!(
                 "  {}  {}  {}",
@@ -1679,8 +1706,26 @@ fn cmd_integrate() -> Result<()> {
                 "  {}  {}  {}",
                 style("✗").red().bold(),
                 style(name).bold(),
-                style(format!("— {e}")).red(),
+                style(format!("MCP — {e}")).red(),
             ),
+        }
+
+        // 2. Optimization skill (new)
+        if matches!(mcp_result, Ok(AgentOutcome::Installed)) {
+            match skills::install_skill(skill_agent, scope, method, &home_path) {
+                Ok(()) => eprintln!(
+                    "  {}  {}  {}",
+                    style("✓").green().bold(),
+                    style(name).bold(),
+                    style("skill written").dim(),
+                ),
+                Err(e) => eprintln!(
+                    "  {}  {}  {}",
+                    style("✗").red().bold(),
+                    style(name).bold(),
+                    style(format!("skill — {e}")).red(),
+                ),
+            }
         }
     }
 

@@ -4,8 +4,6 @@ use std::{
 };
 
 use anyhow::Result;
-use console::style;
-use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
 
 pub const MARROW_CORE_SKILL_MD: &str = r#"---
 description: "Marrow Core Skill: Optimization directives for reading files and exploring the codebase via MCP."
@@ -63,17 +61,6 @@ pub enum Agent {
 }
 
 impl Agent {
-    fn label(self) -> &'static str {
-        match self {
-            Agent::ClaudeCode    => "Claude Code",
-            Agent::Antigravity   => "Antigravity (Gemini)",
-            Agent::Cursor        => "Cursor",
-            Agent::GitHubCopilot => "GitHub Copilot",
-            Agent::Cline         => "Cline",
-            Agent::Zed           => "Zed",
-        }
-    }
-
     /// Resolve the target installation path from the spec's path matrix.
     pub fn target_path(self, scope: Scope, home: &Path) -> PathBuf {
         match (self, scope) {
@@ -152,7 +139,8 @@ pub fn install_skill(agent: Agent, scope: Scope, method: Method, home: &Path) ->
 
 // ── File-system helpers ───────────────────────────────────────────────────────
 
-pub fn install(target: &Path, method: Method, central: &Path) -> Result<()> {
+/// Low-level filesystem primitive. Only call via [`install_skill`]. The `central` parameter is only meaningful for [`Method::Symlink`].
+pub(crate) fn install(target: &Path, method: Method, central: &Path) -> Result<()> {
     // Ensure parent directory exists (bare-root files like .clinerules have no parent dir to create).
     if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
