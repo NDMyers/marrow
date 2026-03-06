@@ -327,6 +327,12 @@
       border: 1px solid #2a2a6a;
     }
 
+    .badge-skeleton {
+      background: #1a0a40;
+      color: #b39ddb;
+      border: 1px solid #4a2a8a;
+    }
+
     /* ── Tool label cell ────────────────────────────────────────────────────── */
     .tool-label {
       font-size: 12px;
@@ -381,7 +387,9 @@
     }
 
     .pct-bar-fill {
+      display: block;
       height: 100%;
+      width: 0%;
       border-radius: 3px;
       transition: width 0.3s ease;
     }
@@ -440,6 +448,159 @@
       padding: 8px 0;
       background: var(--bg);
     }
+
+    /* ── View Delta button ──────────────────────────────────────────────────── */
+    .view-delta-btn {
+      background: none;
+      border: 1px solid #1c3a1c;
+      color: var(--dim);
+      font-family: var(--font);
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 1px 5px;
+      border-radius: 3px;
+      cursor: pointer;
+      margin-left: 8px;
+      vertical-align: middle;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .view-delta-btn:hover {
+      color: var(--green);
+      border-color: var(--green);
+      text-shadow: 0 0 6px var(--green-glow);
+    }
+
+    /* ── Compare Modal ──────────────────────────────────────────────────────── */
+    #compare-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+    }
+    #compare-overlay.open {
+      display: flex;
+    }
+
+    #compare-modal {
+      background: var(--surface);
+      border: 1px solid var(--border-hi);
+      border-radius: 4px;
+      width: 90vw;
+      max-width: 1200px;
+      height: 80vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 0 40px rgba(0, 230, 118, 0.08);
+    }
+
+    #compare-header {
+      flex-shrink: 0;
+      background: #0c100c;
+      border-bottom: 1px solid var(--border);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    #compare-title {
+      font-size: 11px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--green);
+      text-shadow: 0 0 8px var(--green-glow);
+    }
+
+    #compare-close {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--dim);
+      font-family: var(--font);
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      letter-spacing: 0.08em;
+    }
+    #compare-close:hover { color: var(--text); border-color: var(--border-hi); }
+
+    #compare-banner {
+      flex-shrink: 0;
+      background: #00391a;
+      border-bottom: 1px solid #00532a;
+      padding: 6px 16px;
+      font-size: 11px;
+      color: var(--green);
+      letter-spacing: 0.06em;
+      text-align: center;
+      min-height: 30px;
+    }
+
+    #compare-panes {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      overflow: hidden;
+      gap: 0;
+    }
+
+    .compare-pane {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      border-right: 1px solid var(--border);
+    }
+    .compare-pane:last-child { border-right: none; }
+
+    .compare-pane-header {
+      flex-shrink: 0;
+      background: #0c100c;
+      border-bottom: 1px solid var(--border);
+      padding: 6px 14px;
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .compare-pane-header .pane-label { color: var(--dim); }
+    .compare-pane-header .pane-chars { color: var(--amber); font-variant-numeric: tabular-nums; }
+
+    .compare-pane-body {
+      flex: 1;
+      overflow: auto;
+      padding: 0;
+    }
+    .compare-pane-body::-webkit-scrollbar { width: 6px; height: 6px; }
+    .compare-pane-body::-webkit-scrollbar-track { background: var(--bg); }
+    .compare-pane-body::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+    .compare-pane-body pre {
+      margin: 0;
+      padding: 12px 14px;
+      font-family: var(--font);
+      font-size: 11px;
+      line-height: 1.55;
+      color: var(--text);
+      white-space: pre;
+      tab-size: 4;
+    }
+
+    #compare-loading {
+      color: var(--dim);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      padding: 20px 16px;
+      text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -488,6 +649,11 @@
           <div class="card-value amber" id="s-reduction">0.0%</div>
           <div class="card-sub" id="s-reduction-sub">capsule vs. full-file</div>
         </div>
+        <div class="card">
+          <div class="card-label">DB Size</div>
+          <div class="card-value" id="s-db-size">—</div>
+          <div class="card-sub">graph.db on disk</div>
+        </div>
       </div>
 
       <!-- Live tool-call table -->
@@ -532,6 +698,30 @@
           <div class="card-label">Lifetime Reduction %</div>
           <div class="card-value amber" id="l-reduction">—</div>
         </div>
+        <div class="card">
+          <div class="card-label">run_pipeline Requests</div>
+          <div class="card-value" id="l-pipeline-requests">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Auto-Routed Bypasses</div>
+          <div class="card-value" id="l-autorouted">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Rejected Bypasses</div>
+          <div class="card-value" id="l-rejected">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Pipeline Compliance %</div>
+          <div class="card-value amber" id="l-pipeline-compliance">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Ambiguous Symbol Guards</div>
+          <div class="card-value" id="l-ambiguous">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Stale Capsule Guards</div>
+          <div class="card-value" id="l-stale">—</div>
+        </div>
       </div>
 
       <p id="lifetime-sub">Cumulative across all sessions and workspaces sharing this database.</p>
@@ -545,6 +735,39 @@
   </div><!-- /panels -->
 
 </div><!-- /app -->
+
+<!-- Token Delta Modal -->
+<div id="compare-overlay" role="dialog" aria-modal="true" aria-label="Token Delta Viewer">
+  <div id="compare-modal">
+    <div id="compare-header">
+      <span id="compare-title">▸ Token Delta Viewer</span>
+      <button id="compare-close" onclick="closeCompareModal()" title="Close">✕ close</button>
+    </div>
+    <div id="compare-banner">
+      <span id="compare-banner-text">loading…</span>
+    </div>
+    <div id="compare-panes">
+      <div class="compare-pane" id="pane-original">
+        <div class="compare-pane-header">
+          <span class="pane-label">Original Grep</span>
+          <span class="pane-chars" id="pane-original-chars">— tokens</span>
+        </div>
+        <div class="compare-pane-body" id="pane-original-body">
+          <div id="compare-loading">loading…</div>
+        </div>
+      </div>
+      <div class="compare-pane" id="pane-optimized">
+        <div class="compare-pane-header">
+          <span class="pane-label">Marrow Capsule</span>
+          <span class="pane-chars" id="pane-optimized-chars">— tokens</span>
+        </div>
+        <div class="compare-pane-body" id="pane-optimized-body">
+          <div id="compare-loading-2">loading…</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <style>
   /* Lifetime footer shares the same style via id, duplicate here for scoping */
@@ -628,10 +851,11 @@
 
   function badgeHtml(type) {
     const map = {
-      capsule: ['badge-capsule', 'capsule'],
-      index:   ['badge-index',   'index'],
-      impact:  ['badge-impact',  'impact'],
-      server:  ['badge-server',  'server'],
+      capsule:  ['badge-capsule',  'capsule'],
+      index:    ['badge-index',    'index'],
+      impact:   ['badge-impact',   'impact'],
+      server:   ['badge-server',   'server'],
+      skeleton: ['badge-skeleton', 'skeleton'],
     };
     const [cls, label] = map[type] || ['badge-server', type];
     return `<span class="badge ${cls}">${escHtml(label)}</span>`;
@@ -650,6 +874,12 @@
     document.getElementById('l-requests').textContent    = fmtNum(lt.total_requests);
     document.getElementById('l-tokens-saved').textContent = fmtNum(lt.total_tokens_saved);
     document.getElementById('l-reduction').textContent   = fmtPct(lt.reduction_pct);
+    document.getElementById('l-pipeline-requests').textContent = fmtNum(lt.pipeline_requests || 0);
+    document.getElementById('l-autorouted').textContent = fmtNum(lt.direct_low_level_autorouted || 0);
+    document.getElementById('l-rejected').textContent = fmtNum(lt.direct_low_level_rejected || 0);
+    document.getElementById('l-pipeline-compliance').textContent = fmtPct(lt.pipeline_compliance_pct || 0);
+    document.getElementById('l-ambiguous').textContent = fmtNum(lt.ambiguous_symbol_requests || 0);
+    document.getElementById('l-stale').textContent = fmtNum(lt.stale_capsule_prevented || 0);
   }
 
   function setStatus(state) {
@@ -674,7 +904,7 @@
     if (empty) empty.remove();
   }
 
-  function addTableRow(origin, badgeType, toolLabelHtml, pctSaved, ts) {
+  function addTableRow(origin, badgeType, toolLabelHtml, pctSaved, ts, deltaInfo) {
     removeEmptyRow();
 
     const tbody = document.getElementById('event-tbody');
@@ -686,11 +916,21 @@
 
     const tsStr = ts ? fmtTs(ts) : fmtTs(nowTs());
 
+    const deltaBtn = deltaInfo
+      ? `<button class="view-delta-btn"
+           data-filepath="${escHtml(deltaInfo.filepath)}"
+           data-tool="${escHtml(deltaInfo.tool)}"
+           data-symbol="${escHtml(deltaInfo.symbol || '')}"
+           data-repo="${escHtml(deltaInfo.repo || '')}"
+           data-ts="${escHtml(String(deltaInfo.ts || ''))}"
+           onclick="openCompareModal(this)">[delta]</button>`
+      : '';
+
     const tr = document.createElement('tr');
     tr.className = 'row-new';
     tr.innerHTML = `
       <td class="origin-cell">${escHtml(origin || '—')}</td>
-      <td class="tool-label">${badgeHtml(badgeType)}${toolLabelHtml}</td>
+      <td class="tool-label">${badgeHtml(badgeType)}${toolLabelHtml}${deltaBtn}</td>
       <td class="pct-cell">${pctBarHtml(pctSaved)}</td>
       <td class="ts-cell">${escHtml(tsStr)}</td>
     `;
@@ -723,7 +963,8 @@
         const pct = data.file_tokens > 0
           ? (data.tokens_saved / data.file_tokens) * 100
           : null;
-        addTableRow(data.origin || '—', 'capsule', toolHtml, pct, data.ts);
+        const deltaInfo = data.file ? { filepath: data.file, tool: 'get_context_capsule', symbol: data.symbol || '', repo: data.repo || '', ts: data.ts || '' } : null;
+        addTableRow(data.origin || '—', 'capsule', toolHtml, pct, data.ts, deltaInfo);
         break;
       }
 
@@ -753,12 +994,24 @@
         break;
       }
 
+      case 'skeleton_generated': {
+        const dir   = escHtml(data.target_dir || '(workspace)');
+        const nodes = fmtNum(data.node_count || 0);
+        const toolHtml = `<span class="sym">run_pipeline · analyze_repo</span><span class="sep"> · </span><span class="repo">${dir} — Mapped ${nodes} structural nodes</span>`;
+        addTableRow('—', 'skeleton', toolHtml, null, data.ts);
+        break;
+      }
+
       default:
         break;
     }
   }
 
   // ── Replay recent_events from /stats ──────────────────────────────────────
+  //
+  // Session counters (requests, fileTokens, tokensSaved) are loaded from the
+  // server snapshot in fetchStats BEFORE replay runs. Replay must only populate
+  // table rows — never mutate counters — to avoid double-counting.
 
   function replayEvents(events) {
     if (!Array.isArray(events)) return;
@@ -770,22 +1023,20 @@
   }
 
   function handleEventReplay(data) {
-    // Same as handleEvent but skip updating session cards mid-loop (batch update after)
+    // Table-only replay: session counters are already set from the server snapshot.
+    // Do NOT increment session.requests / session.fileTokens / session.tokensSaved here.
     switch (data.type) {
       case 'capsule_served': {
-        session.requests++;
-        session.fileTokens    += data.file_tokens    || 0;
-        session.capsuleTokens += data.capsule_tokens || 0;
-        session.tokensSaved   += data.tokens_saved   || 0;
-
+        // Only get_context_capsule events contribute to session token metrics.
         const sym     = escHtml(data.symbol || '');
         const repo    = escHtml(data.repo   || '');
-        const toolHtml = `<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span>`;
         const pct = data.file_tokens > 0
           ? (data.tokens_saved / data.file_tokens) * 100
           : null;
+        const deltaBtn = data.file
+          ? `<button class="view-delta-btn" data-filepath="${escHtml(data.file)}" data-tool="get_context_capsule" data-symbol="${escHtml(data.symbol || '')}" data-repo="${escHtml(data.repo || '')}" data-ts="${escHtml(String(data.ts || ''))}" onclick="openCompareModal(this)">[delta]</button>`
+          : '';
 
-        // Insert without animation class for replayed rows
         removeEmptyRow();
         const tbody = document.getElementById('event-tbody');
         while (tbody.rows.length >= MAX_ROWS) tbody.deleteRow(tbody.rows.length - 1);
@@ -793,7 +1044,7 @@
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td class="origin-cell">${escHtml(data.origin || '—')}</td>
-          <td class="tool-label">${badgeHtml('capsule')}<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span></td>
+          <td class="tool-label">${badgeHtml('capsule')}<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span>${deltaBtn}</td>
           <td class="pct-cell">${pctBarHtml(pct)}</td>
           <td class="ts-cell">${escHtml(tsStr)}</td>
         `;
@@ -839,6 +1090,24 @@
         break;
       }
 
+      case 'skeleton_generated': {
+        removeEmptyRow();
+        const tbody = document.getElementById('event-tbody');
+        while (tbody.rows.length >= MAX_ROWS) tbody.deleteRow(tbody.rows.length - 1);
+        const dir   = escHtml(data.target_dir || '(workspace)');
+        const nodes = fmtNum(data.node_count  || 0);
+        const tsStr = data.ts ? fmtTs(data.ts) : '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="origin-cell">—</td>
+          <td class="tool-label">${badgeHtml('skeleton')}<span class="sym">run_pipeline · analyze_repo</span><span class="sep"> · </span><span class="repo">${dir} — Mapped ${nodes} structural nodes</span></td>
+          <td class="pct-cell"><span class="pct-dash">—</span></td>
+          <td class="ts-cell">${escHtml(tsStr)}</td>
+        `;
+        tbody.insertBefore(tr, tbody.firstChild);
+        break;
+      }
+
       default:
         break;
     }
@@ -852,16 +1121,24 @@
       .then(body => {
         if (replaySession && body.session) {
           const s = body.session;
-          session.requests      = s.total_requests      || 0;
-          session.fileTokens    = s.total_file_tokens   || 0;
+          // Load authoritative totals from server snapshot.
+          // replayEvents() below only populates table rows — it must NOT re-add to these counters.
+          session.requests      = s.total_requests       || 0;
+          session.fileTokens    = s.total_file_tokens    || 0;
           session.capsuleTokens = s.total_capsule_tokens || 0;
-          session.tokensSaved   = s.total_tokens_saved  || 0;
-          session.reductionPct  = s.reduction_pct       || 0;
+          session.tokensSaved   = s.total_tokens_saved   || 0;
+          session.reductionPct  = session.fileTokens > 0
+            ? (session.tokensSaved / session.fileTokens) * 100
+            : 0;
           updateSessionCards();
           replayEvents(s.recent_events || []);
         }
         if (body.lifetime) {
           updateLifetimeCards(body.lifetime);
+        }
+        if (body.db_size_mb != null) {
+          const mb = Number(body.db_size_mb);
+          document.getElementById('s-db-size').textContent = mb > 0 ? mb.toFixed(2) + ' MB' : '< 0.01 MB';
         }
       })
       .catch(() => {
@@ -926,7 +1203,96 @@
   document.addEventListener('DOMContentLoaded', () => {
     fetchStats(true);
     connectSSE();
+
+    // Close modal on overlay click (outside the modal box)
+    document.getElementById('compare-overlay').addEventListener('click', function(e) {
+      if (e.target === this) closeCompareModal();
+    });
+
+    // Close modal on Escape key
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') closeCompareModal();
+    });
   });
+
+  // ── Compare Modal ──────────────────────────────────────────────────────────
+
+  function openCompareModal(btn) {
+    const filepath = btn.dataset.filepath;
+    const tool     = btn.dataset.tool;
+    const symbol   = btn.dataset.symbol || '';
+    const repo     = btn.dataset.repo   || '';
+    const ts       = btn.dataset.ts     || '';
+
+    const overlay = document.getElementById('compare-overlay');
+    overlay.classList.add('open');
+
+    // Reset panes to loading state
+    document.getElementById('compare-banner-text').textContent = 'loading…';
+    document.getElementById('pane-original-chars').textContent  = '— tokens';
+    document.getElementById('pane-optimized-chars').textContent = '— tokens';
+    document.getElementById('pane-original-body').innerHTML  = '<div style="padding:20px;color:var(--dim);font-size:11px">loading…</div>';
+    document.getElementById('pane-optimized-body').innerHTML = '<div style="padding:20px;color:var(--dim);font-size:11px">loading…</div>';
+
+    const url = '/api/compare?filepath=' + encodeURIComponent(filepath)
+              + '&tool_used=' + encodeURIComponent(tool)
+              + '&symbol='    + encodeURIComponent(symbol)
+              + '&repo='      + encodeURIComponent(repo)
+              + '&ts='        + encodeURIComponent(ts);
+
+    fetch(url)
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) {
+          document.getElementById('compare-banner-text').textContent = 'Error: ' + data.error;
+          document.getElementById('pane-original-body').innerHTML  = '';
+          document.getElementById('pane-optimized-body').innerHTML = '';
+          return;
+        }
+
+        const origLen = data.original_length  || 0;
+        const optLen  = data.optimized_length || 0;
+        const saved   = origLen - optLen;
+        const pct     = origLen > 0 ? ((saved / origLen) * 100).toFixed(1) : '0.0';
+
+        const origToks = Math.ceil(origLen);
+        const optToks  = Math.ceil(optLen);
+        const savedToks = Math.ceil(saved);
+
+        document.getElementById('compare-banner-text').textContent =
+          `Reduced from ~${origToks.toLocaleString()} tokens to ~${optToks.toLocaleString()} tokens`
+          + ` · ~${savedToks.toLocaleString()} tokens saved (${pct}% reduction)`;
+
+        document.getElementById('pane-original-chars').textContent  = `~${origToks.toLocaleString()} tokens`;
+        document.getElementById('pane-optimized-chars').textContent = `~${optToks.toLocaleString()} tokens`;
+
+        const origPre  = document.createElement('pre');
+        const origCode = document.createElement('code');
+        origCode.textContent = data.original_text || '';
+        origPre.appendChild(origCode);
+        document.getElementById('pane-original-body').innerHTML = '';
+        document.getElementById('pane-original-body').appendChild(origPre);
+
+        const optPre  = document.createElement('pre');
+        const optCode = document.createElement('code');
+        optCode.textContent = data.optimized_text || '';
+        optPre.appendChild(optCode);
+        document.getElementById('pane-optimized-body').innerHTML = '';
+        document.getElementById('pane-optimized-body').appendChild(optPre);
+      })
+      .catch(err => {
+        document.getElementById('compare-banner-text').textContent = 'Fetch error: ' + err.message;
+        document.getElementById('pane-original-body').innerHTML  = '';
+        document.getElementById('pane-optimized-body').innerHTML = '';
+      });
+  }
+
+  function closeCompareModal() {
+    document.getElementById('compare-overlay').classList.remove('open');
+    // Clear content to release memory
+    document.getElementById('pane-original-body').innerHTML  = '';
+    document.getElementById('pane-optimized-body').innerHTML = '';
+  }
 </script>
 </body>
 </html>
