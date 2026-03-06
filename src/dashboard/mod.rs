@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -9,7 +9,7 @@ use std::{
 use anyhow::Result;
 use axum::{
     Router,
-    extract::State,
+    extract::{Query, State},
     response::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
@@ -42,6 +42,15 @@ pub enum DashboardEvent {
         tokens_saved: usize,
         origin: String,
         ts: u64,
+        /// Full raw file text. Included in the telemetry POST so the Hub's
+        /// compare endpoint can serve the delta modal even when running as a
+        /// Spoke (different CWD / DB file). Skipped in SSE broadcasts to
+        /// avoid bloating the event stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_text: Option<String>,
+        /// Condensed capsule text. Same rationale as `original_text`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        optimized_text: Option<String>,
     },
     RepoIndexed {
         repo_id: String,
@@ -53,6 +62,17 @@ pub enum DashboardEvent {
         symbol: String,
         repo: String,
         affected_count: usize,
+        ts: u64,
+    },
+    SkeletonGenerated {
+        target_dir: String,
+        node_count: usize,
+        ts: u64,
+    },
+    FileReindexed {
+        file_path: String,
+        repo_id: String,
+        symbols: usize,
         ts: u64,
     },
 }
@@ -82,6 +102,11 @@ pub struct SessionStats {
     pub total_file_tokens:    usize,
     pub total_tokens_saved:   usize,
     pub recent_events:        VecDeque<DashboardEvent>,
+    /// Token delta text cache keyed by `"symbol@repo@ts"`.
+    /// Populated from the telemetry POST body so the compare endpoint works
+    /// even when the Axum server (Hub) is running against a different DB than
+    /// the process that served the capsule (Spoke).
+    pub capsule_text_cache:   HashMap<String, (String, String)>,
 }
 
 impl SessionStats {
@@ -95,7 +120,45 @@ impl SessionStats {
         self.total_capsule_tokens += capsule_tokens;
         self.total_file_tokens    += file_tokens;
         self.total_tokens_saved   += file_tokens.saturating_sub(capsule_tokens);
-        self.recent_events.push_front(event);
+
+        // Extract and cache texts before stripping them from the stored event.
+        // The cache lets the compare endpoint serve delta views without re-querying
+        // the DB — critical for Hub/Spoke scenarios where the Hub's DB is different.
+        let slim_event = if let DashboardEvent::CapsuleServed {
+            ref symbol,
+            ref repo,
+            ref original_text,
+            ref optimized_text,
+            ts,
+            ..
+        } = event {
+            if let (Some(orig), Some(opt)) = (original_text, optimized_text) {
+                let key = format!("{}@{}@{}", symbol, repo, ts);
+                self.capsule_text_cache.insert(key, (orig.clone(), opt.clone()));
+                // Prevent unbounded growth; a simple clear-on-overflow is fine
+                // for a local dashboard cache that holds at most ~50 entries.
+                if self.capsule_text_cache.len() > 100 {
+                    self.capsule_text_cache.clear();
+                }
+            }
+            // Strip the large text blobs before pushing into recent_events so
+            // the SSE broadcast and the /stats payload stay lean.
+            if let DashboardEvent::CapsuleServed {
+                symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts, ..
+            } = event {
+                DashboardEvent::CapsuleServed {
+                    symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts,
+                    original_text: None,
+                    optimized_text: None,
+                }
+            } else {
+                unreachable!()
+            }
+        } else {
+            event
+        };
+
+        self.recent_events.push_front(slim_event);
         if self.recent_events.len() > 50 {
             self.recent_events.pop_back();
         }
@@ -131,8 +194,9 @@ async fn sse_handler(
 
 #[derive(Serialize)]
 struct StatsResponse {
-    session:  SessionSnapshot,
-    lifetime: LifetimeSnapshot,
+    session:    SessionSnapshot,
+    lifetime:   LifetimeSnapshot,
+    db_size_mb: f64,
 }
 
 #[derive(Serialize)]
@@ -147,10 +211,16 @@ struct SessionSnapshot {
 
 #[derive(Serialize)]
 struct LifetimeSnapshot {
-    total_requests:     i64,
-    total_tokens_saved: i64,
-    total_file_tokens:  i64,
-    reduction_pct:      f64,
+    total_requests:               i64,
+    total_tokens_saved:           i64,
+    total_file_tokens:            i64,
+    reduction_pct:                f64,
+    pipeline_requests:            i64,
+    direct_low_level_autorouted:  i64,
+    direct_low_level_rejected:    i64,
+    ambiguous_symbol_requests:    i64,
+    stale_capsule_prevented:      i64,
+    pipeline_compliance_pct:      f64,
 }
 
 async fn stats_handler(State(state): State<AppState>) -> axum::response::Response {
@@ -182,15 +252,148 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
         let saved = crate::db::read_stat(&conn, "total_tokens_saved");
         let file  = crate::db::read_stat(&conn, "total_file_tokens");
         let rpct  = if file == 0 { 0.0 } else { (saved as f64 / file as f64) * 100.0 };
+        let pipeline = crate::db::read_stat(&conn, "pipeline_requests");
+        let autorouted = crate::db::read_stat(&conn, "direct_low_level_autorouted");
+        let rejected = crate::db::read_stat(&conn, "direct_low_level_rejected");
+        let ambiguous = crate::db::read_stat(&conn, "ambiguous_symbol_requests");
+        let stale = crate::db::read_stat(&conn, "stale_capsule_prevented");
+        let compliance_total = pipeline + autorouted + rejected;
+        let compliance_pct = if compliance_total == 0 {
+            0.0
+        } else {
+            (pipeline as f64 / compliance_total as f64) * 100.0
+        };
         LifetimeSnapshot {
-            total_requests:     req,
-            total_tokens_saved: saved,
-            total_file_tokens:  file,
-            reduction_pct:      rpct,
+            total_requests:              req,
+            total_tokens_saved:          saved,
+            total_file_tokens:           file,
+            reduction_pct:               rpct,
+            pipeline_requests:           pipeline,
+            direct_low_level_autorouted: autorouted,
+            direct_low_level_rejected:   rejected,
+            ambiguous_symbol_requests:   ambiguous,
+            stale_capsule_prevented:     stale,
+            pipeline_compliance_pct:     compliance_pct,
         }
     };
 
-    axum::Json(StatsResponse { session, lifetime }).into_response()
+    let db_size_mb = {
+        let db_path = std::env::var("MARROW_DB_PATH")
+            .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+        std::fs::metadata(&db_path)
+            .map(|m| m.len() as f64 / 1_048_576.0)
+            .unwrap_or(0.0)
+    };
+
+    axum::Json(StatsResponse { session, lifetime, db_size_mb }).into_response()
+}
+
+// ── Compare handler ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CompareQuery {
+    filepath:  String,
+    tool_used: String,
+    symbol:    Option<String>,
+    repo:      Option<String>,
+    ts:        Option<u64>,
+}
+
+#[derive(Serialize)]
+struct CompareResponse {
+    original_text:    String,
+    optimized_text:   String,
+    original_length:  usize,
+    optimized_length: usize,
+}
+
+async fn compare_handler(
+    State(state): State<AppState>,
+    Query(params): Query<CompareQuery>,
+) -> axum::response::Response {
+    match params.tool_used.as_str() {
+        "get_context_capsule" => {
+            let symbol = match params.symbol.as_deref().filter(|s| !s.is_empty()) {
+                Some(s) => s.to_string(),
+                None => return axum::Json(serde_json::json!({
+                    "error": "Missing 'symbol' parameter for get_context_capsule"
+                })).into_response(),
+            };
+            let repo = match params.repo.as_deref().filter(|r| !r.is_empty()) {
+                Some(r) => r.to_string(),
+                None => return axum::Json(serde_json::json!({
+                    "error": "Missing 'repo' parameter for get_context_capsule"
+                })).into_response(),
+            };
+
+            // Check the in-memory text cache first. This is populated from the
+            // telemetry POST payload and is the correct source of truth in
+            // Hub/Spoke deployments where the dashboard server and the process
+            // that served the capsule use different .marrow/graph.db files
+            // (e.g., Cursor + Copilot both running Marrow from different CWDs).
+            let cache_key = format!("{}@{}@{}", symbol, repo, params.ts.unwrap_or_default());
+            if let Ok(sess) = state.session.lock() {
+                if let Some((original_text, optimized_text)) = sess.capsule_text_cache.get(&cache_key) {
+                    let original_length  = original_text.len() / 4;
+                    let optimized_length = optimized_text.len() / 4;
+                    return axum::Json(CompareResponse {
+                        original_text:    original_text.clone(),
+                        optimized_text:   optimized_text.clone(),
+                        original_length,
+                        optimized_length,
+                    }).into_response();
+                }
+            }
+
+            if params.ts.is_some() {
+                return axum::Json(serde_json::json!({
+                    "error": "This proof snapshot is no longer cached. Re-run the query to generate a fresh immutable delta."
+                })).into_response();
+            }
+
+            // Cache miss: fall back to querying the local DB. This works when
+            // the Hub and the capsule-serving process share the same DB file,
+            // or when the cache was evicted (>100 entries).
+            let conn = match state.db.lock() {
+                Ok(g)  => g,
+                Err(_) => return axum::Json(serde_json::json!({"error": "DB mutex poisoned"})).into_response(),
+            };
+            match crate::retrieval::get_context_capsule(&conn, &symbol, &repo) {
+                Ok(result) => {
+                    // Both lengths use the same len()/4 heuristic so the delta
+                    // modal matches the telemetry emitted by the MCP tool.
+                    let original_length  = result.original_text.len() / 4;
+                    let optimized_length = result.optimized_text.len() / 4;
+                    axum::Json(CompareResponse {
+                        original_text:    result.original_text,
+                        optimized_text:   result.optimized_text,
+                        original_length,
+                        optimized_length,
+                    }).into_response()
+                }
+                Err(e) => axum::Json(serde_json::json!({
+                    "error": format!("Could not build capsule for '{}': {}", symbol, e)
+                })).into_response(),
+            }
+        }
+        _ => {
+            // Fallback for other tools: read the file from disk.
+            let original_text = match std::fs::read_to_string(&params.filepath) {
+                Ok(s)  => s,
+                Err(e) => return axum::Json(serde_json::json!({
+                    "error": format!("Could not read file '{}': {}", params.filepath, e)
+                })).into_response(),
+            };
+            let original_length  = original_text.len();
+            let optimized_length = original_text.len();
+            axum::Json(CompareResponse {
+                optimized_text: original_text.clone(),
+                original_text,
+                original_length,
+                optimized_length,
+            }).into_response()
+        }
+    }
 }
 
 async fn emit_handler(
@@ -214,7 +417,20 @@ async fn emit_handler(
             }
         }
     }
-    let _ = state.tx.send(event);
+    // Strip text blobs from SSE broadcast. The full texts are already cached
+    // inside SessionStats.capsule_text_cache — browsers don't need them in
+    // the live event stream.
+    let broadcast_event = match event {
+        DashboardEvent::CapsuleServed {
+            symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts, ..
+        } => DashboardEvent::CapsuleServed {
+            symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts,
+            original_text:  None,
+            optimized_text: None,
+        },
+        other => other,
+    };
+    let _ = state.tx.send(broadcast_event);
     axum::http::StatusCode::OK
 }
 
@@ -245,10 +461,11 @@ pub async fn start(
     let state = AppState { tx, session, db };
 
     let router = Router::new()
-        .route("/",          get(index_handler))
-        .route("/stream",    get(sse_handler))
-        .route("/stats",     get(stats_handler))
-        .route("/api/emit",  axum::routing::post(emit_handler))
+        .route("/",              get(index_handler))
+        .route("/stream",        get(sse_handler))
+        .route("/stats",         get(stats_handler))
+        .route("/api/compare",   get(compare_handler))
+        .route("/api/emit",      axum::routing::post(emit_handler))
         // permissive CORS is intentional: this server binds only to 127.0.0.1,
         // and the dashboard UI is served from the same origin.
         .layer(CorsLayer::permissive())
