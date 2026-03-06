@@ -47,6 +47,9 @@ ignore = "0.4"
 dialoguer = "0.11"
 console = "0.15"
 
+# Home directory resolution for global skill paths
+dirs = "5.0"
+
 # Live web dashboard
 axum            = { version = "0.8", features = ["macros"] }
 tower-http      = { version = "0.6", features = ["cors"] }
@@ -54,3 +57,10 @@ open            = "5"
 reqwest          = { version = "0.12", default-features = false, features = ["json"] }
 tokio-stream    = { version = "0.1", features = ["sync"] }
 futures-util    = "0.3"
+
+# Background file watching for live graph updates
+notify              = "7"
+notify-debouncer-mini = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
