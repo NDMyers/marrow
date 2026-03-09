@@ -3,16 +3,14 @@ mod dashboard;
 mod ingestion;
 mod retrieval;
 mod skills;
+mod state;
 mod watcher;
 
 use std::{
     fmt::Write as FmtWrite,
     fs,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
 
@@ -29,12 +27,30 @@ use rmcp::{
     service::RequestContext,
     transport::stdio,
 };
+use state::{IndexState, set_index_state, update_index_progress};
 
 const DASHBOARD_EMIT_URL: &str = "http://127.0.0.1:8765/api/emit";
 
 /// Stores the MCP client's name captured during the `initialize` handshake.
 /// Safe to use as a singleton because stdio spawns one process per session.
 static CLIENT_NAME: OnceLock<String> = OnceLock::new();
+
+/// Returns true when `MARROW_TRACE=1` (or any non-empty value) is set.
+/// Used to gate developer-only timing output so production stderr stays clean.
+#[inline(always)]
+fn trace_enabled() -> bool {
+    std::env::var_os("MARROW_TRACE").is_some_and(|v| !v.is_empty())
+}
+
+/// Emit a `[MARROW TRACE]` line to stderr **iff** `MARROW_TRACE` is set.
+/// Uses macro syntax so the format string is zero-cost when tracing is off.
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if crate::trace_enabled() {
+            eprintln!("[MARROW TRACE] {}", format!($($arg)*));
+        }
+    };
+}
 
 /// Appends a timestamped error line to `~/.marrow/debug.log`.
 /// All failures are silently swallowed so callers never panic or write to stdout.
@@ -204,7 +220,7 @@ fn run_benchmark(
         })?;
 
     // ── Step 2: build capsule (original_text populated by the engine) ─
-    let result = retrieval::get_context_capsule(conn, symbol, repo_id)?;
+    let result = retrieval::get_context_capsule(conn, symbol, repo_id, None)?;
 
     // ── Step 3: count tokens ──────────────────────────────────────────
     let file_tokens    = count_tokens(&result.original_text)?;
@@ -227,7 +243,6 @@ fn run_benchmark(
 struct ContextEngine {
     db:          Arc<Mutex<rusqlite::Connection>>,
     http_client: reqwest::Client,
-    is_indexing: Arc<AtomicBool>,
 }
 
 impl ContextEngine {
@@ -240,7 +255,6 @@ impl ContextEngine {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             http_client,
-            is_indexing: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -250,68 +264,119 @@ impl ContextEngine {
         Arc::new(v.as_object().expect("schema must be a JSON object").clone())
     }
 
-    /// Checks if the workspace is indexed. If not, spawns a background ingest
-    /// and returns `Some(message)` so the caller can return early.
-    /// Returns `None` if the workspace is already indexed (proceed normally).
+    /// Non-blocking guard for tool calls while the boot-time indexer is still
+    /// building the AST graph in the background.
     fn maybe_jit_index(
         &self,
-        repo_id: &str,
-        root_path: &std::path::Path,
+        _repo_id: &str,
+        _fallback_root: &std::path::Path,
     ) -> Option<String> {
-        // Fast path: already indexed
-        {
-            let conn = self.db.lock().unwrap();
-            if crate::db::is_repo_indexed(&conn, repo_id, root_path).unwrap_or(false) {
-                return None;
-            }
-        }
+        state::run_pipeline_guard_message()
+    }
 
-        // Guard against concurrent indexing
-        if self
-            .is_indexing
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Some(
-                "[MARROW] Workspace indexing is already in progress. \
-                 Re-invoke your query in a moment once indexing completes."
-                    .to_string(),
-            );
-        }
-
-        // Spawn background ingest
-        let db = self.db.clone();
-        let is_indexing = self.is_indexing.clone();
-        let repo_id = repo_id.to_string();
-        let root_path = root_path.to_path_buf();
+    #[allow(dead_code)]
+    fn spawn_boot_time_indexer(&self) {
+        let db = Arc::clone(&self.db);
+        let http_client = self.http_client.clone();
+        let workspace_root = current_workspace_root();
+        let repo_id = match db.lock() {
+            Ok(conn) => resolve_request_repo_id(&conn, None, &workspace_root)
+                .unwrap_or_else(|_| fallback_repo_id_for_path(&workspace_root)),
+            Err(_) => fallback_repo_id_for_path(&workspace_root),
+        };
 
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let conn = db.lock().unwrap();
-                crate::ingestion::run_ingestion(&conn, &repo_id, &root_path)
-            })
-            .await;
+            let ingest_t = Instant::now();
 
-            is_indexing.store(false, Ordering::SeqCst);
+            // Retry up to 3 times on lock contention (SQLITE_BUSY).
+            // This handles the rapid-restart race where the previous server
+            // process is still holding the DB write lock when we start.
+            const MAX_ATTEMPTS: u32 = 3;
+            const RETRY_DELAY_MS: u64 = 3_000;
 
-            match result {
-                Ok(Ok((syms, edges))) => {
+            let mut final_result = None;
+            for attempt in 1..=MAX_ATTEMPTS {
+                let db_clone = Arc::clone(&db);
+                let repo_id_clone = repo_id.clone();
+                let root_clone = workspace_root.clone();
+
+                // Use run_ingestion_with_arc so the DB mutex is released during the
+                // CPU-intensive parallel parse phase, allowing concurrent tool calls
+                // to proceed without being blocked for the entire indexing duration.
+                let result = tokio::task::spawn_blocking(move || {
+                    ingestion::run_ingestion_with_arc(
+                        &db_clone,
+                        &repo_id_clone,
+                        &root_clone,
+                        update_index_progress,
+                    )
+                })
+                .await;
+
+                let is_lock_error = match &result {
+                    Ok(Err(e)) => {
+                        let msg = e.to_string().to_lowercase();
+                        msg.contains("database is locked") || msg.contains("sqlite_busy")
+                    }
+                    _ => false,
+                };
+
+                if is_lock_error && attempt < MAX_ATTEMPTS {
                     eprintln!(
-                        "[MARROW] Background indexing complete: {syms} symbols, {edges} edges."
+                        "[MARROW] Boot-time indexing blocked by DB lock (attempt {attempt}/{MAX_ATTEMPTS}), \
+                         retrying in {RETRY_DELAY_MS}ms…"
                     );
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                    continue;
                 }
-                Ok(Err(e)) => eprintln!("[MARROW] Background indexing failed: {e}"),
-                Err(e) => eprintln!("[MARROW] Background indexing task panicked: {e}"),
+
+                final_result = Some(result);
+                break;
+            }
+
+            match final_result.unwrap() {
+                Ok(Ok((symbols, edges))) => {
+                    set_index_state(IndexState::Ready);
+                    eprintln!(
+                        "[MARROW] Boot-time indexing complete: {symbols} symbols, {edges} edges in {}ms.",
+                        ingest_t.elapsed().as_millis()
+                    );
+
+                    let event = DashboardEvent::RepoIndexed {
+                        repo_id,
+                        symbols,
+                        edges,
+                        ts: dashboard::now_ts(),
+                    };
+                    tokio::spawn(async move {
+                        match http_client
+                            .post(DASHBOARD_EMIT_URL)
+                            .json(&event)
+                            .send()
+                            .await
+                        {
+                            Err(e) => log_emit_error(&e.to_string()),
+                            Ok(resp) if !resp.status().is_success() => {
+                                let status = resp.status();
+                                let body = resp.text().await.unwrap_or_default();
+                                log_emit_error(&format!("status={status} body={body}"));
+                            }
+                            Ok(_) => {}
+                        }
+                    });
+                }
+                Ok(Err(e)) => {
+                    set_index_state(IndexState::Uninitialized);
+                    eprintln!("[MARROW] Boot-time indexing failed: {e}");
+                }
+                Err(e) => {
+                    set_index_state(IndexState::Uninitialized);
+                    eprintln!("[MARROW] Boot-time indexing task panicked: {e}");
+                }
             }
         });
-
-        Some(
-            "[MARROW] Workspace indexing started in the background. \
-             This is a one-time operation (typically 30-60s for large codebases). \
-             Re-invoke your query in a moment to proceed with full context."
-                .to_string(),
-        )
     }
+
 
     /// Pull a required string argument out of the tool arguments map, returning
     /// a well-formed MCP error if absent.
@@ -330,12 +395,60 @@ impl ContextEngine {
     }
 }
 
+/// Resolve the workspace root to the actual project directory.
+///
+/// Priority order:
+///   1. `MARROW_WORKSPACE` env var — explicit override for edge cases (e.g. CI, custom launchers)
+///   2. Walk up from `current_dir()` looking for `.marrowrc.json` (authoritative Marrow marker)
+///   3. Walk up from `current_dir()` looking for `.git` (VCS root)
+///   4. Fall back to `current_dir()` as-is
+///
+/// This fixes the VS Code MCP spawn bug: VS Code launches the server from `~` rather than the
+/// open project directory, so a naive `current_dir()` resolves to the home folder and JIT
+/// indexing would attempt to walk the entire filesystem.
 fn current_workspace_root() -> PathBuf {
-    std::env::current_dir()
+    // Tier 1: explicit env override
+    if let Ok(override_path) = std::env::var("MARROW_WORKSPACE") {
+        let p = PathBuf::from(&override_path);
+        if let Ok(canonical) = p.canonicalize() {
+            trace!("current_workspace_root: MARROW_WORKSPACE override → {}", canonical.display());
+            return canonical;
+        }
+    }
+
+    let cwd = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("."))
+        .unwrap_or_else(|_| PathBuf::from("."));
+
+    // Tier 2: walk up for .marrowrc.json
+    {
+        let mut probe = cwd.clone();
+        loop {
+            if probe.join(".marrowrc.json").exists() {
+                trace!("current_workspace_root: found .marrowrc.json → {}", probe.display());
+                return probe;
+            }
+            if !probe.pop() {
+                break;
+            }
+        }
+    }
+
+    // Tier 3: check for .git only at cwd — intentionally NOT walking up.
+    // Walking up can hit a rogue ~/.git and cause the entire home directory
+    // to be indexed (64 k+ files). The CLI is invoked from the project root,
+    // so checking only the current directory is sufficient.
+    if cwd.join(".git").exists() {
+        trace!("current_workspace_root: found .git at cwd → {}", cwd.display());
+        return cwd;
+    }
+
+    // Tier 4: fall back to cwd
+    trace!("current_workspace_root: no marker found, falling back to cwd → {}", cwd.display());
+    cwd
 }
+
 
 fn fallback_repo_id_for_path(path: &Path) -> String {
     path.file_name()
@@ -366,12 +479,21 @@ fn ensure_repo_ready(
     workspace_root: &Path,
 ) -> anyhow::Result<String> {
     let repo_id = resolve_request_repo_id(conn, explicit_repo_id, workspace_root)?;
+
+    // If the caller explicitly passed a repo_id, verify it exists in the DB.
+    // Don't require its root_path to match the current workspace — the repo
+    // may have been ingested at a child directory or from a different CWD.
     if explicit_repo_id.is_some() {
-        let expected_repo_id = db::repo_id_for_root(conn, workspace_root)?
-            .unwrap_or_else(|| fallback_repo_id_for_path(workspace_root));
-        if expected_repo_id != repo_id {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM repositories WHERE id = ?1",
+                rusqlite::params![repo_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) > 0;
+        if !exists {
             return Err(anyhow::anyhow!(
-                "Repo '{}' does not match the current workspace. Run ingest_repo with the correct root_path before querying it from this session.",
+                "Repo '{}' not found in the Marrow database. Run ingest_repo first.",
                 repo_id
             ));
         }
@@ -419,6 +541,13 @@ impl EnforcementMode {
             _ => Self::Default,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteMode {
+    SafeAppend,
+    Overwrite,
+    Symlink,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -486,6 +615,9 @@ fn apply_compliance_gate(
             }
             if let Some(repo_id) = args.remove("repo_id") {
                 routed.insert("repo_id".to_string(), repo_id);
+            }
+            if let Some(filepath) = args.remove("filepath") {
+                routed.insert("filepath".to_string(), filepath);
             }
             Ok(ComplianceRewrite {
                 tool_name: "run_pipeline".to_string(),
@@ -660,10 +792,10 @@ async fn try_auto_init() -> Option<String> {
                 eprintln!("[MARROW AUTO-INIT] Warning: could not create .marrow/: {e}");
                 e
             })?;
-        if let Err(e) = write_workspace_rules(&root) {
+        if let Err(e) = write_workspace_rules(&root, &[0, 1, 2], WORKSPACE_RULES_CONTENT, WriteMode::SafeAppend) {
             eprintln!("[MARROW AUTO-INIT] Warning: could not write workspace rules: {e}");
         }
-        if let Err(e) = write_vscode_mcp_config(&root) {
+        if let Err(e) = write_vscode_mcp_config(&root, WriteMode::SafeAppend) {
             eprintln!("[MARROW AUTO-INIT] Warning: could not write .vscode/mcp.json: {e}");
         }
         if let Err(e) = ensure_workspace_config(Some(EnforcementMode::Default)) {
@@ -775,6 +907,10 @@ impl ServerHandler for ContextEngine {
                         "repo_id": {
                             "type": "string",
                             "description": "The repository identifier used during ingestion (e.g. 'backend_api')."
+                        },
+                        "filepath": {
+                            "type": "string",
+                            "description": "Relative file path to disambiguate symbols with identical names across files. ALWAYS provide this when you know which file the symbol is in (e.g. from the user's open editor tab, cursor location, or a previous skeleton/search result). Example: 'app/controllers/invoices_controller.rb'."
                         }
                     },
                     "required": ["symbol_name", "repo_id"]
@@ -795,6 +931,10 @@ impl ServerHandler for ContextEngine {
                         "repo_id": {
                             "type": "string",
                             "description": "The repository identifier for the pivot symbol."
+                        },
+                        "filepath": {
+                            "type": "string",
+                            "description": "Relative file path to disambiguate symbols with identical names across files. ALWAYS provide this when you know which file the symbol is in (e.g. from the user's open editor tab, cursor location, or a previous skeleton/search result)."
                         }
                     },
                     "required": ["symbol_name", "repo_id"]
@@ -910,23 +1050,36 @@ impl ServerHandler for ContextEngine {
                  symbol lookup, refactoring impact, or codebase exploration. Pass your \
                  goal/intent, and Marrow will auto-detect and return the optimal context \
                  (skeleton, capsule, or impact graph). Use intent 'analyze_repo' to map \
-                 the full codebase, 'explore_symbol' to understand a specific symbol, or \
-                 'refactor_symbol' to assess the blast radius of a change.",
+                 the full codebase, 'explore_symbol' to understand a specific symbol, \
+                 'trace_flow' to linearly trace a symbol's outbound execution path without \
+                 noisy inbound callers, 'refactor_symbol' to assess the blast radius of a change, \
+                 or 'read_node' to expand a neighbor signature into its full source (use this \
+                 after seeing a condensed signature in a previous explore_symbol response — \
+                 never use native read_file for this).",
                 Self::schema(json!({
                     "type": "object",
                     "properties": {
                         "intent": {
                             "type": "string",
-                            "description": "Must be exactly 'analyze_repo', 'explore_symbol', or 'refactor_symbol'."
+                            "description": "Must be exactly 'analyze_repo', 'explore_symbol', 'trace_flow', 'refactor_symbol', or 'read_node'."
                         },
                         "target": {
                             "type": "string",
                             "description": "The symbol name or directory path relevant to the intent. \
-                                            Required for explore_symbol and refactor_symbol."
+                                            Required for explore_symbol, trace_flow, and refactor_symbol."
                         },
                         "repo_id": {
                             "type": "string",
                             "description": "The repository identifier. Auto-detected if omitted."
+                        },
+                        "filepath": {
+                            "type": "string",
+                            "description": "Relative file path to disambiguate symbols with identical names across files. \
+                                            ALWAYS provide this for explore_symbol, trace_flow, and refactor_symbol when \
+                                            you know which file the symbol is in (e.g. from the user's open editor tab, \
+                                            cursor location, or a previous skeleton/search result). Required to resolve \
+                                            a Disambiguation Payload — re-call run_pipeline with the same intent/target \
+                                            plus the filepath from the payload instead of falling back to grep/read_file."
                         }
                     },
                     "required": ["intent"]
@@ -992,6 +1145,7 @@ impl ServerHandler for ContextEngine {
                 "get_context_capsule" => {
                     let symbol_name  = Self::require_str(&args, "symbol_name")?.to_string();
                     let repo_id      = Self::require_str(&args, "repo_id")?.to_string();
+                    let filepath_arg = args.get("filepath").and_then(|v| v.as_str()).map(str::to_string);
                     let client_name  = CLIENT_NAME.get()
                                            .cloned()
                                            .unwrap_or_else(|| "Unknown Agent".to_string());
@@ -1011,7 +1165,7 @@ impl ServerHandler for ContextEngine {
                             let _resolved_repo_id =
                                 ensure_repo_ready(&conn, Some(&repo_id), &cwd)?;
 
-                            let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id)?;
+                            let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())?;
 
                             // Both token counts use the same len()/4 heuristic so
                             // telemetry and the compare endpoint are always in sync.
@@ -1091,6 +1245,7 @@ impl ServerHandler for ContextEngine {
                 "analyze_impact" => {
                     let symbol_name = Self::require_str(&args, "symbol_name")?.to_string();
                     let repo_id     = Self::require_str(&args, "repo_id")?.to_string();
+                    let filepath_arg = args.get("filepath").and_then(|v| v.as_str()).map(str::to_string);
 
                     let cwd = current_workspace_root();
                     if let Some(msg) = self.maybe_jit_index(&repo_id, &cwd) {
@@ -1108,13 +1263,20 @@ impl ServerHandler for ContextEngine {
                         let _resolved_repo_id =
                             ensure_repo_ready(&conn, Some(&repo_id), &cwd)?;
 
-                        retrieval::analyze_impact(&conn, &symbol_name, &repo_id)
+                        retrieval::analyze_impact(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())
                     })
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
                     let mut out = String::new();
+
+                    // Short-circuit: return the disambiguation payload if the symbol was ambiguous.
+                    if let Some(payload) = result.pivot_id.strip_prefix("DISAMBIGUATION:") {
+                        out.push_str(payload);
+                        return Ok(CallToolResult::success(vec![Content::text(out)]));
+                    }
+
                     writeln!(out, "IMPACT ANALYSIS — pivot id: {}", result.pivot_id).ok();
 
                     if result.affected.is_empty() {
@@ -1242,10 +1404,7 @@ impl ServerHandler for ContextEngine {
                     let repo_id_for_event = repo_id.clone();
 
                     let (symbols, edges) = tokio::task::spawn_blocking(move || {
-                        let conn = db
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
-                        ingestion::run_ingestion(&conn, &repo_id, &root_path)
+                        ingestion::run_ingestion_with_arc(&db, &repo_id, &root_path, |_| {})
                     })
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -1365,36 +1524,75 @@ impl ServerHandler for ContextEngine {
                     let intent = Self::require_str(&args, "intent")?.to_string();
                     let target = args.get("target").and_then(|v| v.as_str()).map(str::to_string);
                     let repo_id_arg = args.get("repo_id").and_then(|v| v.as_str()).map(str::to_string);
+                    let filepath_arg = args.get("filepath").and_then(|v| v.as_str()).map(str::to_string);
                     let client_name = CLIENT_NAME.get()
                         .cloned()
                         .unwrap_or_else(|| "Unknown Agent".to_string());
 
+                    if let Some(msg) = state::run_pipeline_guard_message() {
+                        return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                    }
+
+                    // Guard: if the graph is empty the workspace has never been indexed.
+                    // Return an actionable system note rather than an empty/confusing result.
+                    {
+                        let conn = db.lock().map_err(|_| {
+                            rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None)
+                        })?;
+                        let node_count: i64 = conn
+                            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+                            .unwrap_or(0);
+                        if node_count == 0 {
+                            return Ok(CallToolResult::success(vec![Content::text(
+                                "[SYSTEM NOTE: The Marrow graph database is empty. \
+                                 The workspace has not been indexed. Please instruct \
+                                 the human user to open their terminal and run 'marrow' \
+                                 to select the 'Watch Workspace' or 'Index Workspace' option.]",
+                            )]));
+                        }
+                    }
+
                     match intent.as_str() {
                         "analyze_repo" => {
+                            let pipeline_t = Instant::now();
                             let target_dir = target.clone();
                             let target_dir_label = target_dir.clone().unwrap_or_else(|| "(workspace)".to_string());
 
+                            trace!("analyze_repo: start — target_dir={target_dir_label}");
+
                             let cwd = current_workspace_root();
                             let jit_repo_id = {
+                                let t = Instant::now();
                                 let conn = db.lock().map_err(|_| rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None))?;
-                                resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
-                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                                let id = resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
+                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                trace!("analyze_repo: resolve_repo_id='{id}' [{:?}ms]", t.elapsed().as_millis());
+                                id
                             };
                             if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
                                 return Ok(CallToolResult::success(vec![Content::text(msg)]));
                             }
 
                             let (result, repo_used) = tokio::task::spawn_blocking(move || {
+                                let t_lock = Instant::now();
                                 let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                trace!("analyze_repo: db lock acquired [{:?}ms]", t_lock.elapsed().as_millis());
+
                                 let cwd = current_workspace_root();
                                 let repo_id =
                                     ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
+
+                                let t_skel = Instant::now();
                                 let skeleton = retrieval::get_project_skeleton(&conn, &repo_id, target_dir.as_deref())?;
+                                trace!("analyze_repo: get_project_skeleton [{:?}ms] — {} chars", t_skel.elapsed().as_millis(), skeleton.len());
+
                                 Ok::<_, anyhow::Error>((skeleton, repo_id))
                             })
                             .await
                             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                            trace!("analyze_repo: spawn_blocking total [{:?}ms]", pipeline_t.elapsed().as_millis());
 
                             let node_count = result
                                 .lines()
@@ -1426,7 +1624,11 @@ impl ServerHandler for ContextEngine {
                             Ok(CallToolResult::success(vec![Content::text(result)]))
                         }
 
-                        "explore_symbol" => {
+                        // "read_node" is a navigation alias for explore_symbol.
+                        // Agents use it to "click" on a neighbor link from a
+                        // previous Progressive Disclosure capsule response.
+                        "explore_symbol" | "read_node" => {
+                            let pipeline_t = Instant::now();
                             let symbol_name = target.ok_or_else(|| {
                                 rmcp::ErrorData::invalid_params(
                                     "intent 'explore_symbol' requires a 'target' (symbol name)".to_string(),
@@ -1435,11 +1637,16 @@ impl ServerHandler for ContextEngine {
                             })?;
                             let sym_for_event  = symbol_name.clone();
 
+                            trace!("explore_symbol: start — symbol='{symbol_name}'");
+
                             let cwd = current_workspace_root();
                             let jit_repo_id = {
+                                let t = Instant::now();
                                 let conn = db.lock().map_err(|_| rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None))?;
-                                resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
-                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                                let id = resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
+                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                trace!("explore_symbol: resolve_repo_id='{id}' [{:?}ms]", t.elapsed().as_millis());
+                                id
                             };
                             if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
                                 return Ok(CallToolResult::success(vec![Content::text(msg)]));
@@ -1447,18 +1654,23 @@ impl ServerHandler for ContextEngine {
 
                             let (out, original_text, capsule_tokens, file_tokens, abs_file_path, repo_used) =
                                 tokio::task::spawn_blocking(move || {
+                                    let t_lock = Instant::now();
                                     let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                    trace!("explore_symbol: db lock acquired [{:?}ms]", t_lock.elapsed().as_millis());
 
                                     let cwd = current_workspace_root();
                                     let repo_id =
                                         ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
 
-                                    let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id)?;
+                                    let t_cap = Instant::now();
+                                    let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())?;
                                     let full_file_tokens  = capsule_result.original_text.len() / 4;
                                     let optimized_tokens  = capsule_result.optimized_text.len() / 4;
                                     let original_text_out = capsule_result.original_text;
                                     let out               = capsule_result.optimized_text;
+                                    trace!("explore_symbol: get_context_capsule [{:?}ms] — orig={}B opt={}B", t_cap.elapsed().as_millis(), original_text_out.len(), out.len());
 
+                                    let t_lookup = Instant::now();
                                     let abs_path_str: String = conn
                                         .query_row(
                                             "SELECT n.file_path, r.root_path \
@@ -1474,6 +1686,7 @@ impl ServerHandler for ContextEngine {
                                             },
                                         )
                                         .unwrap_or_else(|_| symbol_name.clone());
+                                    trace!("explore_symbol: abs_path lookup [{:?}ms]", t_lookup.elapsed().as_millis());
 
                                     let saved = (full_file_tokens as i64).saturating_sub(optimized_tokens as i64);
                                     let _ = db::increment_stat(&conn, "total_requests",     1);
@@ -1485,6 +1698,8 @@ impl ServerHandler for ContextEngine {
                                 .await
                                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                            trace!("explore_symbol: spawn_blocking total [{:?}ms]", pipeline_t.elapsed().as_millis());
 
                             let tokens_saved = file_tokens.saturating_sub(capsule_tokens);
                             let event = DashboardEvent::CapsuleServed {
@@ -1515,7 +1730,110 @@ impl ServerHandler for ContextEngine {
                             Ok(CallToolResult::success(vec![Content::text(out)]))
                         }
 
+                        // ── trace_flow ────────────────────────────────────────
+                        "trace_flow" => {
+                            let pipeline_t = Instant::now();
+                            let symbol_name = target.ok_or_else(|| {
+                                rmcp::ErrorData::invalid_params(
+                                    "intent 'trace_flow' requires a 'target' (symbol name)".to_string(),
+                                    None,
+                                )
+                            })?;
+                            let sym_for_event = symbol_name.clone();
+
+                            trace!("trace_flow: start — symbol='{symbol_name}'");
+
+                            let cwd = current_workspace_root();
+                            let jit_repo_id = {
+                                let t = Instant::now();
+                                let conn = db.lock().map_err(|_| rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None))?;
+                                let id = resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
+                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                trace!("trace_flow: resolve_repo_id='{id}' [{:?}ms]", t.elapsed().as_millis());
+                                id
+                            };
+                            if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
+                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                            }
+
+                            let (out, capsule_tokens, file_tokens, abs_file_path, repo_used) =
+                                tokio::task::spawn_blocking(move || {
+                                    let t_lock = Instant::now();
+                                    let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                    trace!("trace_flow: db lock acquired [{:?}ms]", t_lock.elapsed().as_millis());
+
+                                    let cwd = current_workspace_root();
+                                    let repo_id =
+                                        ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
+
+                                    let t_trace = Instant::now();
+                                    let result = retrieval::trace_logic_flow(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())?;
+                                    let optimized_tokens = result.optimized_text.len() / 4;
+                                    // trace_flow original_text is the optimized_text (no separate raw file)
+                                    let file_tokens = result.original_text.len() / 4;
+                                    let out = result.optimized_text;
+                                    trace!("trace_flow: trace_logic_flow [{:?}ms] — {}B", t_trace.elapsed().as_millis(), out.len());
+
+                                    let abs_path_str: String = conn
+                                        .query_row(
+                                            "SELECT n.file_path, r.root_path \
+                                             FROM nodes n \
+                                             JOIN repositories r ON r.id = n.repo_id \
+                                             WHERE n.symbol_name = ?1 AND n.repo_id = ?2 \
+                                             ORDER BY n.file_path ASC LIMIT 1",
+                                            rusqlite::params![symbol_name, repo_id],
+                                            |row| {
+                                                let fp: String = row.get(0)?;
+                                                let rp: String = row.get(1)?;
+                                                Ok(std::path::PathBuf::from(&rp).join(&fp).to_string_lossy().to_string())
+                                            },
+                                        )
+                                        .unwrap_or_else(|_| symbol_name.clone());
+
+                                    let saved = (file_tokens as i64).saturating_sub(optimized_tokens as i64);
+                                    let _ = db::increment_stat(&conn, "total_requests",     1);
+                                    let _ = db::increment_stat(&conn, "total_file_tokens",  file_tokens as i64);
+                                    let _ = db::increment_stat(&conn, "total_tokens_saved", saved);
+
+                                    Ok::<_, anyhow::Error>((out, optimized_tokens, file_tokens, abs_path_str, repo_id))
+                                })
+                                .await
+                                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+                            trace!("trace_flow: spawn_blocking total [{:?}ms]", pipeline_t.elapsed().as_millis());
+
+                            let tokens_saved = file_tokens.saturating_sub(capsule_tokens);
+                            let event = DashboardEvent::CapsuleServed {
+                                symbol:         sym_for_event,
+                                repo:           repo_used,
+                                file:           abs_file_path,
+                                capsule_tokens,
+                                file_tokens,
+                                tokens_saved,
+                                origin:         client_name,
+                                ts:             dashboard::now_ts(),
+                                original_text:  None,
+                                optimized_text: Some(out.clone()),
+                            };
+                            let http_client = self.http_client.clone();
+                            tokio::spawn(async move {
+                                match http_client.post(DASHBOARD_EMIT_URL).json(&event).send().await {
+                                    Err(e) => log_emit_error(&e.to_string()),
+                                    Ok(resp) if !resp.status().is_success() => {
+                                        let status = resp.status();
+                                        let body = resp.text().await.unwrap_or_default();
+                                        log_emit_error(&format!("status={status} body={body}"));
+                                    }
+                                    Ok(_) => {}
+                                }
+                            });
+
+                            Ok(CallToolResult::success(vec![Content::text(out)]))
+                        }
+
                         "refactor_symbol" => {
+                            let pipeline_t = Instant::now();
                             let symbol_name = target.ok_or_else(|| {
                                 rmcp::ErrorData::invalid_params(
                                     "intent 'refactor_symbol' requires a 'target' (symbol name)".to_string(),
@@ -1524,31 +1842,50 @@ impl ServerHandler for ContextEngine {
                             })?;
                             let sym_clone = symbol_name.clone();
 
+                            trace!("refactor_symbol: start — symbol='{symbol_name}'");
+
                             let cwd = current_workspace_root();
                             let jit_repo_id = {
+                                let t = Instant::now();
                                 let conn = db.lock().map_err(|_| rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None))?;
-                                resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
-                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                                let id = resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
+                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                trace!("refactor_symbol: resolve_repo_id='{id}' [{:?}ms]", t.elapsed().as_millis());
+                                id
                             };
                             if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
                                 return Ok(CallToolResult::success(vec![Content::text(msg)]));
                             }
 
                             let (result, repo_used) = tokio::task::spawn_blocking(move || {
+                                let t_lock = Instant::now();
                                 let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                trace!("refactor_symbol: db lock acquired [{:?}ms]", t_lock.elapsed().as_millis());
 
                                 let cwd = current_workspace_root();
                                 let repo_id =
                                     ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
 
-                                let result = retrieval::analyze_impact(&conn, &symbol_name, &repo_id)?;
+                                let t_impact = Instant::now();
+                                let result = retrieval::analyze_impact(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())?;
+                                trace!("refactor_symbol: analyze_impact [{:?}ms] — {} affected", t_impact.elapsed().as_millis(), result.affected.len());
+
                                 Ok::<_, anyhow::Error>((result, repo_id))
                             })
                             .await
                             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
+                            trace!("refactor_symbol: spawn_blocking total [{:?}ms]", pipeline_t.elapsed().as_millis());
+
                             let mut out = String::new();
+
+                            // Short-circuit: return the disambiguation payload if the symbol was ambiguous.
+                            if let Some(payload) = result.pivot_id.strip_prefix("DISAMBIGUATION:") {
+                                out.push_str(payload);
+                                return Ok(CallToolResult::success(vec![Content::text(out)]));
+                            }
+
                             writeln!(out, "IMPACT ANALYSIS — pivot id: {}", result.pivot_id).ok();
                             if result.affected.is_empty() {
                                 writeln!(out, "No downstream dependents found. Symbol is safe to change in isolation.").ok();
@@ -1586,7 +1923,7 @@ impl ServerHandler for ContextEngine {
                         }
 
                         _ => Err(rmcp::ErrorData::invalid_params(
-                            "Invalid intent. Must be 'analyze_repo', 'explore_symbol', or 'refactor_symbol'.".to_string(),
+                            "Invalid intent. Must be 'analyze_repo', 'explore_symbol', 'trace_flow', or 'refactor_symbol'.".to_string(),
                             None,
                         )),
                     }
@@ -1600,8 +1937,8 @@ impl ServerHandler for ContextEngine {
                     tokio::task::spawn_blocking(move || {
                         let workspace_root = std::env::current_dir()
                             .unwrap_or_else(|_| PathBuf::from("."));
-                        write_workspace_rules(&workspace_root)?;
-                        write_vscode_mcp_config(&workspace_root)?;
+                        write_workspace_rules(&workspace_root, &[0, 1, 2], WORKSPACE_RULES_CONTENT, WriteMode::SafeAppend)?;
+                        write_vscode_mcp_config(&workspace_root, WriteMode::SafeAppend)?;
                         ensure_workspace_config(Some(enforcement_mode))?;
                         Ok::<_, anyhow::Error>(workspace_root)
                     })
@@ -1981,9 +2318,15 @@ mod tests {
         )
         .unwrap();
 
-        let err = ensure_repo_ready(&conn, Some("other_repo"), &current_root_path).unwrap_err();
+        // Repo exists in DB — should succeed even from a different workspace.
+        let result = ensure_repo_ready(&conn, Some("other_repo"), &current_root_path);
+        assert!(result.is_ok(), "existing repo should be accepted: {:?}", result.err());
+
+        // Repo does NOT exist in DB — should be rejected.
+        let err = ensure_repo_ready(&conn, Some("nonexistent_repo"), &current_root_path).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Run ingest_repo"), "expected explicit guidance to ingest the correct repo: {msg}");
+        assert!(msg.contains("not found"), "expected not-found error: {msg}");
+        assert!(msg.contains("ingest_repo"), "expected guidance to ingest: {msg}");
     }
 }
 
@@ -2052,15 +2395,88 @@ fn cmd_ui() -> Result<()> {
 
 const WORKSPACE_RULES_CONTENT: &str = r#"# MARROW AST CONTEXT ENGINE - STRICT WORKFLOW PROTOCOL
 You are equipped with the 'marrow' MCP server. You MUST adhere to the following strict workflow. Do NOT rely on your default file-reading tools.
+
 ## THE OMNI-TOOL (ALWAYS FIRST)
 For EVERY coding task, exploration, or question, you MUST call the `run_pipeline` tool first.
+
+### Intent Routing Guide
+
 * IF USER SAYS: "Analyze this repo", "Explain the codebase"
-* ACTION: Call `run_pipeline` with `intent: "analyze_repo"`.
-* IF USER SAYS: "How does <function/file> work?", "Fix a bug in <file>"
-* ACTION: Call `run_pipeline` with `intent: "explore_symbol"` and the target.
-* IF USER SAYS: "Refactor <function>", "Delete <file>"
-* ACTION: Call `run_pipeline` with `intent: "refactor_symbol"` and the target.
+  * ACTION: Call `run_pipeline` with `intent: "analyze_repo"`.
+
+* IF USER SAYS: "Trace the execution of <symbol>", "What does <symbol> do step-by-step?", "Debug the flow of <symbol>"
+  * ACTION: Call `run_pipeline` with `intent: "trace_flow"` and the target symbol.
+  * (Use this for precise, linear logic tracing **without** noisy inbound callers.)
+
+* IF USER SAYS: "What calls <symbol>?", "What is the architecture around <symbol>?"
+  * ACTION: Call `run_pipeline` with `intent: "explore_symbol"` and the target.
+  * (Use this to see the broader blast radius and inbound callers.)
+
+* IF USER SAYS: "Refactor <symbol>", "Delete <symbol>"
+  * ACTION: Call `run_pipeline` with `intent: "refactor_symbol"` and the target.
+
 If any tool states the database is empty, immediately run `ingest_repo`.
+
+### Progressive Disclosure (CRITICAL — READ THIS CAREFULLY)
+Marrow uses **Progressive Disclosure** to keep context payloads small and prevent IDE truncation.
+
+When `explore_symbol` returns a capsule:
+- The **pivot symbol** (the one you asked about) contains its **full source code**.
+- **Neighbor symbols** (outbound dependencies it calls) show only their **signature** (first line).
+- This is intentional. You are seeing a navigation map, not the full tree.
+
+**Rule:** If you see a neighbor signature and need its internal logic, you MUST call:
+  `run_pipeline(intent: "read_node", target: "<SymbolName>")`
+
+You are **strictly forbidden** from using `grep`, `read_file`, or any native tool to fetch neighbor bodies. This breaks the Marrow workflow and causes hallucinations from partial file reads.
+
+### Handling Large Artifact Files (CRITICAL)
+If Marrow returns a message like "Large tool result written to file: /tmp/marrow-....md":
+1. You are **strictly forbidden** from guessing or summarizing from memory.
+2. You MUST use your native `read_file` tool to read that specific `/tmp/marrow-....md` path.
+3. Only after reading the artifact may you generate a response.
+
+### Handling Ambiguity (CRITICAL)
+If `run_pipeline` returns a "Disambiguation Payload" stating that multiple matches were found for your target:
+1. DO NOT fall back to native tools like `grep` or `read_file`.
+2. Look at the provided list of file paths in the error payload.
+3. Immediately call `run_pipeline` again, passing the exact same `intent` and `target`, but this time include the correct `target_path` parameter to disambiguate.
+"#;
+
+const WORKSPACE_RULES_CONTENT_SOFT: &str = r#"# MARROW AST CONTEXT ENGINE - WORKFLOW GUIDANCE
+You are equipped with the 'marrow' MCP server. You may use the `run_pipeline` tool if you need broader context about this codebase — it provides richer, AST-aware analysis than default file-reading tools.
+
+## THE OMNI-TOOL (OPTIONAL BUT RECOMMENDED)
+For coding tasks involving exploration or refactoring, consider calling the `run_pipeline` tool for deeper context.
+
+### Intent Routing Guide
+
+* IF USER SAYS: "Analyze this repo", "Explain the codebase"
+  * ACTION: You may call `run_pipeline` with `intent: "analyze_repo"`.
+
+* IF USER SAYS: "Trace the execution of <symbol>", "What does <symbol> do step-by-step?", "Debug the flow of <symbol>"
+  * ACTION: You may call `run_pipeline` with `intent: "trace_flow"` and the target symbol.
+  * (Use this for precise, linear logic tracing **without** noisy inbound callers.)
+
+* IF USER SAYS: "What calls <symbol>?", "What is the architecture around <symbol>?"
+  * ACTION: You may call `run_pipeline` with `intent: "explore_symbol"` and the target.
+  * (Use this to see the broader blast radius and inbound callers.)
+
+* IF USER SAYS: "Refactor <symbol>", "Delete <symbol>"
+  * ACTION: You may call `run_pipeline` with `intent: "refactor_symbol"` and the target.
+
+If any tool states the database is empty, run `ingest_repo` to build the index.
+
+### Progressive Disclosure
+Marrow uses **Progressive Disclosure**: neighbor symbols in a capsule show signatures only.
+To expand a neighbor into its full source, call:
+  `run_pipeline(intent: "read_node", target: "<SymbolName>")`
+Prefer this over using native `read_file` to stay within the Marrow context graph.
+
+### Handling Ambiguity
+If `run_pipeline` returns a "Disambiguation Payload" stating that multiple matches were found for your target:
+1. Look at the provided list of file paths in the error payload.
+2. Call `run_pipeline` again, passing the exact same `intent` and `target`, but this time include the correct `target_path` parameter to disambiguate.
 "#;
 
 /// `marrow rules` — write Marrow-first workflow rules into the target workspace.
@@ -2073,7 +2489,7 @@ If any tool states the database is empty, immediately run `ingest_repo`.
 /// Creates or merges `.vscode/mcp.json` so that GitHub Copilot / VS Code
 /// can discover the Marrow MCP server. Existing `mcpServers` entries are
 /// preserved — only the `"marrow"` key is inserted/updated.
-pub fn write_vscode_mcp_config(workspace_root: &Path) -> Result<()> {
+pub fn write_vscode_mcp_config(workspace_root: &Path, mode: WriteMode) -> Result<Option<String>> {
     let vscode_dir = workspace_root.join(".vscode");
     fs::create_dir_all(&vscode_dir)
         .with_context(|| format!("could not create {}", vscode_dir.display()))?;
@@ -2085,7 +2501,8 @@ pub fn write_vscode_mcp_config(workspace_root: &Path) -> Result<()> {
         "args": ["mcp"]
     });
 
-    let mut config: serde_json::Value = if mcp_path.exists() {
+    // Overwrite mode discards existing config; all other modes preserve it.
+    let mut config: serde_json::Value = if mcp_path.exists() && !matches!(mode, WriteMode::Overwrite) {
         let raw = fs::read_to_string(&mcp_path)
             .with_context(|| format!("could not read {}", mcp_path.display()))?;
         serde_json::from_str(&raw)
@@ -2105,48 +2522,136 @@ pub fn write_vscode_mcp_config(workspace_root: &Path) -> Result<()> {
     fs::write(&mcp_path, pretty)
         .with_context(|| format!("could not write {}", mcp_path.display()))?;
 
-    eprintln!("Wrote VS Code MCP config to {}", mcp_path.display());
-    Ok(())
+    let action = match mode {
+        WriteMode::Overwrite => "overwritten",
+        _ => "merged",
+    };
+    eprintln!("Wrote VS Code MCP config to {} ({})", mcp_path.display(), action);
+    Ok(Some(mcp_path.display().to_string()))
 }
 
-pub fn write_workspace_rules(root_dir: &Path) -> Result<()> {
+/// Write Marrow rule files for the selected agents.
+///
+/// `agent_indices` maps to:
+///   0 → Cursor   (.cursorrules)
+///   1 → Windsurf (.windsurfrules)
+///   2 → Cline    (.clinerules, .roomrules)
+///
+/// Returns the list of file paths that were created, appended, or symlinked.
+pub fn write_workspace_rules(
+    root_dir: &Path,
+    agent_indices: &[usize],
+    rules_content: &str,
+    mode: WriteMode,
+) -> Result<Vec<String>> {
     use std::io::Write;
     const MARROW_HEADER: &str = "# MARROW AST CONTEXT ENGINE";
-    let targets = [".cursorrules", ".clinerules", ".roomrules", ".windsurfrules"];
-    for filename in &targets {
-        let path = root_dir.join(filename);
-        if path.exists() {
-            let existing = fs::read_to_string(&path)
-                .with_context(|| format!("could not read {}", path.display()))?;
-            if existing.contains(MARROW_HEADER) {
-                eprintln!("Skipped {} (Marrow rules already present)", path.display());
-                continue;
+
+    // Index → file names. Cline shares .roomrules for Roo compatibility.
+    const AGENT_FILES: &[&[&str]] = &[
+        &[".cursorrules"],              // 0: Cursor
+        &[".windsurfrules"],            // 1: Windsurf
+        &[".clinerules", ".roomrules"], // 2: Cline + Roo
+    ];
+
+    let mut modified: Vec<String> = Vec::new();
+
+    // For Symlink mode, ensure the central rules file exists once up-front.
+    let central_rules_path = if matches!(mode, WriteMode::Symlink) {
+        let p = dirs::home_dir()
+            .context("could not resolve home directory")?
+            .join(".marrow")
+            .join("global_rules.md");
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        if !p.exists() {
+            fs::write(&p, rules_content)
+                .with_context(|| format!("could not write central rules to {}", p.display()))?;
+        }
+        Some(p)
+    } else {
+        None
+    };
+
+    for &idx in agent_indices {
+        let Some(files) = AGENT_FILES.get(idx) else {
+            continue;
+        };
+        for &filename in *files {
+            let path = root_dir.join(filename);
+            match mode {
+                WriteMode::SafeAppend => {
+                    if path.exists() {
+                        let existing = fs::read_to_string(&path)
+                            .with_context(|| format!("could not read {}", path.display()))?;
+                        if existing.contains(MARROW_HEADER) {
+                            eprintln!("Skipped {} (Marrow rules already present)", path.display());
+                            continue;
+                        }
+                        let mut file = fs::OpenOptions::new()
+                            .append(true)
+                            .open(&path)
+                            .with_context(|| format!("could not open {}", path.display()))?;
+                        write!(file, "\n\n{rules_content}")?;
+                        eprintln!("Appended to {}", path.display());
+                    } else {
+                        let mut file = fs::OpenOptions::new()
+                            .create_new(true)
+                            .write(true)
+                            .open(&path)
+                            .with_context(|| format!("could not create {}", path.display()))?;
+                        write!(file, "{rules_content}")?;
+                        eprintln!("Created {}", path.display());
+                    }
+                    modified.push(path.display().to_string());
+                }
+                WriteMode::Overwrite => {
+                    fs::write(&path, rules_content)
+                        .with_context(|| format!("could not write {}", path.display()))?;
+                    eprintln!("Overwrote {}", path.display());
+                    modified.push(path.display().to_string());
+                }
+                WriteMode::Symlink => {
+                    let central = central_rules_path.as_ref().expect("central path set above");
+                    // Remove existing file or stale symlink before creating the new one.
+                    if path.exists() || path.is_symlink() {
+                        fs::remove_file(&path).ok();
+                    }
+                    #[cfg(unix)]
+                    {
+                        std::os::unix::fs::symlink(central, &path)
+                            .with_context(|| format!(
+                                "could not symlink {} → {}",
+                                path.display(),
+                                central.display()
+                            ))?;
+                        eprintln!("Symlinked {} → {}", path.display(), central.display());
+                        modified.push(path.display().to_string());
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // Symlinks require elevated permissions on Windows; fall back to a copy.
+                        fs::write(&path, rules_content)
+                            .with_context(|| format!("could not write {}", path.display()))?;
+                        eprintln!(
+                            "Created {} (symlink unsupported on this platform, wrote copy)",
+                            path.display()
+                        );
+                        modified.push(path.display().to_string());
+                    }
+                }
             }
-            // File exists but lacks the Marrow block — append.
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .with_context(|| format!("could not open {}", path.display()))?;
-            write!(file, "\n\n{WORKSPACE_RULES_CONTENT}")?;
-            eprintln!("Appended to {}", path.display());
-        } else {
-            // File does not exist — create and write.
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-                .with_context(|| format!("could not create {}", path.display()))?;
-            write!(file, "{WORKSPACE_RULES_CONTENT}")?;
-            eprintln!("Created {}", path.display());
         }
     }
-    Ok(())
+
+    Ok(modified)
 }
 
 fn cmd_rules() -> Result<()> {
     let root = std::env::current_dir().context("could not determine current directory")?;
-    write_workspace_rules(&root)?;
-    write_vscode_mcp_config(&root)?;
+    write_workspace_rules(&root, &[0, 1, 2], WORKSPACE_RULES_CONTENT, WriteMode::SafeAppend)?;
+    write_vscode_mcp_config(&root, WriteMode::SafeAppend)?;
     ensure_workspace_config(Some(EnforcementMode::Default))?;
     eprintln!("[MARROW] Successfully integrated! Workspace rules appended, VS Code / Copilot MCP configuration generated, and workspace enforcement set to default.");
     Ok(())
@@ -2187,7 +2692,7 @@ fn cmd_test_capsules() -> Result<()> {
     let mut err = 0usize;
 
     for (repo_id, symbol_name) in &pairs {
-        match retrieval::get_context_capsule(&conn, symbol_name, repo_id) {
+        match retrieval::get_context_capsule(&conn, symbol_name, repo_id, None) {
             Ok(_) => {
                 ok += 1;
                 eprintln!("OK  {repo_id}:{symbol_name}");
@@ -2700,6 +3205,412 @@ fn cmd_index() -> Result<()> {
     Ok(())
 }
 
+// ── Standalone CLI commands (callable from the interactive menu) ──────────────
+
+/// Write agent rules and VS Code Copilot config into the current workspace.
+///
+/// Presents an interactive sub-menu for:
+///   Phase 1 — Agent selection (MultiSelect)
+///   Phase 2 — Rule strictness (Select; only when markdown-rule agents are chosen)
+///   Phase 3 — Write mode (Select)
+///   Phase 4 — Execution & summary
+pub fn run_integrate_command(workspace_root: &Path) -> Result<()> {
+    use console::style;
+    use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
+
+    // ── Phase 1: Agent Selection ──────────────────────────────────────────────
+    let agent_labels = &[
+        "Cursor    (.cursorrules)",
+        "Windsurf  (.windsurfrules)",
+        "Cline     (.clinerules)",
+        "Copilot MCP (.vscode/mcp.json)",
+    ];
+    let selected_agents = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Which agents do you want to integrate with?")
+        .items(agent_labels)
+        .defaults(&[true, true, true, true])
+        .interact()?;
+
+    if selected_agents.is_empty() {
+        eprintln!("{}", style("No agents selected. Aborting integration.").yellow());
+        return Ok(());
+    }
+
+    // ── Phase 2: Rule Strictness ──────────────────────────────────────────────
+    // Only prompt when at least one markdown-rule agent (Cursor/Windsurf/Cline) is selected.
+    let has_rule_agents = selected_agents.iter().any(|&i| i < 3);
+    let rules_content: &str = if has_rule_agents {
+        let strictness_options = &[
+            "Strict  (Forces the agent to use Marrow's Omni-Tool exclusively)",
+            "Soft    (Suggests Marrow as an optional, supplementary tool)",
+        ];
+        let strictness_choice = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select rule enforcement level")
+            .items(strictness_options)
+            .default(0)
+            .interact()?;
+        if strictness_choice == 0 {
+            WORKSPACE_RULES_CONTENT
+        } else {
+            WORKSPACE_RULES_CONTENT_SOFT
+        }
+    } else {
+        WORKSPACE_RULES_CONTENT
+    };
+
+    // ── Phase 3: Write Mode ───────────────────────────────────────────────────
+    let write_options = &[
+        "Safe Append  (Idempotent, preserves your existing custom rules)",
+        "Overwrite    (Destructive, replaces file entirely)",
+        "Symlink      (Links to a central ~/.marrow/global_rules.md)",
+    ];
+    let write_choice = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("How should the rule files be written?")
+        .items(write_options)
+        .default(0)
+        .interact()?;
+    let write_mode = match write_choice {
+        1 => WriteMode::Overwrite,
+        2 => WriteMode::Symlink,
+        _ => WriteMode::SafeAppend,
+    };
+
+    // ── Phase 4: Execution ────────────────────────────────────────────────────
+    eprintln!();
+    let mut summary: Vec<String> = Vec::new();
+
+    // Rule files for markdown-based agents (indices 0, 1, 2).
+    let rule_agent_indices: Vec<usize> = selected_agents.iter().copied().filter(|&i| i < 3).collect();
+    if !rule_agent_indices.is_empty() {
+        match write_workspace_rules(workspace_root, &rule_agent_indices, rules_content, write_mode) {
+            Ok(modified) => summary.extend(modified),
+            Err(e) => eprintln!("{}", style(format!("  ✗ Rule file error: {e}")).red()),
+        }
+    }
+
+    // Copilot MCP config (index 3).
+    if selected_agents.contains(&3) {
+        match write_vscode_mcp_config(workspace_root, write_mode) {
+            Ok(Some(path)) => summary.push(path),
+            Ok(None) => {}
+            Err(e) => eprintln!("{}", style(format!("  ✗ Copilot MCP config error: {e}")).red()),
+        }
+    }
+
+    // ── Summary ───────────────────────────────────────────────────────────────
+    eprintln!();
+    eprintln!("{}", style("[Marrow] Integration complete. Files modified:").green().bold());
+    if summary.is_empty() {
+        eprintln!("  {}", style("(none — all files already up to date)").dim());
+    } else {
+        for path in &summary {
+            eprintln!("  {}  {}", style("✓").green().bold(), style(path).dim());
+        }
+    }
+    Ok(())
+}
+
+/// Parse all source files in `workspace_root` and build the AST graph in SQLite.
+/// Displays a real-time `indicatif` progress bar while files are parsed in parallel.
+pub fn run_index_command(workspace_root: &Path) -> Result<()> {
+    use console::style;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let t0 = Instant::now();
+
+    let repo_id = workspace_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unnamed")
+        .to_string();
+
+    // Load ignore patterns from .marrowrc.json or use defaults.
+    let ignore_patterns: Vec<String> = if let Ok(raw) = fs::read_to_string(workspace_root.join(".marrowrc.json")) {
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        v.get("ignore")
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    } else {
+        vec!["node_modules".into(), "target".into(), "dist".into(), ".git".into()]
+    };
+
+    let mut builder = ignore::WalkBuilder::new(workspace_root);
+    builder.hidden(true).git_ignore(true).git_global(false).git_exclude(false);
+    let mut overrides = ignore::overrides::OverrideBuilder::new(workspace_root);
+    for pat in &ignore_patterns {
+        overrides.add(&format!("!{pat}/"))?;
+    }
+    builder.overrides(overrides.build()?);
+    builder.filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        !matches!(
+            name.as_ref(),
+            "node_modules" | ".git" | "target" | "dist" | "build" | "vendor"
+        )
+    });
+
+    let discovery_spinner = ProgressBar::new_spinner();
+    discovery_spinner.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+    );
+    discovery_spinner.set_message("Discovering files and evaluating .gitignore rules...");
+    discovery_spinner.enable_steady_tick(Duration::from_millis(100));
+
+    let supported_exts = ["cpp", "cc", "cxx", "h", "hpp", "py", "ts", "tsx", "rs", "rb"];
+    let files: Vec<PathBuf> = builder
+        .build()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+        .filter(|e| {
+            e.path().extension().and_then(|x| x.to_str()).is_some_and(|x| supported_exts.contains(&x))
+        })
+        .map(|e| e.into_path())
+        .collect();
+
+    discovery_spinner.finish_and_clear();
+    eprintln!("{}", style(format!("[Marrow] Indexing {} — {} files", repo_id, files.len())).cyan());
+
+    let pb = ProgressBar::new(files.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] {spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+        )
+        .unwrap()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+        .progress_chars("=>-"),
+    );
+    pb.enable_steady_tick(Duration::from_millis(100));
+
+    let completed = Arc::new(AtomicUsize::new(0));
+    let pb_ref = &pb;
+
+    let parsed: Vec<_> = files
+        .par_iter()
+        .filter_map(|path| {
+            let rel = path.strip_prefix(workspace_root).unwrap_or(path).to_string_lossy().to_string();
+            pb_ref.inc(1);
+            completed.fetch_add(1, Ordering::Relaxed);
+            match ingestion::parse_file(path) {
+                Ok((lang, symbols)) => Some((rel, lang, symbols)),
+                Err(_) => None,
+            }
+        })
+        .collect();
+
+    pb.finish_with_message("parsing complete");
+
+    let db_dir = workspace_root.join(".marrow");
+    fs::create_dir_all(&db_dir)?;
+    let db_path = db_dir.join("graph.db");
+    let conn = db::init_db_or_memory(&db_path.to_string_lossy())?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO repositories (id, root_path) VALUES (?1, ?2)",
+        rusqlite::params![repo_id, workspace_root.to_string_lossy().as_ref()],
+    )?;
+
+    // Flatten parsed symbols into rows for chunked insertion
+    let mut all_rows: Vec<(String, String, String, String, String, String, String)> = Vec::new();
+    for (file_path, lang, symbols) in &parsed {
+        for sym in symbols {
+            let node_id = format!("{repo_id}:{file_path}:{}", sym.name);
+            all_rows.push((
+                node_id,
+                repo_id.clone(),
+                file_path.clone(),
+                lang.clone(),
+                sym.name.clone(),
+                sym.symbol_type.clone(),
+                sym.raw_text.clone(),
+            ));
+        }
+    }
+
+    let insert_pb = ProgressBar::new(all_rows.len() as u64);
+    insert_pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] {spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+        )
+        .unwrap()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+        .progress_chars("=>-"),
+    );
+    insert_pb.set_message("Inserting AST Nodes");
+    insert_pb.enable_steady_tick(Duration::from_millis(100));
+
+    let chunk_size = 5000;
+    let mut symbol_count: usize = 0;
+    for chunk in all_rows.chunks(chunk_size) {
+        // Force an immediate write lock to prevent SQLITE_BUSY upgrade deadlocks.
+        conn.execute("BEGIN IMMEDIATE", [])?;
+        for (node_id, r_id, file_path, lang, name, sym_type, raw_text) in chunk {
+            conn.execute(
+                "INSERT OR REPLACE INTO nodes \
+                 (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![node_id, r_id, file_path, lang, name, sym_type, raw_text],
+            )?;
+            symbol_count += 1;
+        }
+        conn.execute("COMMIT", [])?;
+        insert_pb.inc(chunk.len() as u64);
+    }
+    insert_pb.finish_with_message("insertion complete");
+
+    let edge_count = ingestion::resolve_cross_repo_edges(&conn)?;
+    let elapsed = t0.elapsed();
+
+    eprintln!("{}", style(format!(
+        "[Marrow] Index complete — {} symbols, {} edges in {:.2?}",
+        fmt_num(symbol_count), fmt_num(edge_count), elapsed
+    )).green().bold());
+
+    Ok(())
+}
+
+/// Perform an initial index, then watch the workspace for file saves and
+/// incrementally re-index changed source files.
+pub fn run_watch_command(workspace_root: &Path) -> Result<()> {
+    use console::style;
+    use notify::RecursiveMode;
+    use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
+    use std::time::Duration;
+
+    eprintln!("{}", style("[Marrow] Building baseline index...").cyan());
+    run_index_command(workspace_root)?;
+
+    let db_path = workspace_root.join(".marrow/graph.db");
+    let conn = Arc::new(Mutex::new(db::init_db_or_memory(&db_path.to_string_lossy())?));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
+    debouncer.watcher().watch(workspace_root, RecursiveMode::Recursive)?;
+
+    eprintln!(
+        "{}",
+        style("[Marrow] Watching for changes. Press Ctrl+C to stop.").green().bold()
+    );
+
+    let supported_exts = ["cpp", "cc", "cxx", "h", "hpp", "py", "ts", "tsx", "rs", "rb"];
+    let repo_id = workspace_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unnamed")
+        .to_string();
+
+    for result in rx {
+        match result {
+            Ok(events) => {
+                for event in events {
+                    if event.kind != DebouncedEventKind::Any {
+                        continue;
+                    }
+                    let path = &event.path;
+                    let ext_ok = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| supported_exts.contains(&e));
+                    if !ext_ok {
+                        continue;
+                    }
+                    let rel = path.strip_prefix(workspace_root).unwrap_or(path).to_string_lossy().to_string();
+                    match ingestion::parse_file(path) {
+                        Ok((lang, symbols)) => {
+                            if let Ok(conn) = conn.lock() {
+                                let node_id_prefix = format!("{repo_id}:{rel}:");
+                                // Remove stale nodes for this file then re-insert.
+                                let _ = conn.execute(
+                                    "DELETE FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
+                                    rusqlite::params![repo_id, rel],
+                                );
+                                for sym in &symbols {
+                                    let node_id = format!("{node_id_prefix}{}", sym.name);
+                                    let _ = conn.execute(
+                                        "INSERT OR REPLACE INTO nodes \
+                                         (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text) \
+                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                        rusqlite::params![
+                                            node_id, repo_id, rel, lang,
+                                            sym.name, sym.symbol_type, sym.raw_text
+                                        ],
+                                    );
+                                }
+                            }
+                            eprintln!("{}", style(format!("[Marrow] Updated AST for {rel}")).dim());
+                        }
+                        Err(e) => {
+                            eprintln!("{}", style(format!("[Marrow] Parse error for {rel}: {e}")).yellow());
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("{}", style(format!("[Marrow] Watch error: {e:?}")).red()),
+        }
+    }
+
+    Ok(())
+}
+
+/// Interactive TUI — shown when `marrow` is run with no arguments.
+fn cmd_interactive() -> Result<()> {
+    use console::style;
+    use dialoguer::{Select, theme::ColorfulTheme};
+
+    // Clear terminal
+    print!("\x1B[2J\x1B[1;1H");
+
+    let art = r#"
+  ███╗   ███╗ █████╗ ██████╗ ██████╗  ██████╗ ██╗    ██╗
+  ████╗ ████║██╔══██╗██╔══██╗██╔══██╗██╔═══██╗██║    ██║
+  ██╔████╔██║███████║██████╔╝██████╔╝██║   ██║██║ █╗ ██║
+  ██║╚██╔╝██║██╔══██║██╔══██╗██╔══██╗██║   ██║██║███╗██║
+  ██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██║╚██████╔╝╚███╔███╔╝
+  ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚══╝╚══╝
+"#;
+
+    println!("{}", style(art).green().bold());
+    println!("{}", style("  AST Context Engine for AI Agents\n").cyan());
+
+    let items = [
+        "1. Integrate Agents   (Generate rules & Copilot config)",
+        "2. Index Workspace    (Build the AST graph once)",
+        "3. Watch Workspace    (Index & listen for file changes)",
+        "4. Start MCP Server   (Run stdio server manually)",
+        "5. Exit",
+    ];
+
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Welcome to Marrow. Select an action")
+        .items(&items)
+        .default(0)
+        .interact()?;
+
+    let workspace_root = current_workspace_root();
+
+    match selection {
+        0 => run_integrate_command(&workspace_root)?,
+        1 => run_index_command(&workspace_root)?,
+        2 => run_watch_command(&workspace_root)?,
+        3 => {
+            eprintln!(
+                "{}",
+                style("[Marrow] Starting MCP server... (tip: run 'marrow mcp' to bypass the menu)").yellow()
+            );
+            let current_exe = std::env::current_exe()?;
+            std::process::Command::new(current_exe).arg("mcp").spawn()?.wait()?;
+        }
+        _ => eprintln!("{}", style("Goodbye.").dim()),
+    }
+
+    Ok(())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -2724,6 +3635,8 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(|s| s.as_str()) {
+        // Human interactive mode: no arguments → launch the TUI menu.
+        None => return cmd_interactive(),
         Some("ui")        => return cmd_ui(),
         Some("init")      => return cmd_init(),
         Some("rules")     => return cmd_rules(),
@@ -2758,10 +3671,10 @@ Some("benchmark") => {
                 .unwrap_or_else(|_| ".marrow/graph.db".to_string());
 
             let conn = db::init_db_or_memory(&db_path)?;
-            let result = retrieval::get_context_capsule(&conn, symbol, repo_id)?;
+            let result = retrieval::get_context_capsule(&conn, symbol, repo_id, None)?;
             println!("{}", result.optimized_text);
 
-            let impact = retrieval::analyze_impact(&conn, symbol, repo_id)?;
+            let impact = retrieval::analyze_impact(&conn, symbol, repo_id, None)?;
             println!("\nIMPACT ANALYSIS:");
             if impact.affected.is_empty() {
                 println!("  No downstream dependents found.");
@@ -2772,7 +3685,9 @@ Some("benchmark") => {
             }
             return Ok(());
         }
-        _ => {}
+        // Machine bypass: explicit "mcp" arg (or any unrecognised arg) falls
+        // straight through to the stdio server without showing the menu.
+        Some("mcp") | Some(_) => {}
     }
 
     // ── Default: start MCP stdio server ──────────────────────────────
@@ -2856,8 +3771,11 @@ Some("benchmark") => {
     let engine = ContextEngine {
         db:          Arc::clone(&db_arc),
         http_client,
-        is_indexing: Arc::new(AtomicBool::new(false)),
     };
+
+    // Indexing is now decoupled — managed externally via `marrow index` / `marrow watch`.
+    // Mark the state as Ready so run_pipeline tool calls are not blocked on MCP boot.
+    set_index_state(IndexState::Ready);
 
     eprintln!("Marrow MCP server ready — listening on stdio.");
     let server = engine.serve(stdio()).await?;

@@ -5,6 +5,8 @@ use rusqlite::Connection;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser, Query, QueryCursor};
 
@@ -351,70 +353,139 @@ pub fn is_safe_to_parse(path: &Path) -> bool {
 
 /// Recursively collect all parseable source files under `root`, respecting
 /// `.gitignore` rules and the hardcoded security/noise filter.
+///
+/// Uses `ignore::WalkParallel` with an mpsc channel to traverse the directory
+/// tree concurrently, avoiding the bottleneck of a single-threaded walk on
+/// large repositories.
 pub fn collect_source_files(root: &Path) -> Vec<PathBuf> {
+    use ignore::WalkState;
+
+    let (tx, rx) = mpsc::channel();
+
     let walker = WalkBuilder::new(root)
         .hidden(true)       // skip dotfiles / hidden directories
         .git_ignore(true)   // respect .gitignore
         .git_exclude(true)  // respect .git/info/exclude
-        .build();
-
-    walker
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.is_dir() {
-                return None;
-            }
-            if !is_safe_to_parse(path) {
-                return None;
-            }
-            let ext = path.extension().and_then(|e| e.to_str())?;
-            lang_config_for_ext(ext)?;
-            Some(entry.into_path())
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !matches!(
+                name.as_ref(),
+                "node_modules" | ".git" | "target" | "dist" | "build" | "vendor"
+            )
         })
-        .collect()
+        .build_parallel();
+
+    walker.run(|| {
+        let tx = tx.clone();
+        Box::new(move |result| {
+            if let Ok(entry) = result {
+                if entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    let path = entry.path();
+                    if is_safe_to_parse(path) {
+                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                            if lang_config_for_ext(ext).is_some() {
+                                let _ = tx.send(entry.into_path());
+                            }
+                        }
+                    }
+                }
+            }
+            WalkState::Continue
+        })
+    });
+
+    // Drop the original sender so the receiver drains once all workers finish.
+    drop(tx);
+
+    rx.into_iter().collect()
 }
 
-/// Ingest an entire repository incrementally: only re-parse files whose
-/// content hash has changed since the last index run. First-time ingest
-/// is a full pass. Returns `(total_symbol_count, calls_edge_count)`.
-pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result<(usize, usize)> {
-    let root_path = root_path
-        .canonicalize()
-        .unwrap_or_else(|_| root_path.to_path_buf());
+fn maybe_emit_progress<F>(progress: &F, last_reported: &AtomicU8, next_percent: u8)
+where
+    F: Fn(u8) + Send + Sync,
+{
+    let next_percent = next_percent.min(100);
+    let mut previous = last_reported.load(Ordering::SeqCst);
+    while next_percent > previous {
+        match last_reported.compare_exchange(
+            previous,
+            next_percent,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                if last_reported.load(Ordering::SeqCst) == next_percent {
+                    progress(next_percent);
+                }
+                break;
+            }
+            Err(actual) => previous = actual,
+        }
+    }
+}
 
+/// All data produced by the CPU-intensive parse phase.
+/// Passed to the write phase so the DB lock is not held during file I/O
+/// or tree-sitter work.
+struct ComputedChangeset {
+    /// (rel_path, lang_ext, symbols, content_hash, mtime_ns)
+    parsed: Vec<(String, String, Vec<Symbol>, String, i64)>,
+    /// Files whose mtime changed but content hash was identical (mtime-drift only).
+    mtime_only: Vec<(String, i64)>,
+    /// Relative paths of files that disappeared from disk since last index.
+    removed_rels: Vec<String>,
+}
+
+// ── Phase A: brief DB read ────────────────────────────────────────────────────
+
+/// Insert/update the repository record and return all known file metadata.
+/// Holds the connection only for this short read — no I/O or CPU work.
+fn load_known_files(
+    conn: &Connection,
+    repo_id: &str,
+    root_path: &Path,
+) -> Result<HashMap<String, (i64, String)>> {
     conn.execute(
         "INSERT OR REPLACE INTO repositories (id, root_path) VALUES (?1, ?2)",
         rusqlite::params![repo_id, root_path.to_string_lossy().as_ref()],
     )?;
+    let mut stmt = conn.prepare(
+        "SELECT file_path, mtime_secs, content_hash FROM files WHERE repo_id = ?1",
+    )?;
+    let rows: Vec<(String, i64, String)> = stmt
+        .query_map(rusqlite::params![repo_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows.into_iter().map(|(path, mtime, hash)| (path, (mtime, hash))).collect())
+}
 
-    // ── Load existing file records ────────────────────────────────────────────
-    let known_files: std::collections::HashMap<String, (i64, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT file_path, mtime_secs, content_hash FROM files WHERE repo_id = ?1",
-        )?;
-        let rows: Vec<(String, i64, String)> = stmt
-            .query_map(rusqlite::params![repo_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        rows.into_iter().map(|(path, mtime, hash)| (path, (mtime, hash))).collect()
-    };
+// ── Phase B: pure CPU/IO — no DB connection held ──────────────────────────────
 
-    // ── Walk all source files on disk ─────────────────────────────────────────
-    let disk_files = collect_source_files(&root_path);
+/// Walk the filesystem, hash changed files, and run tree-sitter in parallel.
+/// No database access — safe to run while the DB mutex is released.
+fn compute_changeset<F>(
+    known_files: &HashMap<String, (i64, String)>,
+    root_path: &Path,
+    progress: &F,
+    progress_state: &AtomicU8,
+) -> ComputedChangeset
+where
+    F: Fn(u8) + Send + Sync,
+{
+    let disk_files = collect_source_files(root_path);
+    maybe_emit_progress(progress, progress_state, 10);
 
     // Gather (abs_path, rel_path, mtime_ns) for every file on disk.
-    // We store nanosecond precision so sub-second writes (common in tests and
-    // fast editors) are correctly detected as mtime changes. The column is
-    // named mtime_secs but holds nanoseconds; SQLite INTEGER is 64-bit so
-    // values through year 2262 fit comfortably.
+    // We store nanosecond precision so sub-second writes are correctly
+    // detected. The column is named mtime_secs but holds nanoseconds;
+    // SQLite INTEGER is 64-bit so values through year 2262 fit fine.
     let disk_meta: Vec<(PathBuf, String, i64)> = disk_files
         .iter()
         .filter_map(|path| {
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            let rel = canonical.strip_prefix(&root_path).ok()?.to_string_lossy().to_string();
+            let rel = canonical.strip_prefix(root_path).ok()?.to_string_lossy().to_string();
             let mtime = std::fs::metadata(path).ok()?.modified().ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos() as i64)
@@ -426,33 +497,34 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
     // Determine which files need content-checking (mtime changed or new)
     let candidates: Vec<(PathBuf, String, i64)> = disk_meta
         .iter()
-        .filter(|(_, rel, mtime)| {
-            match known_files.get(rel) {
-                None => true,                           // new file
-                Some((km, _)) => km != mtime,          // mtime changed
-            }
+        .filter(|(_, rel, mtime)| match known_files.get(rel) {
+            None => true,
+            Some((km, _)) => km != mtime,
         })
         .cloned()
         .collect();
 
-    // Read + hash candidates; keep only those whose content hash changed.
-    // Returns (rel_path, abs_path, mtime, content_hash) for files to re-parse.
+    // Read + hash candidates in parallel; keep only those whose content changed.
+    let candidate_total = candidates.len().max(1);
     let changed: Vec<(String, PathBuf, i64, String)> = candidates
         .par_iter()
-        .filter_map(|(path, rel, mtime)| {
+        .enumerate()
+        .filter_map(|(idx, (path, rel, mtime))| {
             let bytes = std::fs::read(path).ok()?;
             let new_hash = crate::db::hash_file_content(&bytes);
-            // If known, compare hash; if hash is same, only mtime drifted (e.g. `touch`)
+            let percent = 10 + (((idx + 1) * 35) / candidate_total) as u8;
+            maybe_emit_progress(progress, progress_state, percent);
             if let Some((_, known_hash)) = known_files.get(rel) {
                 if *known_hash == new_hash {
-                    return None; // content identical — skip re-parse, just update mtime
+                    return None; // content identical — mtime drift only
                 }
             }
             Some((rel.clone(), path.clone(), *mtime, new_hash))
         })
         .collect();
+    maybe_emit_progress(progress, progress_state, 45);
 
-    // Collect rel_paths of mtime-only-changed files (candidates not in `changed`)
+    // mtime-only files: candidates that didn't make it into `changed`
     let changed_rels: std::collections::HashSet<&str> =
         changed.iter().map(|(r, _, _, _)| r.as_str()).collect();
     let mtime_only: Vec<(String, i64)> = candidates
@@ -461,21 +533,27 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
         .map(|(_, rel, mtime)| (rel.clone(), *mtime))
         .collect();
 
-    // ── Parallel parse of changed files ──────────────────────────────────────
+    // Parse changed files in parallel with tree-sitter
+    let changed_total = changed.len().max(1);
     let parsed: Vec<(String, String, Vec<Symbol>, String, i64)> = changed
         .par_iter()
-        .filter_map(|(rel, path, mtime, hash)| {
-            match parse_file(path) {
+        .enumerate()
+        .filter_map(|(idx, (rel, path, mtime, hash))| {
+            let result = match parse_file(path) {
                 Ok((lang, symbols)) => Some((rel.clone(), lang, symbols, hash.clone(), *mtime)),
                 Err(e) => {
                     eprintln!("Warning: skipping {}: {}", path.display(), e);
                     None
                 }
-            }
+            };
+            let percent = 45 + (((idx + 1) * 35) / changed_total) as u8;
+            maybe_emit_progress(progress, progress_state, percent);
+            result
         })
         .collect();
+    maybe_emit_progress(progress, progress_state, 80);
 
-    // ── Detect removed files ──────────────────────────────────────────────────
+    // Detect files removed from disk
     let disk_rels: std::collections::HashSet<&str> =
         disk_meta.iter().map(|(_, r, _)| r.as_str()).collect();
     let removed_rels: Vec<String> = known_files
@@ -484,13 +562,86 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
         .cloned()
         .collect();
 
-    // ── Single transaction: delete stale, insert fresh ────────────────────────
-    let tx = conn.unchecked_transaction()?;
+    ComputedChangeset { parsed, mtime_only, removed_rels }
+}
 
-    // Remove nodes + files record for deleted files
+// ── Phase C: brief DB write ───────────────────────────────────────────────────
+
+/// Commit the computed changeset in a single transaction.
+/// Returns (total_symbol_count, calls_edge_count).
+///
+/// Uses `BEGIN IMMEDIATE` so the write reservation is claimed up-front rather
+/// than deferring the upgrade from read→write. This prevents the race where two
+/// concurrent processes both start deferred transactions and then both try to
+/// upgrade to writer simultaneously, causing `SQLITE_BUSY` for one of them.
+fn write_changeset<F>(
+    conn: &Connection,
+    repo_id: &str,
+    changeset: ComputedChangeset,
+    progress: &F,
+    progress_state: &AtomicU8,
+) -> Result<(usize, usize)>
+where
+    F: Fn(u8) + Send + Sync,
+{
+    // BEGIN IMMEDIATE acquires a RESERVED lock immediately.
+    // Other processes can still read but cannot write while this transaction runs.
+    //
+    // Retry loop: IDE MCP servers may hold a read lock between our attempts,
+    // causing SQLITE_BUSY. Retry up to 20 times with 500 ms back-off before
+    // giving up, rather than failing immediately.
+    {
+        let mut attempts = 0u32;
+        loop {
+            match conn.execute_batch("BEGIN IMMEDIATE") {
+                Ok(_) => break,
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::DatabaseBusy =>
+                {
+                    attempts += 1;
+                    if attempts > 20 {
+                        return Err(anyhow::anyhow!(
+                            "SQLite database is locked after 20 retries; \
+                             another process may be holding a write lock"
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    let result = write_changeset_body(conn, repo_id, changeset, progress, progress_state);
+
+    match result {
+        Ok(counts) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(counts)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+fn write_changeset_body<F>(
+    conn: &Connection,
+    repo_id: &str,
+    changeset: ComputedChangeset,
+    progress: &F,
+    progress_state: &AtomicU8,
+) -> Result<(usize, usize)>
+where
+    F: Fn(u8) + Send + Sync,
+{
+    let ComputedChangeset { parsed, mtime_only, removed_rels } = changeset;
+
+    // Remove nodes + file records for deleted files
     for file_path in &removed_rels {
         let syms: Vec<String> = {
-            let mut s = tx.prepare(
+            let mut s = conn.prepare(
                 "SELECT symbol_name FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
             )?;
             let collected: Vec<String> = s
@@ -500,58 +651,59 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
             collected
         };
         for sym in &syms {
-            crate::db::mark_deleted_observation_stale(&tx, repo_id, sym, file_path)?;
+            crate::db::mark_deleted_observation_stale(conn, repo_id, sym, file_path)?;
         }
-        tx.execute(
+        conn.execute(
             "DELETE FROM edges WHERE source_id IN (
                 SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)
              OR target_id IN (
                 SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)",
             rusqlite::params![repo_id, file_path],
         )?;
-        tx.execute(
+        conn.execute(
             "DELETE FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
             rusqlite::params![repo_id, file_path],
         )?;
-        tx.execute(
+        conn.execute(
             "DELETE FROM files WHERE repo_id = ?1 AND file_path = ?2",
             rusqlite::params![repo_id, file_path],
         )?;
     }
 
-    // Remove old nodes+edges for changed files (will be replaced)
+    // Remove old nodes+edges for changed files (will be replaced below)
     for (file_path, _, _, _, _) in &parsed {
-        tx.execute(
+        conn.execute(
             "DELETE FROM edges WHERE source_id IN (
                 SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)
              OR target_id IN (
                 SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)",
             rusqlite::params![repo_id, file_path],
         )?;
-        tx.execute(
+        conn.execute(
             "DELETE FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
             rusqlite::params![repo_id, file_path],
         )?;
     }
 
-    // Insert new nodes for changed files
+    // Insert fresh nodes for changed files.
+    // Use prepare_cached so SQLite compiles the query plan once and reuses it
+    // for every row, avoiding per-row re-compilation overhead.
     for (file_path, lang, symbols, hash, mtime) in &parsed {
         for sym in symbols {
             let node_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
-            tx.execute(
+            conn.prepare_cached(
                 "INSERT OR REPLACE INTO nodes \
                  (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    node_id, repo_id, file_path, lang,
-                    sym.name, sym.symbol_type, sym.raw_text
-                ],
-            )?;
+            )?
+            .execute(rusqlite::params![
+                node_id, repo_id, file_path, lang,
+                sym.name, sym.symbol_type, sym.raw_text
+            ])?;
             let new_hash = crate::db::hash_raw_text(&sym.raw_text);
-            crate::db::mark_stale_observations(&tx, repo_id, &sym.name, file_path, &new_hash)?;
+            crate::db::mark_stale_observations(conn, repo_id, &sym.name, file_path, &new_hash)?;
         }
-        // Upsert files record for changed file
-        tx.execute(
+        conn.execute(
             "INSERT OR REPLACE INTO files (repo_id, file_path, mtime_secs, content_hash)
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![repo_id, file_path, mtime, hash],
@@ -560,26 +712,24 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
 
     // Update mtime-only files (content unchanged, mtime drifted)
     for (rel, mtime) in &mtime_only {
-        tx.execute(
+        conn.execute(
             "UPDATE files SET mtime_secs = ?1 WHERE repo_id = ?2 AND file_path = ?3",
             rusqlite::params![mtime, repo_id, rel],
         )?;
     }
+    maybe_emit_progress(progress, progress_state, 90);
 
-    // ── Build CALLS edges for changed files (same transaction) ───────────────
-    // Build name→ids map from in-memory parsed data first (no DB query needed
-    // for newly inserted nodes since the transaction hasn't committed yet).
-    let mut name_to_ids: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    // Build CALLS edges for changed files
+    let mut name_to_ids: HashMap<String, Vec<String>> = HashMap::new();
     for (file_path, _, symbols, _, _) in &parsed {
         for sym in symbols {
             let node_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
             name_to_ids.entry(sym.name.clone()).or_default().push(node_id);
         }
     }
-    // Also load existing unchanged nodes for cross-file call resolution
+    // Also pull in existing unchanged nodes for cross-file call resolution
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = conn.prepare(
             "SELECT symbol_name, id FROM nodes WHERE repo_id = ?1",
         )?;
         stmt.query_map(rusqlite::params![repo_id], |row| {
@@ -602,12 +752,12 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
                 }
                 if let Some(target_ids) = name_to_ids.get(callee_name.as_str()) {
                     for target_id in target_ids {
-                        tx.execute(
+                        conn.prepare_cached(
                             "INSERT OR IGNORE INTO edges \
                              (source_id, target_id, relationship_type) \
                              VALUES (?1, ?2, 'CALLS')",
-                            rusqlite::params![source_id, target_id],
-                        )?;
+                        )?
+                        .execute(rusqlite::params![source_id, target_id])?;
                         calls_edge_count += 1;
                     }
                 }
@@ -615,9 +765,8 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
         }
     }
 
-    tx.commit()?;
+    maybe_emit_progress(progress, progress_state, 95);
 
-    // Total node count across the whole repo (unchanged + newly parsed)
     let total: usize = conn.query_row(
         "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
         rusqlite::params![repo_id],
@@ -627,17 +776,122 @@ pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result
     Ok((total, calls_edge_count))
 }
 
+// ── Composed entry points ─────────────────────────────────────────────────────
+
+fn ingest_repo_with_progress<F>(
+    conn: &Connection,
+    repo_id: &str,
+    root_path: &Path,
+    progress: &F,
+) -> Result<(usize, usize)>
+where
+    F: Fn(u8) + Send + Sync,
+{
+    let root_path = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.to_path_buf());
+
+    if !root_path.exists() {
+        return Err(anyhow!("The specified root_path does not exist: {}", root_path.display()));
+    }
+
+    let progress_state = AtomicU8::new(0);
+    maybe_emit_progress(progress, &progress_state, 5);
+
+    let known_files = load_known_files(conn, repo_id, &root_path)?;
+    let changeset = compute_changeset(&known_files, &root_path, progress, &progress_state);
+    write_changeset(conn, repo_id, changeset, progress, &progress_state)
+}
+
+/// Ingest an entire repository incrementally: only re-parse files whose
+/// content hash has changed since the last index run. First-time ingest
+/// is a full pass. Returns `(total_symbol_count, calls_edge_count)`.
+#[allow(dead_code)] // retained for tests and direct/manual ingestion entry points
+pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result<(usize, usize)> {
+    ingest_repo_with_progress(conn, repo_id, root_path, &|_| {})
+}
+
 /// Combined ingestion pipeline: parse all files in `root_path` under `repo_id`,
 /// then resolve cross-repo edges in a single call.
 ///
 /// Both the explicit `ingest_repo` MCP tool handler and the JIT auto-indexer
 /// call this function so the full pipeline is never duplicated.
 /// Returns `(symbol_count, edge_count)`.
+#[allow(dead_code)] // retained for tests and direct ingestion entry points
 pub fn run_ingestion(conn: &Connection, repo_id: &str, root_path: &Path) -> Result<(usize, usize)> {
-    let (symbols, calls_edges) = ingest_repo(conn, repo_id, root_path)?;
+    run_ingestion_with_progress(conn, repo_id, root_path, |_| {})
+}
+
+#[allow(dead_code)] // retained for tests and direct ingestion entry points
+pub fn run_ingestion_with_progress<F>(
+    conn: &Connection,
+    repo_id: &str,
+    root_path: &Path,
+    progress: F,
+) -> Result<(usize, usize)>
+where
+    F: Fn(u8) + Send + Sync,
+{
+    let (symbols, calls_edges) = ingest_repo_with_progress(conn, repo_id, root_path, &progress)?;
+    maybe_emit_progress(&progress, &AtomicU8::new(95), 95);
     let import_edges = resolve_cross_repo_edges(conn)?;
+    maybe_emit_progress(&progress, &AtomicU8::new(95), 100);
     crate::db::vacuum_and_checkpoint(conn)?;
     Ok((symbols, calls_edges + import_edges))
+}
+
+/// Arc-based ingestion pipeline that releases the DB mutex between phases.
+///
+/// Unlike `run_ingestion_with_progress`, this function holds the lock only
+/// for brief read and write windows, releasing it during the CPU/IO-intensive
+/// parallel parse phase. This prevents the boot-time indexer from starving
+/// concurrent tool calls that also need the DB.
+pub fn run_ingestion_with_arc<F>(
+    db: &Arc<Mutex<Connection>>,
+    repo_id: &str,
+    root_path: &Path,
+    progress: F,
+) -> Result<(usize, usize)>
+where
+    F: Fn(u8) + Send + Sync,
+{
+    let root_path = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.to_path_buf());
+
+    if !root_path.exists() {
+        return Err(anyhow!("The specified root_path does not exist: {}", root_path.display()));
+    }
+
+    let progress_state = AtomicU8::new(0);
+
+    // Phase A: brief DB read — lock acquired, then immediately released.
+    let known_files = {
+        let conn = db.lock().map_err(|_| anyhow!("DB mutex poisoned"))?;
+        maybe_emit_progress(&progress, &progress_state, 5);
+        load_known_files(&conn, repo_id, &root_path)?
+    };
+
+    // Phase B: pure CPU/IO — DB mutex is NOT held.
+    let changeset = compute_changeset(&known_files, &root_path, &progress, &progress_state);
+
+    // Phase C: brief DB write — lock acquired, then released.
+    let (total, calls_edges) = {
+        let conn = db.lock().map_err(|_| anyhow!("DB mutex poisoned"))?;
+        write_changeset(&conn, repo_id, changeset, &progress, &progress_state)?
+    };
+
+    // Phase D: cross-repo edges + vacuum — brief lock.
+    let import_edges = {
+        let conn = db.lock().map_err(|_| anyhow!("DB mutex poisoned"))?;
+        maybe_emit_progress(&progress, &progress_state, 95);
+        let edges = resolve_cross_repo_edges(&conn)?;
+        crate::db::vacuum_and_checkpoint(&conn)?;
+        maybe_emit_progress(&progress, &progress_state, 100);
+        edges
+    };
+
+    Ok((total, calls_edges + import_edges))
 }
 
 /// Secondary pass: resolve cross-repo import edges.
@@ -1103,5 +1357,68 @@ function foo() {
 
         let edges = resolve_cross_repo_edges(&conn).unwrap();
         assert_eq!(edges, 0, "ambiguous cross-repo imports should be skipped");
+    }
+
+    #[test]
+    fn test_ruby_symbol_extraction() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let dir = std::env::temp_dir().join("marrow_test_ruby2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("test.rb"),
+            "class InvoicesController < ApplicationController\n  def bulk_update\n    puts 'updating'\n  end\nend\n",
+        )
+        .unwrap();
+
+        let (syms, _edges) = ingest_repo(&conn, "test", &dir).unwrap();
+        
+        let mut stmt = conn.prepare("SELECT symbol_name, symbol_type FROM nodes WHERE repo_id = 'test'").unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0).unwrap(), row.get(1).unwrap())))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        println!("Nodes extracted: {:?}", rows);
+
+        assert!(syms > 0, "No symbols ingested for ruby file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ingest_fails_for_non_existent_path() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let dir = std::env::temp_dir().join("marrow_test_non_existent_path_lkjasdflkjasdf");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let result = ingest_repo(&conn, "test", &dir);
+        assert!(result.is_err(), "ingest_repo should return Err if the root_path does not exist");
+    }
+
+    #[test]
+    fn run_ingestion_with_progress_reports_completion() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let dir = std::env::temp_dir().join("marrow_test_progress_reporting");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def alpha():\n    pass\n").unwrap();
+        std::fs::write(dir.join("b.py"), "def beta():\n    alpha()\n").unwrap();
+
+        let progress_updates = std::sync::Mutex::new(Vec::new());
+        run_ingestion_with_progress(&conn, "test", &dir, |percent| {
+            progress_updates.lock().unwrap().push(percent);
+        })
+        .unwrap();
+
+        let updates = progress_updates.lock().unwrap();
+        assert!(!updates.is_empty(), "expected progress callback to fire");
+        assert_eq!(updates.last().copied(), Some(100), "expected final progress to be 100: {updates:?}");
+        assert!(
+            updates.windows(2).all(|window| window[0] <= window[1]),
+            "progress should be monotonic: {updates:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
