@@ -86,14 +86,17 @@ struct WatchRequest {
 }
 
 async fn handle_watch(
-    State(_state): State<DaemonState>,
+    State(state): State<DaemonState>,
     Json(req): Json<WatchRequest>,
 ) -> impl IntoResponse {
     let path = std::path::PathBuf::from(&req.path);
     if !path.exists() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path does not exist" })));
     }
-    // Phase 1 stub: validate path only. Watcher registration is wired in Task 6.
+    // Open/touch the DB connection so the pool tracks this repo.
+    let _ = state.pool.get_or_open(&path).await;
+    // Signal the background watcher dispatcher (best-effort; receiver may not be ready yet).
+    let _ = state.watcher_tx.send(path).await;
     (StatusCode::OK, Json(serde_json::json!({ "watching": req.path })))
 }
 
