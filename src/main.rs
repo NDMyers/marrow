@@ -3614,6 +3614,40 @@ fn cmd_interactive() -> Result<()> {
     Ok(())
 }
 
+// ── Daemon CLI helpers ────────────────────────────────────────────────────────
+
+fn cmd_status() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let client = ipc::default_client();
+        match client.health_check().await {
+            Ok(true)  => println!("[marrow] daemon is running."),
+            Ok(false) => println!("[marrow] daemon is NOT running."),
+            Err(e)    => println!("[marrow] status check error: {e}"),
+        }
+    });
+    Ok(())
+}
+
+fn cmd_stop() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let client = ipc::default_client();
+        if client.health_check().await.unwrap_or(false) {
+            client.shutdown().await?;
+            println!("[marrow] shutdown signal sent to daemon.");
+        } else {
+            println!("[marrow] daemon is not running.");
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -3691,10 +3725,25 @@ Some("benchmark") => {
         Some("daemon") => {
             return daemon::run().await;
         }
+        Some("status") => return cmd_status(),
+        Some("stop")   => return cmd_stop(),
+        Some("watch")  => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async {
+                ipc::ensure_daemon_running().await?;
+                let cwd = std::env::current_dir()?;
+                ipc::default_client().register_watch(&cwd).await?;
+                println!("[marrow] watching {}", cwd.display());
+                Ok::<_, anyhow::Error>(())
+            })?;
+            return Ok(());
+        }
         Some("service") => {
             let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("");
             match subcmd {
-                "install" => return service::install().map_err(Into::into),
+                "install" => return service::install(),
                 _ => {
                     eprintln!("Usage: marrow service install");
                     return Ok(());

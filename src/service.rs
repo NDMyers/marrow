@@ -4,7 +4,7 @@
 //! Linux:  generates ~/.config/systemd/user/marrow.service
 
 use anyhow::{Context as _, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub fn install() -> Result<()> {
     let exe = std::env::current_exe().context("resolving binary path")?;
@@ -130,6 +130,7 @@ WantedBy=default.target
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn plist_content_contains_binary_path() {
