@@ -120,7 +120,7 @@ async fn handle_mcp(
             v.pointer("/params/arguments/workspace")
                 .or_else(|| v.pointer("/params/workspace"))
                 .and_then(|w| w.as_str())
-                .map(|s| std::path::PathBuf::from(s))
+                .map(std::path::PathBuf::from)
         });
 
     if let Some(path) = workspace {
@@ -211,5 +211,44 @@ mod tests {
         // Verify pool now has an entry for this path
         let map = state.pool.inner.read().await;
         assert!(!map.is_empty(), "pool should have opened a connection");
+    }
+
+    #[tokio::test]
+    async fn mcp_initialize_registers_workspace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (watcher_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (dash_tx, _) = tokio::sync::broadcast::channel(4);
+        let state = DaemonState {
+            pool: Arc::new(RepoPool::new()),
+            watcher_tx,
+            dash_tx,
+        };
+
+        // MCP initialize carries workspace at params.workspace (not params.arguments.workspace)
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0" },
+                "workspace": dir.path().to_string_lossy()
+            }
+        });
+
+        let app = build_router(state.clone());
+        let _ = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rpc/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let map = state.pool.inner.read().await;
+        assert!(!map.is_empty(), "initialize should register workspace in pool");
     }
 }
