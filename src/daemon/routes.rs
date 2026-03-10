@@ -9,28 +9,50 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
-// NOTE: Only RwLock is imported from tokio — do NOT import tokio::sync::Mutex here.
-// All connection-level mutexes use std::sync::Mutex (see pool.rs, Task 4).
-use tokio::sync::RwLock;
+use crate::daemon::pool::{RepoPool, spawn_eviction_loop};
+use tokio::sync::{broadcast, mpsc};
+use std::time::Duration;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
 /// Shared state threaded through all Axum route handlers.
-///
-/// Phase 1 scaffold — replaced entirely in Task 4 with pool + channel fields.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct DaemonState {
-    _placeholder: Arc<RwLock<()>>,
+    pub pool:       Arc<RepoPool>,
+    /// Sender used to register new repo paths with the background watcher.
+    pub watcher_tx: mpsc::Sender<std::path::PathBuf>,
+    /// Dashboard broadcast channel for file-change events.
+    pub dash_tx:    broadcast::Sender<crate::dashboard::DashboardEvent>,
 }
 
 impl DaemonState {
-    pub fn new() -> anyhow::Result<Self> {
-        Ok(Self { _placeholder: Arc::new(RwLock::new(())) })
+    pub fn new(
+        watcher_tx: mpsc::Sender<std::path::PathBuf>,
+        dash_tx: broadcast::Sender<crate::dashboard::DashboardEvent>,
+    ) -> anyhow::Result<Self> {
+        let pool = Arc::new(RepoPool::new());
+        // Evict connections idle 60+ minutes, check every 5 minutes.
+        spawn_eviction_loop(
+            Arc::clone(&pool),
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(5 * 60),
+        );
+        Ok(Self { pool, watcher_tx, dash_tx })
     }
 
+    /// Test constructor — channels are throwaway (receivers dropped immediately).
+    /// All `watcher_tx.send()` calls are handled with `let _ = ...` so dropped
+    /// receivers do not panic.
     #[cfg(test)]
     pub fn new_test() -> Self {
-        Self::new().expect("DaemonState::new_test")
+        let (watcher_tx, _rx) = mpsc::channel(1);
+        let (dash_tx, _)      = broadcast::channel(4);
+        Self {
+            pool: Arc::new(RepoPool::new()),
+            watcher_tx,
+            dash_tx,
+        }
     }
 }
 

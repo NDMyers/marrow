@@ -1,8 +1,11 @@
 //! Daemon subcommand — long-running Axum server that owns all SQLite state.
 
 pub mod routes;
+pub mod pool;
 #[allow(unused_imports)]
 pub use routes::DaemonState;
+#[allow(unused_imports)]
+pub use pool::RepoPool;
 
 use anyhow::Result;
 
@@ -10,9 +13,11 @@ use anyhow::Result;
 /// Entry-point called from `main()` for `marrow daemon`.
 /// NOTE: This is a Phase 1 stub — the complete implementation comes in Task 6.
 pub async fn run() -> Result<()> {
-    let state = routes::DaemonState::new()?;
+    let (watcher_tx, _watcher_rx) = tokio::sync::mpsc::channel::<std::path::PathBuf>(64);
+    let (dash_tx, _)              = tokio::sync::broadcast::channel::<crate::dashboard::DashboardEvent>(256);
+    let state = routes::DaemonState::new(watcher_tx, dash_tx.clone())?;
+    let _addr = routes::bind_address();
 
-    // Bind the socket / port
     #[cfg(unix)]
     {
         use tokio::net::UnixListener;
@@ -29,9 +34,8 @@ pub async fn run() -> Result<()> {
     #[cfg(not(unix))]
     {
         use tokio::net::TcpListener;
-        let addr = routes::bind_address();
-        let listener = TcpListener::bind(addr).await?;
-        eprintln!("[marrow daemon] listening on tcp:{addr}");
+        let listener = TcpListener::bind(_addr).await?;
+        eprintln!("[marrow daemon] listening on tcp:{_addr}");
         axum::serve(listener, routes::build_router(state)).await?;
     }
     Ok(())
