@@ -30,7 +30,7 @@ impl DaemonState {
     pub fn new(
         watcher_tx: mpsc::Sender<std::path::PathBuf>,
         dash_tx: broadcast::Sender<crate::dashboard::DashboardEvent>,
-    ) -> anyhow::Result<Self> {
+    ) -> Self {
         let pool = Arc::new(RepoPool::new());
         // Evict connections idle 60+ minutes, check every 5 minutes.
         spawn_eviction_loop(
@@ -38,7 +38,7 @@ impl DaemonState {
             Duration::from_secs(60 * 60),
             Duration::from_secs(5 * 60),
         );
-        Ok(Self { pool, watcher_tx, dash_tx })
+        Self { pool, watcher_tx, dash_tx }
     }
 
     /// Test constructor — channels are throwaway (receivers dropped immediately).

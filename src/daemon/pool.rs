@@ -4,12 +4,24 @@ use anyhow::{Context as _, Result};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 // Only RwLock from tokio — connection-level locking uses std::sync::Mutex
 // so pool entries can be passed directly to spawn_watcher (which requires std::sync::Mutex).
 use tokio::sync::RwLock;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 // ── Entry ─────────────────────────────────────────────────────────────────────
 
@@ -17,11 +29,16 @@ use tokio::sync::RwLock;
 ///
 /// Fully-qualified std::sync::Mutex in the struct field to avoid any ambiguity
 /// (no `use std::sync::Mutex` import is needed).
+///
+/// **Callers** are responsible for handling mutex poison on `conn.lock()`.
+/// Follow the pattern in `src/watcher.rs`: `.map_err(|_| anyhow::anyhow!("DB mutex poisoned"))`.
 #[allow(dead_code)]
 pub(crate) struct PoolEntry {
     // Fully-qualified: no `use std::sync::Mutex` import is needed; Arc is from std::sync above.
-    pub conn:        Arc<std::sync::Mutex<rusqlite::Connection>>,
-    pub last_access: Instant,
+    pub conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    /// Seconds since UNIX epoch, stored atomically so the fast read-path can
+    /// update last_access without upgrading to a write lock.
+    pub last_access: Arc<AtomicU64>,
 }
 
 // ── Pool ──────────────────────────────────────────────────────────────────────
@@ -50,22 +67,39 @@ impl RepoPool {
     ///
     /// **IMPORTANT — mutex type:** Returns Arc<std::sync::Mutex<Connection>> to match
     /// spawn_watcher's signature in src/watcher.rs.
+    ///
+    /// Returns an error if `repo_root` does not exist (canonicalize fails), preventing
+    /// silent duplicate pool entries from different path representations of the same root.
     #[allow(dead_code)]
-    pub async fn get_or_open(&self, repo_root: &Path) -> Result<Arc<std::sync::Mutex<rusqlite::Connection>>> {
+    pub async fn get_or_open(
+        &self,
+        repo_root: &Path,
+    ) -> Result<Arc<std::sync::Mutex<rusqlite::Connection>>> {
         let key = repo_root
             .canonicalize()
-            .unwrap_or_else(|_| repo_root.to_path_buf());
+            .with_context(|| format!("repo_root does not exist: {}", repo_root.display()))?;
 
-        // Fast path: entry already exists
+        // Fast path: entry already exists — update last_access atomically (no write lock needed).
         {
             let map = self.inner.read().await;
             if let Some(entry) = map.get(&key) {
+                entry.last_access.store(now_secs(), Ordering::Relaxed);
                 return Ok(Arc::clone(&entry.conn));
             }
         }
 
-        // Slow path: open a new connection.
-        // Path convention: <repo_root>/.marrow/graph.db  (matches existing `MARROW_DB_PATH` default)
+        // Slow path: acquire write lock, re-check, then open if still absent.
+        // We must re-check *inside* the write lock before doing the expensive
+        // spawn_blocking, so that only one task ever opens the connection.
+        let mut map = self.inner.write().await;
+
+        // Re-check: another task may have opened the connection while we waited.
+        if let Some(entry) = map.get_mut(&key) {
+            entry.last_access.store(now_secs(), Ordering::Relaxed);
+            return Ok(Arc::clone(&entry.conn));
+        }
+
+        // We hold the write lock — exactly one task will reach this point per key.
         let db_path = key.join(".marrow").join("graph.db");
         let conn = tokio::task::spawn_blocking({
             let db_path = db_path.clone();
@@ -75,31 +109,37 @@ impl RepoPool {
         .context("spawn_blocking for DB open")??;
 
         let arc = Arc::new(std::sync::Mutex::new(conn));
-        let mut map = self.inner.write().await;
-        // Another task may have opened the connection while we waited for the write lock.
-        let entry = map.entry(key).or_insert_with(|| PoolEntry {
-            conn: Arc::clone(&arc),
-            last_access: Instant::now(),
-        });
-        // Update last_access on every open/get
-        entry.last_access = Instant::now();
-        Ok(Arc::clone(&entry.conn))
+        let last_access = Arc::new(AtomicU64::new(now_secs()));
+        map.insert(
+            key,
+            PoolEntry {
+                conn: Arc::clone(&arc),
+                last_access,
+            },
+        );
+        Ok(arc)
     }
 
     /// Remove entries not accessed within `max_idle`.
     pub async fn evict_stale(&self, max_idle: Duration) {
-        let now = Instant::now();
+        let now = now_secs();
+        let max_idle_secs = max_idle.as_secs();
         let mut map = self.inner.write().await;
         map.retain(|_, entry| {
-            now.duration_since(entry.last_access) < max_idle
+            let accessed = entry.last_access.load(Ordering::Relaxed);
+            now.saturating_sub(accessed) < max_idle_secs
         });
     }
 }
 
 /// Spawn a background task that calls `evict_stale` every `interval`.
+///
+/// Note: `tokio::time::interval` fires immediately at t=0. We skip the first
+/// tick so eviction does not run at daemon startup before any connections exist.
 pub fn spawn_eviction_loop(pool: Arc<RepoPool>, max_idle: Duration, interval: Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // discard the immediate t=0 tick
         loop {
             ticker.tick().await;
             pool.evict_stale(max_idle).await;
@@ -118,7 +158,9 @@ mod tests {
         let pool = RepoPool::new();
         let conn = pool.get_or_open(dir.path()).await.unwrap();
         // conn is Arc<std::sync::Mutex<Connection>> — use .lock().unwrap(), NOT .await
-        let mode: String = conn.lock().unwrap()
+        let mode: String = conn
+            .lock()
+            .unwrap()
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
@@ -140,21 +182,20 @@ mod tests {
         pool.get_or_open(dir.path()).await.unwrap();
 
         {
-            let mut map = pool.inner.write().await;
+            let map = pool.inner.read().await;
             // Pool stores canonicalized paths as keys
-            let key = dir.path().canonicalize().unwrap_or_else(|_| dir.path().to_path_buf());
-            if let Some(entry) = map.get_mut(&key) {
+            let key = dir.path().canonicalize().unwrap();
+            if let Some(entry) = map.get(&key) {
                 // Backdate last_access by 61 minutes so eviction triggers
-                entry.last_access = Instant::now()
-                    .checked_sub(Duration::from_secs(61 * 60))
-                    .unwrap_or_else(Instant::now);
+                let past = now_secs().saturating_sub(61 * 60);
+                entry.last_access.store(past, Ordering::Relaxed);
             }
         }
 
         pool.evict_stale(Duration::from_secs(60 * 60)).await;
 
         let map = pool.inner.read().await;
-        let key = dir.path().canonicalize().unwrap_or_else(|_| dir.path().to_path_buf());
+        let key = dir.path().canonicalize().unwrap();
         assert!(!map.contains_key(&key));
     }
 }

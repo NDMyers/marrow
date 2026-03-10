@@ -15,7 +15,7 @@ use anyhow::Result;
 pub async fn run() -> Result<()> {
     let (watcher_tx, _watcher_rx) = tokio::sync::mpsc::channel::<std::path::PathBuf>(64);
     let (dash_tx, _)              = tokio::sync::broadcast::channel::<crate::dashboard::DashboardEvent>(256);
-    let state = routes::DaemonState::new(watcher_tx, dash_tx.clone())?;
+    let state = routes::DaemonState::new(watcher_tx, dash_tx.clone());
     let _addr = routes::bind_address();
 
     #[cfg(unix)]
