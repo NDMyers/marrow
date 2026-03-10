@@ -21,8 +21,15 @@ pub async fn run() -> Result<()> {
     let (dash_tx, _) =
         tokio::sync::broadcast::channel::<crate::dashboard::DashboardEvent>(256);
 
+    // Oneshot for graceful shutdown — sent by POST /api/shutdown.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
     // Build shared state (starts eviction loop internally).
-    let state = routes::DaemonState::new(watcher_tx, dash_tx.clone());
+    let state = routes::DaemonState::new(
+        watcher_tx,
+        dash_tx.clone(),
+        Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),
+    );
 
     // Spawn the global file watcher dispatcher.
     //
@@ -58,7 +65,7 @@ pub async fn run() -> Result<()> {
         }
     });
 
-    // Bind and serve.
+    // Bind and serve with graceful shutdown wired in.
     #[cfg(unix)]
     {
         use tokio::net::UnixListener;
@@ -71,7 +78,9 @@ pub async fn run() -> Result<()> {
         let _ = std::fs::remove_file(&sock_path);
         let listener = UnixListener::bind(&sock_path)?;
         eprintln!("[marrow daemon] listening on unix:{}", sock_path.display());
-        axum::serve(listener, routes::build_router(state)).await?;
+        axum::serve(listener, routes::build_router(state))
+            .with_graceful_shutdown(async { let _ = shutdown_rx.await; })
+            .await?;
     }
     #[cfg(not(unix))]
     {
@@ -79,7 +88,9 @@ pub async fn run() -> Result<()> {
         let addr = routes::bind_address();
         let listener = TcpListener::bind(addr).await?;
         eprintln!("[marrow daemon] listening on tcp:{addr}");
-        axum::serve(listener, routes::build_router(state)).await?;
+        axum::serve(listener, routes::build_router(state))
+            .with_graceful_shutdown(async { let _ = shutdown_rx.await; })
+            .await?;
     }
     Ok(())
 }

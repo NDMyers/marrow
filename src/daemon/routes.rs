@@ -10,26 +10,29 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 use crate::daemon::pool::{RepoPool, spawn_eviction_loop};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use std::time::Duration;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
 /// Shared state threaded through all Axum route handlers.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct DaemonState {
-    pub pool:       Arc<RepoPool>,
+    pub pool:        Arc<RepoPool>,
     /// Sender used to register new repo paths with the background watcher.
-    pub watcher_tx: mpsc::Sender<std::path::PathBuf>,
+    pub watcher_tx:  mpsc::Sender<std::path::PathBuf>,
     /// Dashboard broadcast channel for file-change events.
-    pub dash_tx:    broadcast::Sender<crate::dashboard::DashboardEvent>,
+    #[allow(dead_code)]
+    pub dash_tx:     broadcast::Sender<crate::dashboard::DashboardEvent>,
+    /// One-shot sender for graceful shutdown. Consumed on first `/api/shutdown` call.
+    pub shutdown_tx: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 impl DaemonState {
     pub fn new(
-        watcher_tx: mpsc::Sender<std::path::PathBuf>,
-        dash_tx: broadcast::Sender<crate::dashboard::DashboardEvent>,
+        watcher_tx:  mpsc::Sender<std::path::PathBuf>,
+        dash_tx:     broadcast::Sender<crate::dashboard::DashboardEvent>,
+        shutdown_tx: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
     ) -> Self {
         let pool = Arc::new(RepoPool::new());
         // Evict connections idle 60+ minutes, check every 5 minutes.
@@ -38,7 +41,7 @@ impl DaemonState {
             Duration::from_secs(60 * 60),
             Duration::from_secs(5 * 60),
         );
-        Self { pool, watcher_tx, dash_tx }
+        Self { pool, watcher_tx, dash_tx, shutdown_tx }
     }
 
     /// Test constructor — channels are throwaway (receivers dropped immediately).
@@ -46,12 +49,14 @@ impl DaemonState {
     /// receivers do not panic.
     #[cfg(test)]
     pub fn new_test() -> Self {
-        let (watcher_tx, _rx) = mpsc::channel(1);
-        let (dash_tx, _)      = broadcast::channel(4);
+        let (watcher_tx, _rx)   = mpsc::channel(1);
+        let (dash_tx, _)        = broadcast::channel(4);
+        let (shutdown_tx, _rx2) = oneshot::channel();
         Self {
             pool: Arc::new(RepoPool::new()),
             watcher_tx,
             dash_tx,
+            shutdown_tx: Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),
         }
     }
 }
@@ -60,9 +65,10 @@ impl DaemonState {
 
 pub fn build_router(state: DaemonState) -> Router {
     Router::new()
-        .route("/api/health", get(handle_health))
-        .route("/rpc/mcp",    post(handle_mcp))
-        .route("/api/watch",  post(handle_watch))
+        .route("/api/health",   get(handle_health))
+        .route("/rpc/mcp",      post(handle_mcp))
+        .route("/api/watch",    post(handle_watch))
+        .route("/api/shutdown", post(handle_shutdown))
         .with_state(state)
 }
 
@@ -137,6 +143,19 @@ async fn handle_mcp(
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )
+}
+
+/// Signal the daemon to shut down gracefully.
+///
+/// Fires the oneshot sender stored in `DaemonState::shutdown_tx`. The sender is
+/// consumed on first call so subsequent calls are no-ops.
+async fn handle_shutdown(State(state): State<DaemonState>) -> impl IntoResponse {
+    if let Ok(mut guard) = state.shutdown_tx.lock() {
+        if let Some(tx) = guard.take() {
+            let _ = tx.send(());
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "status": "shutting down" })))
 }
 
 #[cfg(test)]
@@ -216,13 +235,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_initialize_registers_workspace() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (watcher_tx, _rx) = tokio::sync::mpsc::channel(1);
-        let (dash_tx, _) = tokio::sync::broadcast::channel(4);
-        let state = DaemonState {
-            pool: Arc::new(RepoPool::new()),
-            watcher_tx,
-            dash_tx,
-        };
+        let state = DaemonState::new_test();
 
         // MCP initialize carries workspace at params.workspace (not params.arguments.workspace)
         let payload = serde_json::json!({
