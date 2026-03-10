@@ -3,7 +3,9 @@
 pub mod pool;
 pub mod routes;
 
+#[allow(unused_imports)]
 pub use pool::RepoPool;
+#[allow(unused_imports)]
 pub use routes::DaemonState;
 
 use anyhow::Result;
