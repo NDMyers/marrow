@@ -98,12 +98,37 @@ async fn handle_watch(
 }
 
 /// Forward raw MCP JSON-RPC from `marrow mcp` to the appropriate tool handler.
-/// Phase 1: naively echoes the request back (stub).
+///
+/// Parses the JSON body to extract an optional `workspace` field from either
+/// `params.arguments.workspace` or `params.workspace`. If present and the path
+/// exists, the pool is touched (opening a connection if needed) and the path is
+/// forwarded to the background watcher.
+///
+/// Phase 2: pool/watcher registration. Full tool dispatch into the pool (replacing
+/// ContextEngine) is deferred to a follow-on refactor.
 async fn handle_mcp(
-    State(_state): State<DaemonState>,
+    State(state): State<DaemonState>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    // Phase 1 stub: echo request back as-is so the proxy wiring can be tested.
+    // Extract optional workspace path from the JSON payload.
+    let workspace: Option<std::path::PathBuf> = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/params/arguments/workspace")
+                .or_else(|| v.pointer("/params/workspace"))
+                .and_then(|w| w.as_str())
+                .map(|s| std::path::PathBuf::from(s))
+        });
+
+    if let Some(path) = workspace {
+        if path.exists() {
+            // Touch the pool entry (opens DB if not already open).
+            let _ = state.pool.get_or_open(&path).await;
+            // Register with the background file watcher (best-effort).
+            let _ = state.watcher_tx.send(path).await;
+        }
+    }
+
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -129,7 +154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_echo_stub_returns_body() {
+    async fn mcp_no_workspace_echoes_body() {
         let app = build_router(DaemonState::new_test());
         let payload = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         let response = app
@@ -146,5 +171,42 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], payload);
+    }
+
+    #[tokio::test]
+    async fn mcp_routes_to_pool_connection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = DaemonState::new_test();
+
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "run_pipeline",
+                "arguments": {
+                    "intent": "analyze_repo",
+                    "workspace": dir.path().to_string_lossy()
+                }
+            }
+        });
+
+        let app = build_router(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rpc/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        // Verify pool now has an entry for this path
+        let map = state.pool.inner.read().await;
+        assert!(!map.is_empty(), "pool should have opened a connection");
     }
 }
