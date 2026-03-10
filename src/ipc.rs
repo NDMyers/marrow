@@ -131,13 +131,27 @@ pub async fn ensure_daemon_running() -> Result<()> {
 
     // Spawn daemon — fully detached so it outlives this process.
     let exe = std::env::current_exe().context("resolving current exe path")?;
-    tokio::process::Command::new(&exe)
-        .arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawning daemon process")?;
+    #[cfg(unix)]
+    {
+        tokio::process::Command::new(&exe)
+            .arg("daemon")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0) // detach into its own process group; prevents SIGHUP on parent exit
+            .spawn()
+            .context("spawning daemon process")?;
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::process::Command::new(&exe)
+            .arg("daemon")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("spawning daemon process")?;
+    }
 
     // Retry loop — poll up to 10 times with 50 ms gaps (500 ms total).
     for _ in 0..10 {

@@ -3722,7 +3722,10 @@ Some("benchmark") => {
 
                 // Consume blank line separator
                 let mut blank = String::new();
-                reader.read_line(&mut blank).await?;
+                let blank_n = reader.read_line(&mut blank).await?;
+                if blank_n == 0 {
+                    break; // EOF after header line
+                }
 
                 // Read body
                 let mut body = vec![0u8; content_length];
@@ -3731,10 +3734,14 @@ Some("benchmark") => {
                 // Forward to daemon — on error, synthesize a JSON-RPC error response
                 let response = match client.forward_mcp(body).await {
                     Ok(bytes) => bytes,
-                    Err(e) => serde_json::to_vec(&serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "error": { "code": -32000, "message": e.to_string() }
-                    })).unwrap_or_default(),
+                    Err(e) => {
+                        let fallback = br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"internal proxy error"}}"#;
+                        serde_json::to_vec(&serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": null,
+                            "error": { "code": -32000, "message": e.to_string() }
+                        })).unwrap_or_else(|_| fallback.to_vec())
+                    },
                 };
 
                 // Write response back with framing
