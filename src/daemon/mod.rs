@@ -1,6 +1,8 @@
 //! Daemon subcommand — long-running Axum server that owns all SQLite state.
 
 pub mod routes;
+#[allow(unused_imports)]
+pub use routes::DaemonState;
 
 use anyhow::Result;
 
@@ -15,7 +17,9 @@ pub async fn run() -> Result<()> {
     {
         use tokio::net::UnixListener;
         let sock_path = crate::ipc::default_sock_path();
-        std::fs::create_dir_all(sock_path.parent().unwrap())?;
+        let parent = sock_path.parent()
+            .ok_or_else(|| anyhow::anyhow!("daemon socket path has no parent directory"))?;
+        std::fs::create_dir_all(parent)?;
         // Remove stale socket file from a previous (crashed) daemon.
         let _ = std::fs::remove_file(&sock_path);
         let listener = UnixListener::bind(&sock_path)?;
