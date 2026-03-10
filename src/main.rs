@@ -4,6 +4,7 @@ mod dashboard;
 mod ingestion;
 mod ipc;
 mod retrieval;
+mod service;
 mod skills;
 mod state;
 mod watcher;
@@ -3689,6 +3690,16 @@ Some("benchmark") => {
         }
         Some("daemon") => {
             return daemon::run().await;
+        }
+        Some("service") => {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            match subcmd {
+                "install" => return service::install().map_err(Into::into),
+                _ => {
+                    eprintln!("Usage: marrow service install");
+                    return Ok(());
+                }
+            }
         }
         // ── marrow mcp: thin stdio ↔ daemon IPC proxy ─────────────────────────
         Some("mcp") => {
