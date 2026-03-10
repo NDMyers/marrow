@@ -1,3 +1,4 @@
+mod daemon;
 mod db;
 mod dashboard;
 mod ingestion;
@@ -3685,6 +3686,9 @@ Some("benchmark") => {
                 }
             }
             return Ok(());
+        }
+        Some("daemon") => {
+            return daemon::run().await;
         }
         // Machine bypass: explicit "mcp" arg (or any unrecognised arg) falls
         // straight through to the stdio server without showing the menu.
