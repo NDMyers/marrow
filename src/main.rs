@@ -1,6 +1,7 @@
 mod db;
 mod dashboard;
 mod ingestion;
+mod ipc;
 mod retrieval;
 mod skills;
 mod state;
