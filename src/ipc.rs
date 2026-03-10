@@ -3,6 +3,8 @@
 //! On Unix we use a Unix Domain Socket (`~/.marrow/daemon.sock`).
 //! On Windows we fall back to localhost TCP (`127.0.0.1:DAEMON_PORT`).
 
+#![allow(dead_code)]
+
 use anyhow::{Context as _, Result};
 use std::path::{Path, PathBuf};
 
@@ -68,7 +70,9 @@ impl IpcClient {
             .body(body)
             .send()
             .await
-            .context("forwarding MCP request to daemon")?;
+            .context("forwarding MCP request to daemon")?
+            .error_for_status()
+            .context("daemon returned error status")?;
         Ok(resp.bytes().await?.to_vec())
     }
 
@@ -127,7 +131,7 @@ pub async fn ensure_daemon_running() -> Result<()> {
 
     // Spawn daemon — fully detached so it outlives this process.
     let exe = std::env::current_exe().context("resolving current exe path")?;
-    std::process::Command::new(exe)
+    tokio::process::Command::new(&exe)
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -135,17 +139,14 @@ pub async fn ensure_daemon_running() -> Result<()> {
         .spawn()
         .context("spawning daemon process")?;
 
-    // Retry loop
-    for i in 0..10 {
+    // Retry loop — poll up to 10 times with 50 ms gaps (500 ms total).
+    for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         if client.health_check().await.unwrap_or(false) {
             return Ok(());
         }
-        if i == 9 {
-            anyhow::bail!("daemon did not start within 500ms");
-        }
     }
-    Ok(())
+    anyhow::bail!("daemon did not start within 500ms");
 }
 
 #[cfg(test)]
@@ -156,5 +157,35 @@ mod tests {
     fn default_sock_path_ends_with_daemon_sock() {
         let p = default_sock_path();
         assert!(p.ends_with("daemon.sock"), "unexpected path: {}", p.display());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_roundtrip_over_uds() {
+        let sock = std::env::temp_dir().join("marrow_ipc_test.sock");
+        let _ = std::fs::remove_file(&sock);
+
+        let sock_path = sock.clone();
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        hyper::service::service_fn(|_req| async {
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                http_body_util::Empty::<bytes::Bytes>::new(),
+                            ))
+                        }),
+                    )
+                    .await;
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let status = IpcClient::new_unix(&sock).health_check().await.unwrap();
+        assert!(status, "health check should return true over UDS");
+        std::fs::remove_file(&sock).ok();
     }
 }
