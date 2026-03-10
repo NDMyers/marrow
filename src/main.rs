@@ -3690,9 +3690,66 @@ Some("benchmark") => {
         Some("daemon") => {
             return daemon::run().await;
         }
-        // Machine bypass: explicit "mcp" arg (or any unrecognised arg) falls
-        // straight through to the stdio server without showing the menu.
-        Some("mcp") | Some(_) => {}
+        // ── marrow mcp: thin stdio ↔ daemon IPC proxy ─────────────────────────
+        Some("mcp") => {
+            // Ensure daemon is running (auto-spawns if dead).
+            ipc::ensure_daemon_running().await
+                .context("failed to start or connect to marrow daemon")?;
+
+            let client = ipc::default_client();
+
+            // Pipe stdin → daemon → stdout in a simple Content-Length framing loop.
+            // MCP uses HTTP Content-Length framing; we forward raw bytes.
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+            let mut reader = BufReader::new(tokio::io::stdin());
+            let mut writer = tokio::io::stdout();
+
+            loop {
+                // Read Content-Length header
+                let mut header_line = String::new();
+                let n = reader.read_line(&mut header_line).await?;
+                if n == 0 {
+                    break; // EOF
+                }
+                let content_length: usize = header_line
+                    .trim()
+                    .strip_prefix("Content-Length:")
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if content_length == 0 {
+                    continue;
+                }
+
+                // Consume blank line separator
+                let mut blank = String::new();
+                reader.read_line(&mut blank).await?;
+
+                // Read body
+                let mut body = vec![0u8; content_length];
+                reader.read_exact(&mut body).await?;
+
+                // Forward to daemon — on error, synthesize a JSON-RPC error response
+                let response = match client.forward_mcp(body).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32000, "message": e.to_string() }
+                    })).unwrap_or_default(),
+                };
+
+                // Write response back with framing
+                writer.write_all(
+                    format!("Content-Length: {}\r\n\r\n", response.len()).as_bytes()
+                ).await?;
+                writer.write_all(&response).await?;
+                writer.flush().await?;
+            }
+
+            return Ok(());
+        }
+        // Machine bypass: any unrecognised arg falls straight through to the
+        // stdio server without showing the menu.
+        Some(_) => {}
     }
 
     // ── Default: start MCP stdio server ──────────────────────────────
