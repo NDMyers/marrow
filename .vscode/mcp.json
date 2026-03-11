@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "marrow": {
+      "command": "/bin/zsh",
+      "args": ["-lc", "marrow mcp"]
+    }
+  }
+}

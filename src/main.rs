@@ -2426,7 +2426,7 @@ mod tests {
     }
 
     #[test]
-    fn integrate_cursor_writes_command_marrow_with_env_path() {
+    fn integrate_cursor_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
         let ctx = IntegrationCtx {
@@ -2437,12 +2437,16 @@ mod tests {
         let raw = std::fs::read_to_string(home.path().join(".cursor/mcp.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
-        assert_eq!(cmd, "marrow");
-        assert!(cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string());
+        // Cursor uses shell wrapper — cmd is the shell binary, not "marrow".
+        assert!(cmd.ends_with("zsh") || cmd.ends_with("bash"), "expected shell binary, got: {cmd}");
+        assert_eq!(cfg["mcpServers"]["marrow"]["args"][0], "-lc");
+        assert!(cfg["mcpServers"]["marrow"]["args"][1].as_str().unwrap().contains("marrow mcp"));
+        // ctx.binary must not appear anywhere in the config.
+        assert!(!raw.contains("/absolute/path/to/marrow"), "binary path must not leak into config");
     }
 
     #[test]
-    fn integrate_copilot_vscode_writes_command_marrow_with_env_path() {
+    fn integrate_copilot_vscode_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
         let vscode_dir = home.path().join("Library/Application Support/Code/User");
         std::fs::create_dir_all(&vscode_dir).unwrap();
@@ -2454,12 +2458,13 @@ mod tests {
         let raw = std::fs::read_to_string(vscode_dir.join("mcp.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["servers"]["marrow"]["command"].as_str().unwrap();
-        assert_eq!(cmd, "marrow", "vscode global: command must be 'marrow', got: {cmd}");
-        assert!(cfg["servers"]["marrow"]["env"]["PATH"].is_string());
+        assert!(cmd.ends_with("zsh") || cmd.ends_with("bash"), "vscode: expected shell binary, got: {cmd}");
+        assert_eq!(cfg["servers"]["marrow"]["args"][0], "-lc");
+        assert!(!raw.contains("/absolute/path/to/marrow"));
     }
 
     #[test]
-    fn integrate_copilot_cli_writes_command_marrow_with_env_path() {
+    fn integrate_copilot_cli_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".copilot")).unwrap();
         let ctx = IntegrationCtx {
@@ -2470,12 +2475,14 @@ mod tests {
         let raw = std::fs::read_to_string(home.path().join(".copilot/mcp-config.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
-        assert_eq!(cmd, "marrow", "copilot cli: command must be 'marrow', got: {cmd}");
-        assert!(cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string());
+        assert!(cmd.ends_with("zsh") || cmd.ends_with("bash"), "copilot cli: expected shell binary, got: {cmd}");
+        assert_eq!(cfg["mcpServers"]["marrow"]["args"][0], "-lc");
+        assert_eq!(cfg["mcpServers"]["marrow"]["type"], "stdio");
+        assert!(!raw.contains("/absolute/path/to/marrow"));
     }
 
     #[test]
-    fn integrate_cline_writes_command_marrow_with_env_path() {
+    fn integrate_cline_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
         let cline_dir = home.path()
             .join("Library/Application Support/Code/User/globalStorage")
@@ -2489,9 +2496,10 @@ mod tests {
         let raw = std::fs::read_to_string(cline_dir.join("cline_mcp_settings.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
-        assert_eq!(cmd, "marrow");
-        assert!(cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string());
+        assert!(cmd.ends_with("zsh") || cmd.ends_with("bash"), "cline: expected shell binary, got: {cmd}");
+        assert_eq!(cfg["mcpServers"]["marrow"]["args"][0], "-lc");
         assert_eq!(cfg["mcpServers"]["marrow"]["disabled"], false);
+        assert!(!raw.contains("/absolute/path/to/marrow"));
     }
 
     #[test]
@@ -2516,11 +2524,13 @@ mod tests {
     // ── regression guard ──────────────────────────────────────────────────────
 
     #[test]
-    fn no_integrate_fn_writes_absolute_path_as_command() {
-        // If this test fails, someone has used ctx.binary directly as the MCP command.
-        // All integrate_* functions must produce command:"marrow" (or path:"marrow" for Zed).
+    fn no_integrate_fn_leaks_binary_path_into_config() {
+        // Regression guard: ctx.binary must never appear as a command value in any config.
+        // - Claude/Antigravity/Zed: use command:"marrow" (portable name) with env.PATH.
+        // - Cursor/Copilot/Cline: use shell wrapper (/bin/zsh or /bin/bash) — never the binary.
         let home = tempfile::tempdir().unwrap();
         let h = home.path();
+        const BINARY: &str = "/some/absolute/path/to/marrow-unique-sentinel";
 
         // Pre-create all required directories/files.
         std::fs::create_dir_all(h.join(".cursor")).unwrap();
@@ -2537,7 +2547,7 @@ mod tests {
         std::fs::create_dir_all(&vscode).unwrap();
 
         let ctx = IntegrationCtx {
-            binary: "/some/absolute/path/to/marrow".to_string(),
+            binary: BINARY.to_string(),
             home: h.to_string_lossy().into_owned(),
         };
 
@@ -2548,34 +2558,50 @@ mod tests {
         integrate_cline(&ctx).unwrap();
         integrate_zed(&ctx).unwrap();
 
-        // Check configs written by each function.
-        let checks: &[(&str, &str, &str)] = &[
-            (".claude.json",           "/mcpServers/marrow/command", "marrow"),
-            (".cursor/mcp.json",       "/mcpServers/marrow/command", "marrow"),
-            (".copilot/mcp-config.json", "/mcpServers/marrow/command", "marrow"),
-            ("Library/Application Support/Code/User/mcp.json", "/servers/marrow/command", "marrow"),
-            ("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-             "/mcpServers/marrow/command", "marrow"),
+        // Every written config file must not contain the sentinel binary path.
+        let config_files = [
+            ".claude.json",
+            ".cursor/mcp.json",
+            ".copilot/mcp-config.json",
+            "Library/Application Support/Code/User/mcp.json",
+            "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
+            ".config/zed/settings.json",
         ];
-        for (rel_path, json_ptr, expected) in checks {
-            let full = h.join(rel_path);
-            let raw = std::fs::read_to_string(&full)
+        for rel_path in &config_files {
+            let raw = std::fs::read_to_string(h.join(rel_path))
                 .unwrap_or_else(|_| panic!("config not written: {rel_path}"));
-            let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            let cmd = cfg.pointer(json_ptr)
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| panic!("command missing at {json_ptr} in {rel_path}"));
-            assert_eq!(cmd, *expected, "{rel_path}: command must be '{expected}', got: {cmd}");
-            assert!(!cmd.starts_with('/'), "{rel_path}: command must not be absolute path: {cmd}");
+            assert!(
+                !raw.contains(BINARY),
+                "{rel_path}: binary path leaked into config:\n{raw}"
+            );
         }
-        // Zed uses nested path field.
+
+        // Claude and Antigravity must use portable command name.
+        let claude_raw = std::fs::read_to_string(h.join(".claude.json")).unwrap();
+        let claude_cfg: serde_json::Value = serde_json::from_str(&claude_raw).unwrap();
+        assert_eq!(claude_cfg["mcpServers"]["marrow"]["command"], "marrow");
+
+        // Zed must use portable path name in nested command object.
         let zed_raw = std::fs::read_to_string(zed.join("settings.json")).unwrap();
         let zed_cfg: serde_json::Value = serde_json::from_str(&zed_raw).unwrap();
-        let zed_cmd = zed_cfg.pointer("/context_servers/marrow/command/path")
-            .and_then(|v| v.as_str())
-            .expect("Zed command.path missing");
-        assert_eq!(zed_cmd, "marrow");
-        assert!(!zed_cmd.starts_with('/'));
+        assert_eq!(zed_cfg["context_servers"]["marrow"]["command"]["path"], "marrow");
+
+        // Shell-wrapper hosts must use a shell binary, not "marrow" directly.
+        for (rel, ptr) in [
+            (".cursor/mcp.json", "/mcpServers/marrow/command"),
+            ("Library/Application Support/Code/User/mcp.json", "/servers/marrow/command"),
+            ("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
+             "/mcpServers/marrow/command"),
+        ] {
+            let raw = std::fs::read_to_string(h.join(rel)).unwrap();
+            let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let cmd = cfg.pointer(ptr).and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("command missing at {ptr} in {rel}"));
+            assert!(
+                cmd.ends_with("zsh") || cmd.ends_with("bash"),
+                "{rel}: expected shell wrapper, got: {cmd}"
+            );
+        }
     }
 }
 
@@ -2745,10 +2771,7 @@ pub fn write_vscode_mcp_config(workspace_root: &Path, mode: WriteMode) -> Result
 
     let mcp_path = vscode_dir.join("mcp.json");
 
-    let marrow_entry = serde_json::json!({
-        "command": "marrow",
-        "args": ["mcp"]
-    });
+    let marrow_entry = mcp_shell_launch_spec();
 
     // Overwrite mode discards existing config; all other modes preserve it.
     let mut config: serde_json::Value = if mcp_path.exists() && !matches!(mode, WriteMode::Overwrite) {
@@ -3014,6 +3037,28 @@ fn mcp_launch_spec() -> serde_json::Value {
     })
 }
 
+/// Returns a shell-wrapped MCP launch spec for VS Code-based hosts (VS Code, Cursor, Cline).
+///
+/// These hosts use Node.js `child_process.spawn` which resolves the command using the
+/// *parent process* PATH — i.e. the launchd GUI PATH — not the `env` field in the config.
+/// This means `env.PATH` injection cannot prevent ENOENT for these hosts.
+///
+/// The fix: use an absolute shell path (`/bin/zsh`) with `-l` (login) mode so the shell
+/// sources `~/.zprofile` (and equivalents) before executing `marrow mcp`. This makes
+/// `/bin/zsh` itself the resolved binary — which always exists — and lets the shell find
+/// `marrow` via the user's normal login PATH.
+fn mcp_shell_launch_spec() -> serde_json::Value {
+    #[cfg(target_os = "macos")]
+    let shell = "/bin/zsh";
+    #[cfg(not(target_os = "macos"))]
+    let shell = "/bin/bash";
+
+    serde_json::json!({
+        "command": shell,
+        "args":    ["-lc", "marrow mcp"]
+    })
+}
+
 /// Builds a GUI-safe PATH string for injection into generated MCP configs.
 ///
 /// macOS IDEs launched from Finder/Dock/Spotlight inherit launchd's minimal
@@ -3138,12 +3183,13 @@ fn integrate_antigravity(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
 }
 
 /// ~/.cursor/mcp.json (global)
+/// Cursor uses Node.js child_process.spawn which resolves the command via the parent PATH
+/// (launchd GUI PATH), not the env field. Use the shell wrapper so /bin/zsh resolves marrow
+/// via the user's login PATH instead.
 fn integrate_cursor(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     let path = PathBuf::from(&ctx.home).join(".cursor/mcp.json");
     let mut cfg = load_json_or_empty(&path)?;
-    let mut spec = mcp_launch_spec();
-    spec["env"] = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });
-    cfg["mcpServers"]["marrow"] = spec;
+    cfg["mcpServers"]["marrow"] = mcp_shell_launch_spec();
     save_json(&path, &cfg)?;
     Ok(AgentOutcome::Installed)
 }
@@ -3152,12 +3198,12 @@ fn integrate_cursor(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
 ///   ~/Library/Application Support/Code/User/mcp.json  (VS Code global MCP, macOS)
 ///   ~/.copilot/mcp-config.json                         (Copilot CLI, uses "mcpServers" key)
 fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
-    let env_val = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });
-
     // 1. VS Code global MCP config — location is platform-specific.
     //    macOS: ~/Library/Application Support/Code/User/mcp.json
     //    Linux: ~/.config/Code/User/mcp.json
     //    Windows: %APPDATA%\Code\User\mcp.json
+    //    Uses shell wrapper — VS Code's extension host resolves command via parent PATH,
+    //    so env injection cannot prevent ENOENT for GUI-launched IDE.
     #[cfg(target_os = "macos")]
     let vscode_path = PathBuf::from(&ctx.home).join("Library/Application Support/Code/User/mcp.json");
     #[cfg(target_os = "linux")]
@@ -3168,9 +3214,7 @@ fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     if let Some(parent) = vscode_path.parent() {
         if parent.exists() {
             let mut vscode_cfg = load_json_or_empty(&vscode_path)?;
-            let mut spec = mcp_launch_spec();
-            spec["env"] = env_val.clone();
-            vscode_cfg["servers"]["marrow"] = spec;
+            vscode_cfg["servers"]["marrow"] = mcp_shell_launch_spec();
             save_json(&vscode_path, &vscode_cfg)?;
         }
     }
@@ -3178,9 +3222,8 @@ fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     // 2. ~/.copilot/mcp-config.json — Copilot CLI
     let cli_path = PathBuf::from(&ctx.home).join(".copilot/mcp-config.json");
     let mut cli_cfg = load_json_or_empty(&cli_path)?;
-    let mut spec = mcp_launch_spec();
+    let mut spec = mcp_shell_launch_spec();
     spec["type"] = serde_json::json!("stdio");
-    spec["env"] = env_val;
     cli_cfg["mcpServers"]["marrow"] = spec;
     save_json(&cli_path, &cli_cfg)?;
 
@@ -3197,8 +3240,7 @@ fn integrate_cline(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
         return Ok(AgentOutcome::NotFound);
     }
     let mut cfg = load_json_or_empty(&path)?;
-    let mut spec = mcp_launch_spec();
-    spec["env"] = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });
+    let mut spec = mcp_shell_launch_spec();
     spec["disabled"] = serde_json::json!(false);
     spec["autoApprove"] = serde_json::json!([]);
     cfg["mcpServers"]["marrow"] = spec;
