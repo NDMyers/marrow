@@ -2344,6 +2344,24 @@ mod tests {
     }
 
     #[test]
+    fn mcp_shell_launch_spec_uses_absolute_shell_and_invokes_marrow_mcp() {
+        let spec = mcp_shell_launch_spec();
+        let cmd = spec["command"].as_str().expect("command must be a string");
+        let args = spec["args"].as_array().expect("args must be an array");
+        let args_str: Vec<&str> = args.iter().filter_map(|a| a.as_str()).collect();
+
+        // Command must be an absolute path to a shell — never "marrow" itself.
+        #[cfg(not(target_os = "windows"))]
+        assert!(cmd.starts_with('/'), "shell must be an absolute path on Unix: {cmd}");
+        #[cfg(target_os = "windows")]
+        assert!(cmd.ends_with(".exe"), "shell must be an .exe on Windows: {cmd}");
+
+        // The args must ultimately invoke "marrow mcp".
+        let full = args_str.join(" ");
+        assert!(full.contains("marrow mcp"), "args must invoke 'marrow mcp': {full}");
+    }
+
+    #[test]
     fn gui_safe_path_places_binary_dir_first() {
         let path = gui_safe_path("/usr/local/bin/marrow");
         let first = path.split(':').next().unwrap();
@@ -3040,23 +3058,61 @@ fn mcp_launch_spec() -> serde_json::Value {
 /// Returns a shell-wrapped MCP launch spec for VS Code-based hosts (VS Code, Cursor, Cline).
 ///
 /// These hosts use Node.js `child_process.spawn` which resolves the command using the
-/// *parent process* PATH — i.e. the launchd GUI PATH — not the `env` field in the config.
-/// This means `env.PATH` injection cannot prevent ENOENT for these hosts.
+/// *parent process* PATH — i.e. the GUI/launchd PATH — not the `env` field in the config.
+/// Injecting `env.PATH` cannot prevent ENOENT because command lookup happens before the
+/// child process is started.
 ///
-/// The fix: use an absolute shell path (`/bin/zsh`) with `-l` (login) mode so the shell
-/// sources `~/.zprofile` (and equivalents) before executing `marrow mcp`. This makes
-/// `/bin/zsh` itself the resolved binary — which always exists — and lets the shell find
-/// `marrow` via the user's normal login PATH.
+/// The fix: delegate to a login shell at a known absolute path. The shell itself never
+/// ENOENTs, and its login mode (`-l`) sources the user's profile so `marrow` is on PATH
+/// by the time `marrow mcp` executes.
+///
+/// Platform behaviour:
+///   macOS   — `/bin/zsh -lc "marrow mcp"`         (zsh guaranteed since Catalina; sources ~/.zprofile)
+///   Linux   — `/bin/zsh` or `/bin/bash -lc`        (prefers zsh if installed; sources ~/.profile chain)
+///   Windows — `powershell.exe -NoProfile -NonInteractive -Command "marrow mcp"`
+///             (PATH inherited from Windows environment; no login-profile concept needed)
+///   Other   — `/bin/sh -lc "marrow mcp"`           (POSIX login-shell fallback)
 fn mcp_shell_launch_spec() -> serde_json::Value {
+    // macOS: zsh is the system default since Catalina and is always at /bin/zsh.
     #[cfg(target_os = "macos")]
-    let shell = "/bin/zsh";
-    #[cfg(not(target_os = "macos"))]
-    let shell = "/bin/bash";
-
-    serde_json::json!({
-        "command": shell,
+    let spec = serde_json::json!({
+        "command": "/bin/zsh",
         "args":    ["-lc", "marrow mcp"]
-    })
+    });
+
+    // Windows: PowerShell is present on all modern Windows (7+). PATH is inherited from
+    // the Windows environment where installers (cargo, scoop, winget) write their entries,
+    // so no profile sourcing is required — we just need a shell that handles the invocation.
+    #[cfg(target_os = "windows")]
+    let spec = serde_json::json!({
+        "command": "powershell.exe",
+        "args":    ["-NoProfile", "-NonInteractive", "-Command", "marrow mcp"]
+    });
+
+    // Linux: prefer zsh if available (common on dev machines), otherwise bash.
+    // Both support `-lc` and their login mode sources /etc/profile + ~/.profile / ~/.zprofile,
+    // where cargo and package managers register their PATH entries.
+    #[cfg(target_os = "linux")]
+    let spec = {
+        let shell = if std::path::Path::new("/bin/zsh").exists() {
+            "/bin/zsh"
+        } else {
+            "/bin/bash"
+        };
+        serde_json::json!({
+            "command": shell,
+            "args":    ["-lc", "marrow mcp"]
+        })
+    };
+
+    // Generic Unix fallback (FreeBSD, OpenBSD, etc.): POSIX sh login shell.
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    let spec = serde_json::json!({
+        "command": "/bin/sh",
+        "args":    ["-lc", "marrow mcp"]
+    });
+
+    spec
 }
 
 /// Builds a GUI-safe PATH string for injection into generated MCP configs.
