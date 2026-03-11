@@ -2331,6 +2331,252 @@ mod tests {
         assert!(msg.contains("not found"), "expected not-found error: {msg}");
         assert!(msg.contains("ingest_repo"), "expected guidance to ingest: {msg}");
     }
+
+    // ── launch-spec helpers ────────────────────────────────────────────────────
+
+    #[test]
+    fn mcp_launch_spec_is_portable_command_not_absolute_path() {
+        let spec = mcp_launch_spec();
+        let cmd = spec["command"].as_str().expect("command must be a string");
+        assert_eq!(cmd, "marrow");
+        assert!(!cmd.starts_with('/'), "command must not be an absolute path: {cmd}");
+        assert_eq!(spec["args"][0], "mcp");
+    }
+
+    #[test]
+    fn gui_safe_path_places_binary_dir_first() {
+        let path = gui_safe_path("/usr/local/bin/marrow");
+        let first = path.split(':').next().unwrap();
+        assert_eq!(first, "/usr/local/bin");
+    }
+
+    #[test]
+    fn gui_safe_path_includes_cargo_bin() {
+        let path = gui_safe_path("/some/other/marrow");
+        assert!(path.contains(".cargo/bin"), "expected .cargo/bin in: {path}");
+    }
+
+    #[test]
+    fn gui_safe_path_has_no_duplicate_entries() {
+        // /usr/local/bin is in our static list AND is the binary dir here — must not duplicate.
+        let path = gui_safe_path("/usr/local/bin/marrow");
+        let segments: Vec<&str> = path.split(':').collect();
+        let unique: std::collections::HashSet<_> = segments.iter().collect();
+        assert_eq!(segments.len(), unique.len(), "duplicate entries in PATH: {path}");
+    }
+
+    #[test]
+    fn gui_safe_path_is_non_empty_with_empty_binary() {
+        let path = gui_safe_path("");
+        assert!(!path.is_empty(), "PATH must never be empty");
+        assert!(path.contains("/usr/local/bin"));
+    }
+
+    #[test]
+    fn validate_marrow_command_error_lists_searched_dirs() {
+        let result = validate_marrow_command("/dir/one:/dir/two:/dir/three");
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("/dir/one"), "expected dir in error: {msg}");
+        assert!(msg.contains("/dir/two"), "expected dir in error: {msg}");
+    }
+
+    #[test]
+    fn validate_marrow_command_fails_on_nonexistent_path() {
+        let result = validate_marrow_command("/nonexistent/path:/also/nonexistent");
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("not found"), "error should mention not found: {msg}");
+    }
+
+    // ── per-agent integration config tests ────────────────────────────────────
+
+    #[test]
+    fn integrate_claude_writes_command_marrow_with_env_path() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+        };
+        integrate_claude(&ctx).unwrap();
+        let raw = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
+        assert_eq!(cmd, "marrow", "command must be 'marrow', got: {cmd}");
+        assert!(!cmd.starts_with('/'), "command must not be absolute path");
+        assert!(cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string(), "env.PATH must be present");
+    }
+
+    #[test]
+    fn integrate_antigravity_writes_command_marrow_with_env_path() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg_path = home.path().join(".gemini/antigravity/mcp_config.json");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(&cfg_path, "{}").unwrap();
+        let ctx = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+        };
+        integrate_antigravity(&ctx).unwrap();
+        let raw = std::fs::read_to_string(&cfg_path).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
+        assert_eq!(cmd, "marrow");
+        assert!(cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string());
+    }
+
+    #[test]
+    fn integrate_cursor_writes_command_marrow_with_env_path() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        let ctx = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+        };
+        integrate_cursor(&ctx).unwrap();
+        let raw = std::fs::read_to_string(home.path().join(".cursor/mcp.json")).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
+        assert_eq!(cmd, "marrow");
+        assert!(cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string());
+    }
+
+    #[test]
+    fn integrate_copilot_vscode_writes_command_marrow_with_env_path() {
+        let home = tempfile::tempdir().unwrap();
+        let vscode_dir = home.path().join("Library/Application Support/Code/User");
+        std::fs::create_dir_all(&vscode_dir).unwrap();
+        let ctx = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+        };
+        integrate_copilot(&ctx).unwrap();
+        let raw = std::fs::read_to_string(vscode_dir.join("mcp.json")).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cmd = cfg["servers"]["marrow"]["command"].as_str().unwrap();
+        assert_eq!(cmd, "marrow", "vscode global: command must be 'marrow', got: {cmd}");
+        assert!(cfg["servers"]["marrow"]["env"]["PATH"].is_string());
+    }
+
+    #[test]
+    fn integrate_copilot_cli_writes_command_marrow_with_env_path() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".copilot")).unwrap();
+        let ctx = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+        };
+        integrate_copilot(&ctx).unwrap();
+        let raw = std::fs::read_to_string(home.path().join(".copilot/mcp-config.json")).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
+        assert_eq!(cmd, "marrow", "copilot cli: command must be 'marrow', got: {cmd}");
+        assert!(cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string());
+    }
+
+    #[test]
+    fn integrate_cline_writes_command_marrow_with_env_path() {
+        let home = tempfile::tempdir().unwrap();
+        let cline_dir = home.path()
+            .join("Library/Application Support/Code/User/globalStorage")
+            .join("saoudrizwan.claude-dev/settings");
+        std::fs::create_dir_all(&cline_dir).unwrap();
+        let ctx = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+        };
+        integrate_cline(&ctx).unwrap();
+        let raw = std::fs::read_to_string(cline_dir.join("cline_mcp_settings.json")).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
+        assert_eq!(cmd, "marrow");
+        assert!(cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string());
+        assert_eq!(cfg["mcpServers"]["marrow"]["disabled"], false);
+    }
+
+    #[test]
+    fn integrate_zed_writes_command_marrow_with_env_path() {
+        let home = tempfile::tempdir().unwrap();
+        let zed_dir = home.path().join(".config/zed");
+        std::fs::create_dir_all(&zed_dir).unwrap();
+        std::fs::write(zed_dir.join("settings.json"), "{}").unwrap();
+        let ctx = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+        };
+        integrate_zed(&ctx).unwrap();
+        let raw = std::fs::read_to_string(zed_dir.join("settings.json")).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let path_val = cfg["context_servers"]["marrow"]["command"]["path"].as_str().unwrap();
+        assert_eq!(path_val, "marrow", "Zed command.path must be 'marrow', got: {path_val}");
+        assert!(!path_val.starts_with('/'));
+        assert!(cfg["context_servers"]["marrow"]["command"]["env"]["PATH"].is_string());
+    }
+
+    // ── regression guard ──────────────────────────────────────────────────────
+
+    #[test]
+    fn no_integrate_fn_writes_absolute_path_as_command() {
+        // If this test fails, someone has used ctx.binary directly as the MCP command.
+        // All integrate_* functions must produce command:"marrow" (or path:"marrow" for Zed).
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+
+        // Pre-create all required directories/files.
+        std::fs::create_dir_all(h.join(".cursor")).unwrap();
+        std::fs::create_dir_all(h.join(".copilot")).unwrap();
+        let ag = h.join(".gemini/antigravity/mcp_config.json");
+        std::fs::create_dir_all(ag.parent().unwrap()).unwrap();
+        std::fs::write(&ag, "{}").unwrap();
+        let cline = h.join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings");
+        std::fs::create_dir_all(&cline).unwrap();
+        let zed = h.join(".config/zed");
+        std::fs::create_dir_all(&zed).unwrap();
+        std::fs::write(zed.join("settings.json"), "{}").unwrap();
+        let vscode = h.join("Library/Application Support/Code/User");
+        std::fs::create_dir_all(&vscode).unwrap();
+
+        let ctx = IntegrationCtx {
+            binary: "/some/absolute/path/to/marrow".to_string(),
+            home: h.to_string_lossy().into_owned(),
+        };
+
+        integrate_claude(&ctx).unwrap();
+        integrate_antigravity(&ctx).unwrap();
+        integrate_cursor(&ctx).unwrap();
+        integrate_copilot(&ctx).unwrap();
+        integrate_cline(&ctx).unwrap();
+        integrate_zed(&ctx).unwrap();
+
+        // Check configs written by each function.
+        let checks: &[(&str, &str, &str)] = &[
+            (".claude.json",           "/mcpServers/marrow/command", "marrow"),
+            (".cursor/mcp.json",       "/mcpServers/marrow/command", "marrow"),
+            (".copilot/mcp-config.json", "/mcpServers/marrow/command", "marrow"),
+            ("Library/Application Support/Code/User/mcp.json", "/servers/marrow/command", "marrow"),
+            ("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
+             "/mcpServers/marrow/command", "marrow"),
+        ];
+        for (rel_path, json_ptr, expected) in checks {
+            let full = h.join(rel_path);
+            let raw = std::fs::read_to_string(&full)
+                .unwrap_or_else(|_| panic!("config not written: {rel_path}"));
+            let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let cmd = cfg.pointer(json_ptr)
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("command missing at {json_ptr} in {rel_path}"));
+            assert_eq!(cmd, *expected, "{rel_path}: command must be '{expected}', got: {cmd}");
+            assert!(!cmd.starts_with('/'), "{rel_path}: command must not be absolute path: {cmd}");
+        }
+        // Zed uses nested path field.
+        let zed_raw = std::fs::read_to_string(zed.join("settings.json")).unwrap();
+        let zed_cfg: serde_json::Value = serde_json::from_str(&zed_raw).unwrap();
+        let zed_cmd = zed_cfg.pointer("/context_servers/marrow/command/path")
+            .and_then(|v| v.as_str())
+            .expect("Zed command.path missing");
+        assert_eq!(zed_cmd, "marrow");
+        assert!(!zed_cmd.starts_with('/'));
+    }
 }
 
 // ── CLI subcommands ───────────────────────────────────────────────────────────
@@ -2757,16 +3003,121 @@ fn save_json(path: &Path, val: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+// ── Shared launch-spec helpers ────────────────────────────────────────────────
+
+/// Returns the canonical, portable MCP launch spec for Marrow.
+/// All integration config writers MUST use this — never write command/args by hand.
+fn mcp_launch_spec() -> serde_json::Value {
+    serde_json::json!({
+        "command": "marrow",
+        "args":    ["mcp"]
+    })
+}
+
+/// Builds a GUI-safe PATH string for injection into generated MCP configs.
+///
+/// macOS IDEs launched from Finder/Dock/Spotlight inherit launchd's minimal
+/// PATH, not the user's interactive shell PATH.  Injecting this value into
+/// the `env.PATH` field of each MCP config entry lets the host find `marrow`
+/// by command name even in that stripped environment.
+///
+/// Strategy: the directory containing the currently-running Marrow binary
+/// wins (position 0), common package-manager locations follow, and the
+/// existing process PATH appends at the end.  Duplicate entries are dropped
+/// while preserving order.
+fn gui_safe_path(binary_path: &str) -> String {
+    let mut segments: Vec<String> = Vec::new();
+
+    // 1. Directory of the running binary (position 0 — highest priority).
+    if let Some(dir) = std::path::Path::new(binary_path).parent() {
+        let s = dir.to_string_lossy();
+        if !s.is_empty() {
+            segments.push(s.into_owned());
+        }
+    }
+
+    // 2. Common install locations for macOS and Linux package managers.
+    let home = std::env::var("HOME").unwrap_or_default();
+    for candidate in [
+        format!("{home}/.cargo/bin"),
+        format!("{home}/.local/bin"),
+        "/opt/homebrew/bin".to_string(),
+        "/opt/homebrew/sbin".to_string(),
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+    ] {
+        segments.push(candidate);
+    }
+
+    // 3. Existing shell PATH last (lowest priority so our entries win).
+    if let Ok(existing) = std::env::var("PATH") {
+        for entry in existing.split(':') {
+            if !entry.is_empty() {
+                segments.push(entry.to_string());
+            }
+        }
+    }
+
+    // Deduplicate, preserving first occurrence.
+    let mut seen = std::collections::HashSet::new();
+    segments.retain(|s| seen.insert(s.clone()));
+    segments.join(":")
+}
+
+/// Checks whether `marrow` is resolvable as an executable on `env_path`.
+///
+/// Manually walks each directory rather than spawning a subprocess.
+/// Spawning would inherit the calling shell's PATH and produce false-positives
+/// on machines where `marrow` is only on the interactive PATH, not the GUI PATH.
+///
+/// Returns `Ok(())` if marrow is found and executable; `Err` with a diagnostic
+/// message (including which directories were searched) if not.
+fn validate_marrow_command(env_path: &str) -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let found = env_path.split(':').any(|dir| {
+        let candidate = std::path::Path::new(dir).join("marrow");
+        if !candidate.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            candidate
+                .metadata()
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            true // on non-Unix just check existence
+        }
+    });
+
+    if found {
+        Ok(())
+    } else {
+        let searched: Vec<&str> = env_path.split(':').take(10).collect();
+        anyhow::bail!(
+            "`marrow` binary not found on the generated PATH.\n\
+             Searched: {}\n\
+             Fix: ensure `marrow` is installed (e.g. `cargo install marrow`) \
+             and is in one of the directories above.",
+            searched.join(", ")
+        )
+    }
+}
+
 // ── Per-agent helpers ─────────────────────────────────────────────────────────
 
 /// ~/.claude.json (global Claude Code config)
 fn integrate_claude(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     let path = PathBuf::from(&ctx.home).join(".claude.json");
     let mut cfg = load_json_or_empty(&path)?;
-    cfg["mcpServers"]["marrow"] = serde_json::json!({
-        "command": ctx.binary,
-        "args":    ["mcp"]
-    });
+    let mut spec = mcp_launch_spec();
+    spec["env"] = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });
+    cfg["mcpServers"]["marrow"] = spec;
     save_json(&path, &cfg)?;
     Ok(AgentOutcome::Installed)
 }
@@ -2779,10 +3130,9 @@ fn integrate_antigravity(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
         return Ok(AgentOutcome::NotFound);
     }
     let mut cfg = load_json_or_empty(&path)?;
-    cfg["mcpServers"]["marrow"] = serde_json::json!({
-        "command": ctx.binary,
-        "args":    ["mcp"]
-    });
+    let mut spec = mcp_launch_spec();
+    spec["env"] = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });
+    cfg["mcpServers"]["marrow"] = spec;
     save_json(&path, &cfg)?;
     Ok(AgentOutcome::Installed)
 }
@@ -2791,10 +3141,9 @@ fn integrate_antigravity(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
 fn integrate_cursor(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     let path = PathBuf::from(&ctx.home).join(".cursor/mcp.json");
     let mut cfg = load_json_or_empty(&path)?;
-    cfg["mcpServers"]["marrow"] = serde_json::json!({
-        "command": ctx.binary,
-        "args":    ["mcp"]
-    });
+    let mut spec = mcp_launch_spec();
+    spec["env"] = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });
+    cfg["mcpServers"]["marrow"] = spec;
     save_json(&path, &cfg)?;
     Ok(AgentOutcome::Installed)
 }
@@ -2803,6 +3152,8 @@ fn integrate_cursor(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
 ///   ~/Library/Application Support/Code/User/mcp.json  (VS Code global MCP, macOS)
 ///   ~/.copilot/mcp-config.json                         (Copilot CLI, uses "mcpServers" key)
 fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
+    let env_val = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });
+
     // 1. VS Code global MCP config — location is platform-specific.
     //    macOS: ~/Library/Application Support/Code/User/mcp.json
     //    Linux: ~/.config/Code/User/mcp.json
@@ -2817,10 +3168,9 @@ fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     if let Some(parent) = vscode_path.parent() {
         if parent.exists() {
             let mut vscode_cfg = load_json_or_empty(&vscode_path)?;
-            vscode_cfg["servers"]["marrow"] = serde_json::json!({
-                "command": ctx.binary,
-                "args":    ["mcp"]
-            });
+            let mut spec = mcp_launch_spec();
+            spec["env"] = env_val.clone();
+            vscode_cfg["servers"]["marrow"] = spec;
             save_json(&vscode_path, &vscode_cfg)?;
         }
     }
@@ -2828,11 +3178,10 @@ fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     // 2. ~/.copilot/mcp-config.json — Copilot CLI
     let cli_path = PathBuf::from(&ctx.home).join(".copilot/mcp-config.json");
     let mut cli_cfg = load_json_or_empty(&cli_path)?;
-    cli_cfg["mcpServers"]["marrow"] = serde_json::json!({
-        "type":    "local",
-        "command": ctx.binary,
-        "args":    ["mcp"]
-    });
+    let mut spec = mcp_launch_spec();
+    spec["type"] = serde_json::json!("stdio");
+    spec["env"] = env_val;
+    cli_cfg["mcpServers"]["marrow"] = spec;
     save_json(&cli_path, &cli_cfg)?;
 
     Ok(AgentOutcome::Installed)
@@ -2848,12 +3197,11 @@ fn integrate_cline(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
         return Ok(AgentOutcome::NotFound);
     }
     let mut cfg = load_json_or_empty(&path)?;
-    cfg["mcpServers"]["marrow"] = serde_json::json!({
-        "command":     ctx.binary,
-        "args":        ["mcp"],
-        "disabled":    false,
-        "autoApprove": []
-    });
+    let mut spec = mcp_launch_spec();
+    spec["env"] = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });
+    spec["disabled"] = serde_json::json!(false);
+    spec["autoApprove"] = serde_json::json!([]);
+    cfg["mcpServers"]["marrow"] = spec;
     save_json(&path, &cfg)?;
     Ok(AgentOutcome::Installed)
 }
@@ -2868,8 +3216,9 @@ fn integrate_zed(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     let mut cfg = load_json_or_empty(&path)?;
     cfg["context_servers"]["marrow"] = serde_json::json!({
         "command": {
-            "path": ctx.binary,
-            "args": ["mcp"]
+            "path": "marrow",
+            "args": ["mcp"],
+            "env":  { "PATH": gui_safe_path(&ctx.binary) }
         },
         "settings": {}
     });
@@ -2928,6 +3277,24 @@ fn cmd_integrate() -> Result<()> {
     let home = std::env::var("HOME").context("$HOME is not set")?;
     let home_path = PathBuf::from(&home);
     let ctx = IntegrationCtx { binary, home };
+
+    // Warn if `marrow` is not resolvable via the GUI-safe PATH we will inject.
+    // This converts a vague post-restart ENOENT into an immediate install-time diagnosis.
+    {
+        let env_path = gui_safe_path(&ctx.binary);
+        if let Err(e) = validate_marrow_command(&env_path) {
+            eprintln!(
+                "  {}  {}",
+                style("⚠").yellow().bold(),
+                style(format!("PATH warning: {e}")).yellow()
+            );
+            eprintln!(
+                "  {}",
+                style("Continuing install — ensure `marrow` is on PATH before restarting your IDE.").dim()
+            );
+            eprintln!();
+        }
+    }
 
     let rule_config = if install_rules {
         // Scope selection: Global writes to ~/.agent/rules; Project writes to .agent/rules in CWD
@@ -3750,69 +4117,13 @@ Some("benchmark") => {
                 }
             }
         }
-        // ── marrow mcp: thin stdio ↔ daemon IPC proxy ─────────────────────────
+        // ── marrow mcp: start stdio MCP server (also boots daemon for file watching) ─
         Some("mcp") => {
-            // Ensure daemon is running (auto-spawns if dead).
-            ipc::ensure_daemon_running().await
-                .context("failed to start or connect to marrow daemon")?;
-
-            let client = ipc::default_client();
-
-            // Pipe stdin → daemon → stdout in a simple Content-Length framing loop.
-            // MCP uses HTTP Content-Length framing; we forward raw bytes.
-            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-            let mut reader = BufReader::new(tokio::io::stdin());
-            let mut writer = tokio::io::stdout();
-
-            loop {
-                // Read Content-Length header
-                let mut header_line = String::new();
-                let n = reader.read_line(&mut header_line).await?;
-                if n == 0 {
-                    break; // EOF
-                }
-                let content_length: usize = header_line
-                    .trim()
-                    .strip_prefix("Content-Length:")
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(0);
-                if content_length == 0 {
-                    continue;
-                }
-
-                // Consume blank line separator
-                let mut blank = String::new();
-                let blank_n = reader.read_line(&mut blank).await?;
-                if blank_n == 0 {
-                    break; // EOF after header line
-                }
-
-                // Read body
-                let mut body = vec![0u8; content_length];
-                reader.read_exact(&mut body).await?;
-
-                // Forward to daemon — on error, synthesize a JSON-RPC error response
-                let response = match client.forward_mcp(body).await {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        let fallback = br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"internal proxy error"}}"#;
-                        serde_json::to_vec(&serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": null,
-                            "error": { "code": -32000, "message": e.to_string() }
-                        })).unwrap_or_else(|_| fallback.to_vec())
-                    },
-                };
-
-                // Write response back with framing
-                writer.write_all(
-                    format!("Content-Length: {}\r\n\r\n", response.len()).as_bytes()
-                ).await?;
-                writer.write_all(&response).await?;
-                writer.flush().await?;
+            // Kick off the background daemon for file watching (best-effort; non-fatal).
+            if let Err(e) = ipc::ensure_daemon_running().await {
+                eprintln!("[marrow] daemon start warning (file watching unavailable): {e}");
             }
-
-            return Ok(());
+            // Fall through to the stdio MCP server below.
         }
         // Machine bypass: any unrecognised arg falls straight through to the
         // stdio server without showing the menu.
