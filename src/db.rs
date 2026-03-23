@@ -2,6 +2,22 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension as _};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedRepoSnapshot {
+    pub repo_id:      String,
+    pub root_path:    String,
+    pub symbol_count: i64,
+    pub file_count:   i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseScopeSnapshot {
+    pub repo_count:   i64,
+    pub symbol_count: i64,
+    pub file_count:   i64,
+    pub repos:        Vec<IndexedRepoSnapshot>,
+}
+
 /// Opens (or creates) the database at `db_path`.
 /// If the filesystem is read-only or the directory cannot be created, falls back
 /// transparently to an in-memory database so the MCP server can still function
@@ -33,7 +49,8 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
-         PRAGMA busy_timeout=5000;
+         PRAGMA busy_timeout=30000;
+         PRAGMA temp_store=MEMORY;
          PRAGMA auto_vacuum=INCREMENTAL;",
     )?;
     conn.execute_batch(
@@ -153,6 +170,7 @@ pub fn repo_id_for_root(conn: &Connection, root_path: &Path) -> Result<Option<St
     .map_err(Into::into)
 }
 
+#[allow(dead_code)] // retained for unit tests; production callers use is_repo_indexed_by_id
 pub fn is_repo_indexed(conn: &Connection, repo_id: &str, root_path: &Path) -> Result<bool> {
     let canonical = canonicalize_best_effort(root_path);
     let exists = conn
@@ -179,6 +197,61 @@ pub fn read_stat(conn: &Connection, key: &str) -> i64 {
         |row| row.get::<_, i64>(0),
     )
     .unwrap_or(0)
+}
+
+pub fn database_scope_snapshot(conn: &Connection) -> Result<DatabaseScopeSnapshot> {
+    let symbol_count = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?;
+    let file_count = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
+
+    let mut stmt = conn.prepare(
+        "SELECT
+            r.id,
+            r.root_path,
+            COUNT(DISTINCT n.id)        AS symbol_count,
+            COUNT(DISTINCT f.file_path) AS file_count
+         FROM repositories r
+         LEFT JOIN nodes n ON n.repo_id = r.id
+         LEFT JOIN files f ON f.repo_id = r.id
+         GROUP BY r.id, r.root_path
+         HAVING COUNT(DISTINCT n.id) > 0 OR COUNT(DISTINCT f.file_path) > 0
+         ORDER BY r.id ASC",
+    )?;
+
+    let repos = stmt
+        .query_map([], |row| {
+            Ok(IndexedRepoSnapshot {
+                repo_id: row.get(0)?,
+                root_path: row.get(1)?,
+                symbol_count: row.get(2)?,
+                file_count: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let repo_count = repos.len() as i64;
+
+    Ok(DatabaseScopeSnapshot {
+        repo_count,
+        symbol_count,
+        file_count,
+        repos,
+    })
+}
+
+pub fn connected_database_path(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare("PRAGMA database_list")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "main" {
+            let path: String = row.get(2)?;
+            if path.is_empty() {
+                return Ok(":memory:".to_string());
+            }
+            return Ok(path);
+        }
+    }
+    Ok(":memory:".to_string())
 }
 
 /// FNV-1a hash of raw file bytes — used for change detection in the `files` table.
@@ -408,6 +481,7 @@ pub fn mark_deleted_observation_stale(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     #[test]
@@ -416,7 +490,7 @@ mod tests {
         let timeout: i64 = conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .expect("PRAGMA busy_timeout failed");
-        assert_eq!(timeout, 5000, "busy_timeout should be 5000ms");
+        assert_eq!(timeout, 30000, "busy_timeout should be 30000ms");
     }
 
     #[test]
@@ -540,5 +614,119 @@ mod tests {
             [],
         );
         assert!(result.is_err(), "duplicate (repo_id, file_path) should violate PK");
+    }
+
+    #[test]
+    fn database_scope_snapshot_reports_repo_aware_totals() {
+        let conn = init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2), (?3, ?4)",
+            rusqlite::params![
+                "frontend",
+                "/tmp/frontend",
+                "backend",
+                "/tmp/backend"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+             VALUES
+                (?1, ?2, ?3, 'ts', ?4, 'function', 'export function App() {}'),
+                (?5, ?6, ?7, 'ts', ?8, 'function', 'export function Header() {}'),
+                (?9, ?10, ?11, 'rs', ?12, 'function', 'fn main() {}')",
+            rusqlite::params![
+                "frontend:src/app.ts:App",
+                "frontend",
+                "src/app.ts",
+                "App",
+                "frontend:src/header.ts:Header",
+                "frontend",
+                "src/header.ts",
+                "Header",
+                "backend:src/main.rs:main",
+                "backend",
+                "src/main.rs",
+                "main"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (repo_id, file_path, mtime_secs, content_hash)
+             VALUES
+                ('frontend', 'src/app.ts', 1, 'a'),
+                ('frontend', 'src/header.ts', 1, 'b'),
+                ('backend', 'src/main.rs', 1, 'c')",
+            [],
+        )
+        .unwrap();
+
+        let snapshot = database_scope_snapshot(&conn).unwrap();
+        assert_eq!(snapshot.repo_count, 2);
+        assert_eq!(snapshot.symbol_count, 3);
+        assert_eq!(snapshot.file_count, 3);
+        assert_eq!(snapshot.repos.len(), 2);
+
+        let repos: HashMap<_, _> = snapshot
+            .repos
+            .into_iter()
+            .map(|repo| {
+                let repo_id = repo.repo_id.clone();
+                (repo_id, repo)
+            })
+            .collect();
+
+        let frontend = repos.get("frontend").expect("frontend repo missing");
+        assert_eq!(frontend.symbol_count, 2);
+        assert_eq!(frontend.file_count, 2);
+        assert_eq!(frontend.root_path, "/tmp/frontend");
+
+        let backend = repos.get("backend").expect("backend repo missing");
+        assert_eq!(backend.symbol_count, 1);
+        assert_eq!(backend.file_count, 1);
+        assert_eq!(backend.root_path, "/tmp/backend");
+    }
+
+    #[test]
+    fn database_scope_snapshot_excludes_unindexed_repo_records() {
+        let conn = init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2), (?3, ?4)",
+            rusqlite::params![
+                "indexed_repo",
+                "/tmp/indexed_repo",
+                "empty_repo",
+                "/tmp/empty_repo"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+             VALUES (?1, ?2, ?3, 'rs', ?4, 'function', 'fn main() {}')",
+            rusqlite::params![
+                "indexed_repo:src/main.rs:main",
+                "indexed_repo",
+                "src/main.rs",
+                "main"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files (repo_id, file_path, mtime_secs, content_hash)
+             VALUES ('indexed_repo', 'src/main.rs', 1, 'abc')",
+            [],
+        )
+        .unwrap();
+
+        let snapshot = database_scope_snapshot(&conn).unwrap();
+        assert_eq!(snapshot.repo_count, 1);
+        assert_eq!(snapshot.repos.len(), 1);
+        assert_eq!(snapshot.repos[0].repo_id, "indexed_repo");
+    }
+
+    #[test]
+    fn connected_database_path_reports_memory_for_in_memory_db() {
+        let conn = init_db(":memory:").unwrap();
+        assert_eq!(connected_database_path(&conn).unwrap(), ":memory:");
     }
 }

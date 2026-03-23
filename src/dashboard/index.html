@@ -437,6 +437,29 @@
       margin-top: -8px;
     }
 
+    #scope-path {
+      font-size: 11px;
+      color: var(--dim);
+      margin-bottom: 14px;
+    }
+
+    .repo-path-cell {
+      color: var(--dim);
+      font-size: 11px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 520px;
+    }
+
+    #repo-empty-row td {
+      text-align: center;
+      color: var(--dim);
+      font-size: 11px;
+      padding: 20px 14px;
+      border: none;
+    }
+
     /* ── Privacy footer ─────────────────────────────────────────────────────── */
     #privacy {
       flex-shrink: 0;
@@ -650,9 +673,9 @@
           <div class="card-sub" id="s-reduction-sub">capsule vs. full-file</div>
         </div>
         <div class="card">
-          <div class="card-label">DB Size</div>
+          <div class="card-label">Attached DB Size</div>
           <div class="card-value" id="s-db-size">—</div>
-          <div class="card-sub">graph.db on disk</div>
+          <div class="card-sub">current graph.db on disk</div>
         </div>
       </div>
 
@@ -724,7 +747,45 @@
         </div>
       </div>
 
-      <p id="lifetime-sub">Cumulative across all sessions and workspaces sharing this database.</p>
+      <p id="lifetime-sub">Persisted in the attached database. A workspace database can contain multiple indexed repos.</p>
+      <p id="scope-path">Attached database: <span id="scope-db-path">—</span></p>
+
+      <div class="cards-row">
+        <div class="card">
+          <div class="card-label">Attached DB Size</div>
+          <div class="card-value" id="db-size">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Indexed Repos</div>
+          <div class="card-value cyan" id="db-repos">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Indexed Files</div>
+          <div class="card-value" id="db-files">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Indexed Symbols</div>
+          <div class="card-value amber" id="db-symbols">—</div>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Repo</th>
+              <th>Files</th>
+              <th>Symbols</th>
+              <th>Root Path</th>
+            </tr>
+          </thead>
+          <tbody id="repo-tbody">
+            <tr id="repo-empty-row">
+              <td colspan="4">no repos indexed in the attached database yet</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
 
       <footer id="privacy-lt">
         Marrow operates entirely offline. No telemetry. All data remains strictly on your local machine (127.0.0.1).
@@ -823,6 +884,11 @@
     return Number(n).toFixed(1) + '%';
   }
 
+  function fmtMb(mb) {
+    const value = Number(mb || 0);
+    return value > 0 ? value.toFixed(2) + ' MB' : '< 0.01 MB';
+  }
+
   function fmtTs(ts) {
     // ts is a unix epoch in seconds
     const d = new Date(Number(ts) * 1000);
@@ -880,6 +946,42 @@
     document.getElementById('l-pipeline-compliance').textContent = fmtPct(lt.pipeline_compliance_pct || 0);
     document.getElementById('l-ambiguous').textContent = fmtNum(lt.ambiguous_symbol_requests || 0);
     document.getElementById('l-stale').textContent = fmtNum(lt.stale_capsule_prevented || 0);
+  }
+
+  function updateDatabaseScope(database) {
+    if (!database) return;
+
+    document.getElementById('s-db-size').textContent = fmtMb(database.size_mb);
+    document.getElementById('db-size').textContent = fmtMb(database.size_mb);
+    document.getElementById('db-repos').textContent = fmtNum(database.repo_count || 0);
+    document.getElementById('db-files').textContent = fmtNum(database.file_count || 0);
+    document.getElementById('db-symbols').textContent = fmtNum(database.symbol_count || 0);
+    document.getElementById('scope-db-path').textContent = database.path || '—';
+    renderRepoTable(database.repos || []);
+  }
+
+  function renderRepoTable(repos) {
+    const tbody = document.getElementById('repo-tbody');
+    tbody.innerHTML = '';
+
+    if (!Array.isArray(repos) || repos.length === 0) {
+      const tr = document.createElement('tr');
+      tr.id = 'repo-empty-row';
+      tr.innerHTML = '<td colspan="4">no repos indexed in the attached database yet</td>';
+      tbody.appendChild(tr);
+      return;
+    }
+
+    for (const repo of repos) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="tool-label"><span class="sym">${escHtml(repo.repo_id || '—')}</span></td>
+        <td>${fmtNum(repo.file_count || 0)}</td>
+        <td>${fmtNum(repo.symbol_count || 0)}</td>
+        <td class="repo-path-cell">${escHtml(repo.root_path || '—')}</td>
+      `;
+      tbody.appendChild(tr);
+    }
   }
 
   function setStatus(state) {
@@ -1136,9 +1238,8 @@
         if (body.lifetime) {
           updateLifetimeCards(body.lifetime);
         }
-        if (body.db_size_mb != null) {
-          const mb = Number(body.db_size_mb);
-          document.getElementById('s-db-size').textContent = mb > 0 ? mb.toFixed(2) + ' MB' : '< 0.01 MB';
+        if (body.database) {
+          updateDatabaseScope(body.database);
         }
       })
       .catch(() => {

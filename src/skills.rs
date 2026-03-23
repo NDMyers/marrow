@@ -86,10 +86,12 @@ impl Agent {
             }
 
             (Agent::GitHubCopilot, Scope::Project) => {
-                PathBuf::from(".github/copilot-instructions/marrow-optimization.md")
+                PathBuf::from(".github/instructions/marrow-optimization.instructions.md")
             }
             (Agent::GitHubCopilot, Scope::Global) => {
-                home.join(".copilot/skills/marrow-optimization.md")
+                home.join(
+                    "Library/Application Support/Code/User/prompts/marrow-optimization.instructions.md",
+                )
             }
 
             // Cline project target is a bare file at the repo root — no subdirectory.
@@ -119,28 +121,73 @@ pub enum Method {
     Symlink,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallStatus {
+    Written,
+    PreservedExisting,
+}
+
 // ── Public entry points ───────────────────────────────────────────────────────
 
-/// Install the Marrow optimization skill for a single agent.
+/// Install the Marrow optimization rule file for a single agent.
 /// Called by `marrow integrate` after MCP registration.
-pub fn install_skill(agent: Agent, scope: Scope, method: Method, home: &Path) -> Result<()> {
+pub fn install_skill(
+    agent: Agent,
+    scope: Scope,
+    method: Method,
+    home: &Path,
+) -> Result<InstallStatus> {
     let target = agent.target_path(scope, home);
-    let central = home.join(".marrow/marrow-optimization.md");
+    let central = install_source_path(method, home)
+        .unwrap_or_else(|| home.join(".marrow/marrow-optimization.md"));
+
+    // Respect any existing user-managed instruction file or symlink target.
+    // A dangling symlink (symlink_metadata ok but exists false) is not usable —
+    // remove it so we can recreate a valid one rather than silently leaving it broken.
+    if target.symlink_metadata().is_ok() && !target.exists() {
+        fs::remove_file(&target)?;
+    } else if target.exists() {
+        return Ok(InstallStatus::PreservedExisting);
+    }
 
     if matches!(method, Method::Symlink) {
         if let Some(parent) = central.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&central, MARROW_CORE_SKILL_MD)?;
+        if !central.exists() {
+            fs::write(&central, MARROW_CORE_SKILL_MD)?;
+        }
     }
 
     install(&target, method, &central)
 }
 
+pub fn install_source_path(method: Method, home: &Path) -> Option<PathBuf> {
+    match method {
+        Method::WriteFile => None,
+        Method::Symlink => Some(home.join(".marrow/marrow-optimization.md")),
+    }
+}
+
+pub fn install_source_description(method: Method, home: &Path) -> String {
+    match install_source_path(method, home) {
+        Some(path) => format!("source: {}", path.display()),
+        None => "source: embedded Marrow template; edit/remove the target file directly"
+            .to_string(),
+    }
+}
+
 // ── File-system helpers ───────────────────────────────────────────────────────
 
-/// Low-level filesystem primitive. Only call via [`install_skill`]. The `central` parameter is only meaningful for [`Method::Symlink`].
-fn install(target: &Path, method: Method, central: &Path) -> Result<()> {
+/// Low-level filesystem primitive. Only call via [`install_skill`].
+/// The `central` parameter is only meaningful for [`Method::Symlink`].
+fn install(target: &Path, method: Method, central: &Path) -> Result<InstallStatus> {
+    if target.symlink_metadata().is_ok() && !target.exists() {
+        fs::remove_file(target)?;
+    } else if target.exists() {
+        return Ok(InstallStatus::PreservedExisting);
+    }
+
     // Ensure parent directory exists (bare-root files like .clinerules have no parent dir to create).
     if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
@@ -153,13 +200,102 @@ fn install(target: &Path, method: Method, central: &Path) -> Result<()> {
             fs::write(target, MARROW_CORE_SKILL_MD)?;
         }
         Method::Symlink => {
-            // Remove any existing file or broken symlink before creating the new one.
-            if target.exists() || target.symlink_metadata().is_ok() {
-                fs::remove_file(target)?;
-            }
             std::os::unix::fs::symlink(central, target)?;
         }
     }
 
-    Ok(())
+    Ok(InstallStatus::Written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{install, install_source_description, install_source_path, Agent, InstallStatus, Method, Scope};
+    use std::{fs, path::Path};
+    use tempfile::tempdir;
+
+    #[test]
+    fn copilot_project_skill_uses_valid_instruction_file() {
+        let path = Agent::GitHubCopilot.target_path(Scope::Project, Path::new("/tmp/home"));
+
+        assert_eq!(
+            path,
+            Path::new(".github/instructions/marrow-optimization.instructions.md")
+        );
+    }
+
+    #[test]
+    fn copilot_global_skill_uses_profile_prompts_instruction_file() {
+        let path = Agent::GitHubCopilot.target_path(Scope::Global, Path::new("/tmp/home"));
+
+        assert_eq!(
+            path,
+            Path::new("/tmp/home/Library/Application Support/Code/User/prompts/marrow-optimization.instructions.md")
+        );
+    }
+
+    #[test]
+    fn write_file_install_preserves_existing_instruction_file() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("existing.instructions.md");
+        let central = tmp.path().join("central.md");
+
+        fs::write(&target, "existing content").unwrap();
+
+        install(&target, Method::WriteFile, &central).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "existing content");
+    }
+
+    #[test]
+    fn symlink_install_preserves_existing_instruction_file() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("existing.instructions.md");
+        let central = tmp.path().join("central.md");
+
+        fs::write(&target, "existing content").unwrap();
+
+        install(&target, Method::Symlink, &central).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "existing content");
+    }
+
+    #[test]
+    fn symlink_install_source_path_uses_central_marrow_file() {
+        let source = install_source_path(Method::Symlink, Path::new("/tmp/home"));
+
+        assert_eq!(
+            source.as_deref(),
+            Some(Path::new("/tmp/home/.marrow/marrow-optimization.md"))
+        );
+    }
+
+    #[test]
+    fn dangling_symlink_is_replaced_not_preserved() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("target.md");
+        let nonexistent = tmp.path().join("ghost.md"); // never created
+
+        // Create a dangling symlink pointing at a nonexistent path.
+        std::os::unix::fs::symlink(&nonexistent, &target).unwrap();
+        assert!(target.symlink_metadata().is_ok(), "symlink entry should exist");
+        assert!(!target.exists(), "dangling symlink should not resolve");
+
+        // install should remove the dangling symlink and write the file.
+        let central = tmp.path().join("central.md");
+        let result = install(&target, Method::WriteFile, &central).unwrap();
+
+        assert_eq!(result, InstallStatus::Written);
+        assert!(target.exists(), "file should now exist after replacing dangling symlink");
+        assert!(fs::read_to_string(&target).unwrap().to_lowercase().contains("marrow"));
+    }
+
+    #[test]
+    fn write_file_install_source_description_points_users_to_target() {
+        let description = install_source_description(Method::WriteFile, Path::new("/tmp/home"));
+
+        assert!(
+            description.contains("edit/remove the target file directly"),
+            "expected direct-management guidance: {description}"
+        );
+    }
 }
