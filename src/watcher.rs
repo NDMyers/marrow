@@ -246,30 +246,27 @@ async fn handle_file_change(
                 count += 1;
             }
 
-            // Build CALLS edges for the new symbols
-            // First collect all symbol names in the repo for matching
-            let mut name_to_ids: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            {
-                let mut stmt = conn.prepare(
-                    "SELECT id, symbol_name FROM nodes WHERE repo_id = ?1",
-                )?;
-                let rows = stmt
-                    .query_map(rusqlite::params![repo_id_clone], |row| {
-                        let id: String = row.get(0)?;
-                        let name: String = row.get(1)?;
-                        Ok((id, name))
-                    })?
-                    .filter_map(|r| r.ok());
-                for (id, name) in rows {
-                    name_to_ids.entry(name).or_default().push(id);
-                }
-            }
-
             let lang_ext = file_path_for_task
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
+
+            // Build CALLS edges: only load target ids for callee names used in this file.
+            let mut callee_names = HashSet::new();
+            for sym in &symbols {
+                let callees = ingestion::extract_calls_from_symbol(&sym.raw_text, lang_ext);
+                for c in callees {
+                    if c != sym.name {
+                        callee_names.insert(c);
+                    }
+                }
+            }
+            let name_to_ids = ingestion::build_name_to_ids_for_symbol_names(
+                &tx_db,
+                &repo_id_clone,
+                &callee_names,
+            )?;
+
             for sym in &symbols {
                 let callees = ingestion::extract_calls_from_symbol(&sym.raw_text, lang_ext);
                 let source_id = format!("{}:{}:{}", repo_id_clone, rel_path_clone, sym.name);
