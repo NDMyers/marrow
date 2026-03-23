@@ -58,6 +58,7 @@ cargo clippy -- -D warnings
 | `MARROW_INGEST_THREADS` | `min(8, max(2, cores))` | Rayon workers for hash/parse during ingest; fewer workers lower peak RAM during full reindex. |
 | `MARROW_INGEST_PARSE_QUEUE` | `64` | Max parsed files in the bounded channel between Rayon workers and a drainer thread (serialized to a temp spill file); lower → lower peak RSS on huge reindexes, more back-pressure on workers. Spill reads cap blob size (64 MiB per field) and symbol count per row to limit corrupt-file DoS. |
 | `MARROW_SKIP_POST_INGEST_MAINTENANCE` | *(unset)* | If non-empty, skip WAL checkpoint + `incremental_vacuum` after ingest (faster huge reindexes). Run `marrow maintenance` later. |
+| `MARROW_CROSS_REPO_FULL_SCAN` | *(unset)* | If `1`/`true`/`yes`, scan **all** repos for cross-repo `IMPORTS` after each ingest (legacy). Default: only the repo that was just indexed — see `MARROW-PERF-012` / [`docs/perf-harness.md`](docs/perf-harness.md). |
 | `MARROW_CAPSULE_MAX_OUTBOUND` | `500` | Max outbound edges loaded per capsule / trace (RAM bound). |
 | `MARROW_CAPSULE_MAX_INBOUND_LOAD` | `64` | Max inbound rows loaded from DB (display still capped at 10). |
 | `MARROW_IMPACT_MAX_ROWS` | `5000` | Max rows returned by `analyze_impact`. |
@@ -78,6 +79,9 @@ Tracked RAM/latency work (MARROW-PERF-001–015, milestones M0–M3) is listed i
 
 - Runbook: [`docs/perf-baseline-runbook.md`](docs/perf-baseline-runbook.md)
 - `marrow perf-harness`: [`docs/perf-harness.md`](docs/perf-harness.md) — `cargo build --release && ./target/release/marrow perf-harness --help`
+- SQLite hot-query notes: [`docs/sqlite-query-plans.md`](docs/sqlite-query-plans.md)
+- Phase C worker spike (defer): [`docs/phase-c-worker-spike.md`](docs/phase-c-worker-spike.md)
+- CI perf smoke thresholds: [`ci/perf-thresholds.json`](ci/perf-thresholds.json) (used by `.github/workflows/ci.yml`)
 
 **Global install** (puts the binary on your PATH via `~/.cargo/bin`, which must be on `PATH`):
 

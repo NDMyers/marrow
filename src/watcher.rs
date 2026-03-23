@@ -203,39 +203,81 @@ async fn handle_file_change(
             None
         };
 
-        // Delete old nodes for this file
+        let old_ids: HashSet<String> = tx_db
+            .prepare("SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2")?
+            .query_map(rusqlite::params![repo_id_clone, rel_path_clone], |row| {
+                row.get::<_, String>(0)
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Drop outgoing edges from this file; keep inbound CALLS with stable target ids (MARROW-PERF-011).
+        tx_db.execute(
+            "DELETE FROM edges WHERE source_id IN (
+                SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)",
+            rusqlite::params![repo_id_clone, rel_path_clone],
+        )?;
+
         tx_db.execute(
             "DELETE FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
             rusqlite::params![repo_id_clone, rel_path_clone],
         )?;
 
-        // Delete edges touching this file's nodes, including cross-repo imports.
-        let prefix = format!("{}:{}:", repo_id_clone, rel_path_clone);
-        tx_db.execute(
-            "DELETE FROM edges WHERE source_id LIKE ?1 OR target_id LIKE ?1",
-            rusqlite::params![format!("{prefix}%")],
-        )?;
+        // File removed or parse skipped: drop any edges still referencing deleted node ids.
+        if parsed_symbols.is_none() && !old_ids.is_empty() {
+            let v: Vec<String> = old_ids.iter().cloned().collect();
+            ingestion::delete_edges_touching_removed_ids(&tx_db, &v)?;
+        }
 
         if let Some(symbols) = parsed_symbols {
-            // Insert new nodes
+            let new_ids: HashSet<String> = symbols
+                .iter()
+                .map(|s| format!("{}:{}:{}", repo_id_clone, rel_path_clone, s.name))
+                .collect();
+            let removed: Vec<String> = old_ids.difference(&new_ids).cloned().collect();
+            ingestion::delete_edges_touching_removed_ids(&tx_db, &removed)?;
+            for id in &removed {
+                tx_db.execute("DELETE FROM nodes WHERE id = ?1", rusqlite::params![id])?;
+            }
+
+            let lang_ext_store = file_path_for_task
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_string();
+
             let mut count = 0;
             for sym in &symbols {
                 let node_id = format!("{}:{}:{}", repo_id_clone, rel_path_clone, sym.name);
-                tx_db.execute(
-                    "INSERT OR REPLACE INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    rusqlite::params![
-                        node_id,
-                        repo_id_clone,
-                        rel_path_clone,
-                        file_path_for_task.extension().and_then(|e| e.to_str()).unwrap_or(""),
-                        sym.name,
-                        sym.symbol_type,
-                        sym.raw_text
-                    ],
-                )?;
-
                 let new_hash = crate::db::hash_raw_text(&sym.raw_text);
+                if old_ids.contains(&node_id) {
+                    tx_db.execute(
+                        "UPDATE nodes SET language = ?1, symbol_name = ?2, symbol_type = ?3, raw_text = ?4 \
+                         WHERE id = ?5",
+                        rusqlite::params![
+                            lang_ext_store.as_str(),
+                            sym.name,
+                            sym.symbol_type,
+                            sym.raw_text,
+                            node_id
+                        ],
+                    )?;
+                } else {
+                    tx_db.execute(
+                        "INSERT OR REPLACE INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![
+                            node_id,
+                            repo_id_clone,
+                            rel_path_clone,
+                            lang_ext_store.as_str(),
+                            sym.name,
+                            sym.symbol_type,
+                            sym.raw_text
+                        ],
+                    )?;
+                }
+
                 crate::db::mark_stale_observations(
                     &tx_db,
                     &repo_id_clone,
@@ -246,10 +288,7 @@ async fn handle_file_change(
                 count += 1;
             }
 
-            let lang_ext = file_path_for_task
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let lang_ext = lang_ext_store.as_str();
 
             // Build CALLS edges: only load target ids for callee names used in this file.
             let mut callee_names = HashSet::new();
@@ -287,7 +326,7 @@ async fn handle_file_change(
             }
 
             tx_db.commit()?;
-            crate::ingestion::resolve_cross_repo_edges(&conn)?;
+            crate::ingestion::resolve_cross_repo_after_ingest(&conn, &repo_id_clone)?;
             return Ok(count);
         }
 
@@ -301,7 +340,7 @@ async fn handle_file_change(
                 )?;
             }
             tx_db.commit()?;
-            crate::ingestion::resolve_cross_repo_edges(&conn)?;
+            crate::ingestion::resolve_cross_repo_after_ingest(&conn, &repo_id_clone)?;
             return Ok(0);
         }
         Ok(0)

@@ -106,6 +106,9 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_nodes_repo ON nodes(repo_id);
         CREATE INDEX IF NOT EXISTS idx_nodes_symbol ON nodes(symbol_name);
+        -- MARROW-PERF-010: composite covers repo+file and repo+symbol hot paths (ingest + callee join).
+        CREATE INDEX IF NOT EXISTS idx_nodes_repo_file ON nodes(repo_id, file_path);
+        CREATE INDEX IF NOT EXISTS idx_nodes_repo_symbol ON nodes(repo_id, symbol_name);
         CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
         CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 
@@ -138,7 +141,17 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         );",
     )?;
     ensure_observations_repo_id(&conn)?;
+    ensure_performance_indexes(&conn)?;
     Ok(conn)
+}
+
+/// Adds indexes introduced after initial schema (idempotent).
+fn ensure_performance_indexes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_nodes_repo_file ON nodes(repo_id, file_path);
+         CREATE INDEX IF NOT EXISTS idx_nodes_repo_symbol ON nodes(repo_id, symbol_name);",
+    )?;
+    Ok(())
 }
 
 /// Runs a WAL checkpoint (truncating the WAL file) and an incremental
