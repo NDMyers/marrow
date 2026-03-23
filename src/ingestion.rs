@@ -898,23 +898,22 @@ where
 /// Scans node raw_text for import-like patterns and creates IMPORTS edges
 /// when the imported symbol exists in another repo's nodes.
 pub fn resolve_cross_repo_edges(conn: &Connection) -> Result<usize> {
-    // Load all nodes once
+    // Stream rows — never collect all `raw_text` into a Vec. A full-graph ingest can
+    // have hundreds of thousands of nodes; holding every body at once duplicates
+    // SQLite's page cache in Rust allocations and routinely exceeds tens of GB RSS.
     let mut stmt = conn.prepare("SELECT id, repo_id, raw_text, language FROM nodes")?;
-    let rows: Vec<(String, String, String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let mut rows = stmt.query([])?;
 
-    if rows.is_empty() {
-        return Ok(0);
-    }
-
-    // Pass 1 — collect all imports in memory
+    // Pass 1 — collect imports keyed by imported symbol name
     // import_name -> Vec<(source_id, source_repo_id)>
     let mut import_map: std::collections::HashMap<String, Vec<(String, String)>> =
         std::collections::HashMap::new();
-    for (source_id, source_repo, raw_text, lang) in &rows {
-        for name in extract_imports(raw_text, lang) {
+    while let Some(row) = rows.next()? {
+        let source_id: String = row.get(0)?;
+        let source_repo: String = row.get(1)?;
+        let raw_text: String = row.get(2)?;
+        let lang: String = row.get(3)?;
+        for name in extract_imports(&raw_text, &lang) {
             import_map
                 .entry(name)
                 .or_default()
