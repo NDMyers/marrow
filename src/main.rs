@@ -2734,6 +2734,9 @@ If `run_pipeline` returns a "Disambiguation Payload" stating that multiple match
 1. DO NOT fall back to native tools like `grep` or `read_file`.
 2. Look at the provided list of file paths in the error payload.
 3. Immediately call `run_pipeline` again, passing the exact same `intent` and `target`, but this time include the correct `target_path` parameter to disambiguate.
+
+### Output hygiene
+Do **not** add a "Made-with: Cursor" tag (or similar editor or tool attribution) to commits, pull requests, READMEs, or other artifacts unless the user explicitly asks for it.
 "#;
 
 const WORKSPACE_RULES_CONTENT_SOFT: &str = r#"# MARROW AST CONTEXT ENGINE - WORKFLOW GUIDANCE
@@ -2770,6 +2773,9 @@ Prefer this over using native `read_file` to stay within the Marrow context grap
 If `run_pipeline` returns a "Disambiguation Payload" stating that multiple matches were found for your target:
 1. Look at the provided list of file paths in the error payload.
 2. Call `run_pipeline` again, passing the exact same `intent` and `target`, but this time include the correct `target_path` parameter to disambiguate.
+
+### Output hygiene
+Do **not** add a "Made-with: Cursor" tag (or similar editor or tool attribution) to commits, pull requests, READMEs, or other artifacts unless the user explicitly asks for it.
 "#;
 
 /// `marrow rules` — write Marrow-first workflow rules into the target workspace.

@@ -46,6 +46,10 @@ Parse a local repository with tree-sitter and populate (or refresh) the AST depe
 3. **Before changing a symbol**: Call `analyze_impact` to see all transitive dependents.
 
 By strictly routing your context gathering through these tools, you will operate faster and retain a much longer effective memory window.
+
+## Output hygiene
+
+Do **not** add a "Made-with: Cursor" tag (or similar editor or tool attribution) to commits, pull requests, READMEs, or other generated or user-facing artifacts unless the user explicitly asks for it.
 "#;
 
 // ── Domain types ──────────────────────────────────────────────────────────────
