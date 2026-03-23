@@ -1,12 +1,15 @@
 use anyhow::{anyhow, Result};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
+use std::fs;
+use rayon::ThreadPoolBuilder;
 use rusqlite::Connection;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser, Query, QueryCursor};
 
@@ -16,6 +19,9 @@ pub struct Symbol {
     pub symbol_type: String,
     pub raw_text: String,
 }
+
+/// One indexed file’s parse output: rel path, language tag, symbols, content hash, mtime (ns).
+type ParsedFileBatchRow = (String, String, Vec<Symbol>, String, i64);
 
 /// Tree-sitter configuration for a supported language.
 struct LangConfig {
@@ -33,6 +39,30 @@ thread_local! {
     /// Avoids re-compiling call queries on every symbol during edge building.
     static CALL_PARSERS: RefCell<HashMap<String, (tree_sitter::Parser, tree_sitter::Query)>> =
         RefCell::new(HashMap::new());
+}
+
+/// Rayon worker count for ingestion (`read_to_string` + tree-sitter per file).
+/// Unbounded parallelism multiplies peak RSS (one full source buffer per worker).
+fn ingest_parse_thread_count() -> usize {
+    std::env::var("MARROW_INGEST_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 8))
+                .unwrap_or(4)
+        })
+}
+
+/// Max parsed files buffered between Rayon workers and the DB write phase.
+/// Bounded channel back-pressure limits peak RSS during large reindexes.
+fn ingest_parse_queue_capacity() -> usize {
+    std::env::var("MARROW_INGEST_PARSE_QUEUE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(64)
 }
 
 /// Return the tree-sitter `Language` for a file extension.
@@ -351,29 +381,72 @@ pub fn is_safe_to_parse(path: &Path) -> bool {
     true
 }
 
+/// Ignore globs from `.marrowrc.json` (same semantics as `marrow index` / TUI index).
+fn marrow_ignore_patterns(root: &Path) -> Vec<String> {
+    let path = root.join(".marrowrc.json");
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return default_marrow_ignore_patterns();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return default_marrow_ignore_patterns();
+    };
+    v.get("ignore")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn default_marrow_ignore_patterns() -> Vec<String> {
+    vec![
+        "node_modules".into(),
+        "target".into(),
+        "dist".into(),
+        ".git".into(),
+    ]
+}
+
+/// Configure a `WalkBuilder` like `marrow index` / `run_index_command` (marrowrc + .gitignore).
+fn walk_builder_for_repo(root: &Path) -> Result<WalkBuilder> {
+    let ignore_patterns = marrow_ignore_patterns(root);
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(false);
+    let mut overrides = ignore::overrides::OverrideBuilder::new(root);
+    for pat in &ignore_patterns {
+        overrides
+            .add(&format!("!{pat}/"))
+            .map_err(|e| anyhow!("marrowrc ignore override `{pat}`: {e}"))?;
+    }
+    builder.overrides(overrides.build()?);
+    builder.filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        !matches!(
+            name.as_ref(),
+            "node_modules" | ".git" | "target" | "dist" | "build" | "vendor"
+        )
+    });
+    Ok(builder)
+}
+
 /// Recursively collect all parseable source files under `root`, respecting
-/// `.gitignore` rules and the hardcoded security/noise filter.
+/// `.gitignore`, `.marrowrc.json` ignore rules, and the hardcoded security/noise filter.
 ///
 /// Uses `ignore::WalkParallel` with an mpsc channel to traverse the directory
 /// tree concurrently, avoiding the bottleneck of a single-threaded walk on
 /// large repositories.
-pub fn collect_source_files(root: &Path) -> Vec<PathBuf> {
+pub fn collect_source_files(root: &Path) -> Result<Vec<PathBuf>> {
     use ignore::WalkState;
 
     let (tx, rx) = mpsc::channel();
-
-    let walker = WalkBuilder::new(root)
-        .hidden(true)       // skip dotfiles / hidden directories
-        .git_ignore(true)   // respect .gitignore
-        .git_exclude(true)  // respect .git/info/exclude
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !matches!(
-                name.as_ref(),
-                "node_modules" | ".git" | "target" | "dist" | "build" | "vendor"
-            )
-        })
-        .build_parallel();
+    let wb = walk_builder_for_repo(root)?;
+    let walker = wb.build_parallel();
 
     walker.run(|| {
         let tx = tx.clone();
@@ -394,33 +467,23 @@ pub fn collect_source_files(root: &Path) -> Vec<PathBuf> {
         })
     });
 
-    // Drop the original sender so the receiver drains once all workers finish.
     drop(tx);
-
-    rx.into_iter().collect()
+    Ok(rx.into_iter().collect())
 }
 
-fn maybe_emit_progress<F>(progress: &F, last_reported: &AtomicU8, next_percent: u8)
+/// Updates progress only when `next_percent` exceeds the last value **and** invokes `progress`
+/// under a mutex so parallel rayon workers cannot emit callbacks out of order (e.g. 45 then 27).
+fn maybe_emit_progress<F>(progress: &F, last_reported: &Mutex<u8>, next_percent: u8)
 where
     F: Fn(u8) + Send + Sync,
 {
-    let next_percent = next_percent.min(100);
-    let mut previous = last_reported.load(Ordering::SeqCst);
-    while next_percent > previous {
-        match last_reported.compare_exchange(
-            previous,
-            next_percent,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => {
-                if last_reported.load(Ordering::SeqCst) == next_percent {
-                    progress(next_percent);
-                }
-                break;
-            }
-            Err(actual) => previous = actual,
-        }
+    let next = next_percent.min(100);
+    let Ok(mut prev) = last_reported.lock() else {
+        return;
+    };
+    if next > *prev {
+        *prev = next;
+        progress(next);
     }
 }
 
@@ -428,12 +491,99 @@ where
 /// Passed to the write phase so the DB lock is not held during file I/O
 /// or tree-sitter work.
 struct ComputedChangeset {
-    /// (rel_path, lang_ext, symbols, content_hash, mtime_ns)
-    parsed: Vec<(String, String, Vec<Symbol>, String, i64)>,
+    /// Serialized parsed rows (workers → bounded channel → drainer thread wrote here).
+    /// Removed after `write_changeset` finishes.
+    parsed_spill: PathBuf,
     /// Files whose mtime changed but content hash was identical (mtime-drift only).
     mtime_only: Vec<(String, i64)>,
     /// Relative paths of files that disappeared from disk since last index.
     removed_rels: Vec<String>,
+}
+
+fn write_u64_be(w: &mut impl Write, v: u64) -> std::io::Result<()> {
+    w.write_all(&v.to_be_bytes())
+}
+
+fn read_u64_be(r: &mut impl Read) -> std::io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_be_bytes(b))
+}
+
+fn write_utf8_blob(w: &mut impl Write, s: &str) -> std::io::Result<()> {
+    let b = s.as_bytes();
+    write_u64_be(w, b.len() as u64)?;
+    w.write_all(b)
+}
+
+/// Max bytes for a single length-prefixed UTF-8 blob in the ingest spill file (DoS guard).
+const MAX_INGEST_SPILL_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_utf8_blob(r: &mut impl Read) -> std::io::Result<String> {
+    read_utf8_blob_capped(r, MAX_INGEST_SPILL_BLOB_BYTES)
+}
+
+fn read_utf8_blob_capped(r: &mut impl Read, max_len: u64) -> std::io::Result<String> {
+    let len = read_u64_be(r)?;
+    if len > max_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("ingest spill blob length {len} exceeds cap {max_len}"),
+        ));
+    }
+    let len = len as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    String::from_utf8(buf).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("ingest spill: {e}"))
+    })
+}
+
+fn write_spill_parsed_row(w: &mut impl Write, row: &ParsedFileBatchRow) -> std::io::Result<()> {
+    let (path, lang, symbols, hash, mtime) = row;
+    write_utf8_blob(w, path)?;
+    write_utf8_blob(w, lang)?;
+    write_utf8_blob(w, hash)?;
+    w.write_all(&mtime.to_be_bytes())?;
+    write_u64_be(w, symbols.len() as u64)?;
+    for sym in symbols {
+        write_utf8_blob(w, &sym.name)?;
+        write_utf8_blob(w, &sym.symbol_type)?;
+        write_utf8_blob(w, &sym.raw_text)?;
+    }
+    Ok(())
+}
+
+/// `Ok(None)` on clean EOF before the next row; `Err` on corrupt/truncated spill.
+fn read_spill_parsed_row(r: &mut impl Read) -> Result<Option<ParsedFileBatchRow>> {
+    let path = match read_utf8_blob(r) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let lang = read_utf8_blob(r)?;
+    let hash = read_utf8_blob(r)?;
+    let mut mt = [0u8; 8];
+    r.read_exact(&mut mt)?;
+    let mtime = i64::from_be_bytes(mt);
+    let n = read_u64_be(r)? as usize;
+    const MAX_SYMBOLS_PER_SPILL_ROW: u64 = 1_000_000;
+    if n as u64 > MAX_SYMBOLS_PER_SPILL_ROW {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("ingest spill symbol count {n} exceeds cap {MAX_SYMBOLS_PER_SPILL_ROW}"),
+        )
+        .into());
+    }
+    let mut symbols = Vec::with_capacity(n);
+    for _ in 0..n {
+        symbols.push(Symbol {
+            name: read_utf8_blob(r)?,
+            symbol_type: read_utf8_blob(r)?,
+            raw_text: read_utf8_blob(r)?,
+        });
+    }
+    Ok(Some((path, lang, symbols, hash, mtime)))
 }
 
 // ── Phase A: brief DB read ────────────────────────────────────────────────────
@@ -463,18 +613,136 @@ fn load_known_files(
 
 // ── Phase B: pure CPU/IO — no DB connection held ──────────────────────────────
 
+/// Hash + parse candidate files in parallel. Separated so we can run it on a capped
+/// rayon pool without relying on `FnOnce` twice.
+fn parallel_hash_and_parse_candidates<F>(
+    candidates: &[(PathBuf, String, i64)],
+    known_files: &HashMap<String, (i64, String)>,
+    parsed_tx: SyncSender<ParsedFileBatchRow>,
+    progress: &F,
+    progress_state: &Mutex<u8>,
+) -> Result<Vec<(String, i64)>>
+where
+    F: Fn(u8) + Send + Sync,
+{
+    let candidate_total = candidates.len().max(1);
+    let changed: Vec<(String, PathBuf, i64, String)> = candidates
+        .par_iter()
+        .enumerate()
+        .filter_map(|(idx, (path, rel, mtime))| {
+            let bytes = std::fs::read(path).ok()?;
+            let new_hash = crate::db::hash_file_content(&bytes);
+            let percent = 10 + (((idx + 1) * 35) / candidate_total) as u8;
+            maybe_emit_progress(progress, progress_state, percent);
+            if let Some((_, known_hash)) = known_files.get(rel) {
+                if *known_hash == new_hash {
+                    return None;
+                }
+            }
+            Some((rel.clone(), path.clone(), *mtime, new_hash))
+        })
+        .collect();
+    maybe_emit_progress(progress, progress_state, 45);
+
+    let changed_rels: std::collections::HashSet<&str> =
+        changed.iter().map(|(r, _, _, _)| r.as_str()).collect();
+    let mtime_only: Vec<(String, i64)> = candidates
+        .iter()
+        .filter(|(_, rel, _)| !changed_rels.contains(rel.as_str()))
+        .map(|(_, rel, mtime)| (rel.clone(), *mtime))
+        .collect();
+
+    let changed_total = changed.len().max(1);
+    let parse_outcome = changed
+        .par_iter()
+        .enumerate()
+        .try_for_each(|(idx, (rel, path, mtime, hash))| -> Result<()> {
+            let tx = parsed_tx.clone();
+            let result = match parse_file(path) {
+                Ok((lang, symbols)) => Some((rel.clone(), lang, symbols, hash.clone(), *mtime)),
+                Err(e) => {
+                    eprintln!("Warning: skipping {}: {}", path.display(), e);
+                    None
+                }
+            };
+            let percent = 45 + (((idx + 1) * 35) / changed_total) as u8;
+            maybe_emit_progress(progress, progress_state, percent);
+            if let Some(row) = result {
+                tx.send(row).map_err(|_| {
+                    anyhow!("ingest parse queue closed before write phase (receiver dropped)")
+                })?;
+            }
+            Ok(())
+        });
+    drop(parsed_tx);
+    parse_outcome?;
+    maybe_emit_progress(progress, progress_state, 80);
+
+    Ok(mtime_only)
+}
+
+fn ingest_spill_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "marrow_ingest_spill_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ))
+}
+
+fn spill_file_create_private(path: &Path) -> Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(Into::into)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::File::create(path).map_err(Into::into)
+    }
+}
+
+fn spill_drainer_loop(
+    parsed_rx: mpsc::Receiver<ParsedFileBatchRow>,
+    spill_path: PathBuf,
+) -> Result<()> {
+    let f = spill_file_create_private(&spill_path)?;
+    let mut w = BufWriter::new(f);
+    let mut first_write_err: Option<anyhow::Error> = None;
+    while let Ok(row) = parsed_rx.recv() {
+        if first_write_err.is_none() {
+            if let Err(e) = write_spill_parsed_row(&mut w, &row) {
+                first_write_err = Some(anyhow::Error::from(e));
+            }
+        }
+    }
+    w.flush()?;
+    if let Some(e) = first_write_err {
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Walk the filesystem, hash changed files, and run tree-sitter in parallel.
 /// No database access — safe to run while the DB mutex is released.
 fn compute_changeset<F>(
     known_files: &HashMap<String, (i64, String)>,
     root_path: &Path,
     progress: &F,
-    progress_state: &AtomicU8,
-) -> ComputedChangeset
+    progress_state: &Mutex<u8>,
+) -> Result<ComputedChangeset>
 where
     F: Fn(u8) + Send + Sync,
 {
-    let disk_files = collect_source_files(root_path);
+    let disk_files = collect_source_files(root_path)?;
     maybe_emit_progress(progress, progress_state, 10);
 
     // Gather (abs_path, rel_path, mtime_ns) for every file on disk.
@@ -504,54 +772,55 @@ where
         .cloned()
         .collect();
 
-    // Read + hash candidates in parallel; keep only those whose content changed.
-    let candidate_total = candidates.len().max(1);
-    let changed: Vec<(String, PathBuf, i64, String)> = candidates
-        .par_iter()
-        .enumerate()
-        .filter_map(|(idx, (path, rel, mtime))| {
-            let bytes = std::fs::read(path).ok()?;
-            let new_hash = crate::db::hash_file_content(&bytes);
-            let percent = 10 + (((idx + 1) * 35) / candidate_total) as u8;
-            maybe_emit_progress(progress, progress_state, percent);
-            if let Some((_, known_hash)) = known_files.get(rel) {
-                if *known_hash == new_hash {
-                    return None; // content identical — mtime drift only
-                }
+    let ingest_threads = ingest_parse_thread_count();
+    let queue_cap = ingest_parse_queue_capacity();
+    let (parsed_tx, parsed_rx) = mpsc::sync_channel::<ParsedFileBatchRow>(queue_cap);
+    let spill_path = ingest_spill_path();
+    let spill_path_for_drainer = spill_path.clone();
+    let drainer = std::thread::spawn(move || spill_drainer_loop(parsed_rx, spill_path_for_drainer));
+
+    // Ensure `parsed_tx` is always dropped (closing the channel) even if Rayon panics,
+    // so `spill_drainer_loop` cannot block forever in `recv`.
+    let parse_caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match ThreadPoolBuilder::new()
+            .num_threads(ingest_threads)
+            .build()
+        {
+            Ok(pool) => pool.install(|| {
+                parallel_hash_and_parse_candidates(
+                    &candidates,
+                    known_files,
+                    parsed_tx,
+                    progress,
+                    progress_state,
+                )
+            }),
+            Err(e) => {
+                eprintln!(
+                    "[marrow] ingest thread pool build failed ({e}); using default rayon pool"
+                );
+                parallel_hash_and_parse_candidates(
+                    &candidates,
+                    known_files,
+                    parsed_tx,
+                    progress,
+                    progress_state,
+                )
             }
-            Some((rel.clone(), path.clone(), *mtime, new_hash))
-        })
-        .collect();
-    maybe_emit_progress(progress, progress_state, 45);
+        }
+    }));
 
-    // mtime-only files: candidates that didn't make it into `changed`
-    let changed_rels: std::collections::HashSet<&str> =
-        changed.iter().map(|(r, _, _, _)| r.as_str()).collect();
-    let mtime_only: Vec<(String, i64)> = candidates
-        .iter()
-        .filter(|(_, rel, _)| !changed_rels.contains(rel.as_str()))
-        .map(|(_, rel, mtime)| (rel.clone(), *mtime))
-        .collect();
+    let parse_res = match parse_caught {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("ingest parse phase panicked")),
+    };
 
-    // Parse changed files in parallel with tree-sitter
-    let changed_total = changed.len().max(1);
-    let parsed: Vec<(String, String, Vec<Symbol>, String, i64)> = changed
-        .par_iter()
-        .enumerate()
-        .filter_map(|(idx, (rel, path, mtime, hash))| {
-            let result = match parse_file(path) {
-                Ok((lang, symbols)) => Some((rel.clone(), lang, symbols, hash.clone(), *mtime)),
-                Err(e) => {
-                    eprintln!("Warning: skipping {}: {}", path.display(), e);
-                    None
-                }
-            };
-            let percent = 45 + (((idx + 1) * 35) / changed_total) as u8;
-            maybe_emit_progress(progress, progress_state, percent);
-            result
-        })
-        .collect();
-    maybe_emit_progress(progress, progress_state, 80);
+    let drain_res = drainer.join().map_err(|_| anyhow!("ingest spill drainer panicked"))?;
+    if parse_res.is_err() || drain_res.is_err() {
+        let _ = fs::remove_file(&spill_path);
+    }
+    drain_res?;
+    let mtime_only = parse_res?;
 
     // Detect files removed from disk
     let disk_rels: std::collections::HashSet<&str> =
@@ -562,7 +831,11 @@ where
         .cloned()
         .collect();
 
-    ComputedChangeset { parsed, mtime_only, removed_rels }
+    Ok(ComputedChangeset {
+        parsed_spill: spill_path,
+        mtime_only,
+        removed_rels,
+    })
 }
 
 // ── Phase C: brief DB write ───────────────────────────────────────────────────
@@ -579,7 +852,7 @@ fn write_changeset<F>(
     repo_id: &str,
     changeset: ComputedChangeset,
     progress: &F,
-    progress_state: &AtomicU8,
+    progress_state: &Mutex<u8>,
 ) -> Result<(usize, usize)>
 where
     F: Fn(u8) + Send + Sync,
@@ -612,9 +885,9 @@ where
         }
     }
 
+    let spill_path = changeset.parsed_spill.clone();
     let result = write_changeset_body(conn, repo_id, changeset, progress, progress_state);
-
-    match result {
+    let out = match result {
         Ok(counts) => {
             conn.execute_batch("COMMIT")?;
             Ok(counts)
@@ -623,7 +896,9 @@ where
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)
         }
-    }
+    };
+    let _ = fs::remove_file(&spill_path);
+    out
 }
 
 fn write_changeset_body<F>(
@@ -631,12 +906,16 @@ fn write_changeset_body<F>(
     repo_id: &str,
     changeset: ComputedChangeset,
     progress: &F,
-    progress_state: &AtomicU8,
+    progress_state: &Mutex<u8>,
 ) -> Result<(usize, usize)>
 where
     F: Fn(u8) + Send + Sync,
 {
-    let ComputedChangeset { parsed, mtime_only, removed_rels } = changeset;
+    let ComputedChangeset {
+        parsed_spill,
+        mtime_only,
+        removed_rels,
+    } = changeset;
 
     // Remove nodes + file records for deleted files
     for file_path in &removed_rels {
@@ -670,8 +949,14 @@ where
         )?;
     }
 
-    // Remove old nodes+edges for changed files (will be replaced below)
-    for (file_path, _, _, _, _) in &parsed {
+    // Apply each parsed file from the spill file (bounded channel + drainer limited parse-phase RSS).
+    let mut changed_paths: HashSet<String> = HashSet::new();
+    let spill_file = fs::File::open(&parsed_spill)?;
+    let mut spill_reader = BufReader::new(spill_file);
+    while let Some((file_path, lang, symbols, hash, mtime)) =
+        read_spill_parsed_row(&mut spill_reader)?
+    {
+        changed_paths.insert(file_path.clone());
         conn.execute(
             "DELETE FROM edges WHERE source_id IN (
                 SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)
@@ -683,13 +968,8 @@ where
             "DELETE FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
             rusqlite::params![repo_id, file_path],
         )?;
-    }
 
-    // Insert fresh nodes for changed files.
-    // Use prepare_cached so SQLite compiles the query plan once and reuses it
-    // for every row, avoiding per-row re-compilation overhead.
-    for (file_path, lang, symbols, hash, mtime) in &parsed {
-        for sym in symbols {
+        for sym in &symbols {
             let node_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
             conn.prepare_cached(
                 "INSERT OR REPLACE INTO nodes \
@@ -697,11 +977,16 @@ where
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?
             .execute(rusqlite::params![
-                node_id, repo_id, file_path, lang,
-                sym.name, sym.symbol_type, sym.raw_text
+                node_id,
+                repo_id,
+                file_path,
+                lang,
+                sym.name,
+                sym.symbol_type,
+                sym.raw_text
             ])?;
             let new_hash = crate::db::hash_raw_text(&sym.raw_text);
-            crate::db::mark_stale_observations(conn, repo_id, &sym.name, file_path, &new_hash)?;
+            crate::db::mark_stale_observations(conn, repo_id, &sym.name, &file_path, &new_hash)?;
         }
         conn.execute(
             "INSERT OR REPLACE INTO files (repo_id, file_path, mtime_secs, content_hash)
@@ -719,32 +1004,47 @@ where
     }
     maybe_emit_progress(progress, progress_state, 90);
 
-    // Build CALLS edges for changed files
+    // Resolve callee names using the full node map for this repo (same as prior in-memory merge + DB).
     let mut name_to_ids: HashMap<String, Vec<String>> = HashMap::new();
-    for (file_path, _, symbols, _, _) in &parsed {
-        for sym in symbols {
-            let node_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
-            name_to_ids.entry(sym.name.clone()).or_default().push(node_id);
-        }
-    }
-    // Also pull in existing unchanged nodes for cross-file call resolution
-    {
-        let mut stmt = conn.prepare(
-            "SELECT symbol_name, id FROM nodes WHERE repo_id = ?1",
-        )?;
-        stmt.query_map(rusqlite::params![repo_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .filter_map(|r| r.ok())
-        .for_each(|(name, id)| {
-            name_to_ids.entry(name).or_default().push(id);
-        });
-    }
+    let mut stmt = conn.prepare("SELECT symbol_name, id FROM nodes WHERE repo_id = ?1")?;
+    stmt.query_map(rusqlite::params![repo_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?
+    .filter_map(|r| r.ok())
+    .for_each(|(name, id)| {
+        name_to_ids.entry(name).or_default().push(id);
+    });
 
     let mut calls_edge_count = 0usize;
-    for (file_path, lang, symbols, _, _) in &parsed {
-        for sym in symbols {
-            let callees = extract_calls_from_symbol(&sym.raw_text, lang);
+    for file_path in &changed_paths {
+        let mut sym_stmt = conn.prepare(
+            "SELECT language, symbol_name, symbol_type, raw_text FROM nodes \
+             WHERE repo_id = ?1 AND file_path = ?2",
+        )?;
+        let mut lang_for_file: Option<String> = None;
+        let mut symbols: Vec<Symbol> = Vec::new();
+        let rows = sym_stmt.query_map(rusqlite::params![repo_id, file_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (lang, name, symbol_type, raw_text) = row?;
+            lang_for_file.get_or_insert(lang);
+            symbols.push(Symbol {
+                name,
+                symbol_type,
+                raw_text,
+            });
+        }
+        let Some(lang) = lang_for_file else {
+            continue;
+        };
+        for sym in &symbols {
+            let callees = extract_calls_from_symbol(&sym.raw_text, &lang);
             let source_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
             for callee_name in &callees {
                 if callee_name == &sym.name {
@@ -783,6 +1083,7 @@ fn ingest_repo_with_progress<F>(
     repo_id: &str,
     root_path: &Path,
     progress: &F,
+    progress_state: &Mutex<u8>,
 ) -> Result<(usize, usize)>
 where
     F: Fn(u8) + Send + Sync,
@@ -795,12 +1096,11 @@ where
         return Err(anyhow!("The specified root_path does not exist: {}", root_path.display()));
     }
 
-    let progress_state = AtomicU8::new(0);
-    maybe_emit_progress(progress, &progress_state, 5);
+    maybe_emit_progress(progress, progress_state, 5);
 
     let known_files = load_known_files(conn, repo_id, &root_path)?;
-    let changeset = compute_changeset(&known_files, &root_path, progress, &progress_state);
-    write_changeset(conn, repo_id, changeset, progress, &progress_state)
+    let changeset = compute_changeset(&known_files, &root_path, progress, progress_state)?;
+    write_changeset(conn, repo_id, changeset, progress, progress_state)
 }
 
 /// Ingest an entire repository incrementally: only re-parse files whose
@@ -808,7 +1108,8 @@ where
 /// is a full pass. Returns `(total_symbol_count, calls_edge_count)`.
 #[allow(dead_code)] // retained for tests and direct/manual ingestion entry points
 pub fn ingest_repo(conn: &Connection, repo_id: &str, root_path: &Path) -> Result<(usize, usize)> {
-    ingest_repo_with_progress(conn, repo_id, root_path, &|_| {})
+    let progress_state = Mutex::new(0u8);
+    ingest_repo_with_progress(conn, repo_id, root_path, &|_| {}, &progress_state)
 }
 
 /// Combined ingestion pipeline: parse all files in `root_path` under `repo_id`,
@@ -832,11 +1133,13 @@ pub fn run_ingestion_with_progress<F>(
 where
     F: Fn(u8) + Send + Sync,
 {
-    let (symbols, calls_edges) = ingest_repo_with_progress(conn, repo_id, root_path, &progress)?;
-    maybe_emit_progress(&progress, &AtomicU8::new(95), 95);
+    let progress_state = Mutex::new(0u8);
+    let (symbols, calls_edges) =
+        ingest_repo_with_progress(conn, repo_id, root_path, &progress, &progress_state)?;
+    maybe_emit_progress(&progress, &progress_state, 95);
     let import_edges = resolve_cross_repo_edges(conn)?;
-    maybe_emit_progress(&progress, &AtomicU8::new(95), 100);
-    crate::db::vacuum_and_checkpoint(conn)?;
+    maybe_emit_progress(&progress, &progress_state, 100);
+    crate::db::post_ingest_maintenance(conn)?;
     Ok((symbols, calls_edges + import_edges))
 }
 
@@ -863,7 +1166,7 @@ where
         return Err(anyhow!("The specified root_path does not exist: {}", root_path.display()));
     }
 
-    let progress_state = AtomicU8::new(0);
+    let progress_state = Mutex::new(0u8);
 
     // Phase A: brief DB read — lock acquired, then immediately released.
     let known_files = {
@@ -873,7 +1176,7 @@ where
     };
 
     // Phase B: pure CPU/IO — DB mutex is NOT held.
-    let changeset = compute_changeset(&known_files, &root_path, &progress, &progress_state);
+    let changeset = compute_changeset(&known_files, &root_path, &progress, &progress_state)?;
 
     // Phase C: brief DB write — lock acquired, then released.
     let (total, calls_edges) = {
@@ -886,7 +1189,7 @@ where
         let conn = db.lock().map_err(|_| anyhow!("DB mutex poisoned"))?;
         maybe_emit_progress(&progress, &progress_state, 95);
         let edges = resolve_cross_repo_edges(&conn)?;
-        crate::db::vacuum_and_checkpoint(&conn)?;
+        crate::db::post_ingest_maintenance(&conn)?;
         maybe_emit_progress(&progress, &progress_state, 100);
         edges
     };
@@ -1052,6 +1355,7 @@ fn extract_imports(raw_text: &str, lang: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn test_call_query_parses_all_languages() {
@@ -1417,6 +1721,81 @@ function foo() {
             updates.windows(2).all(|window| window[0] <= window[1]),
             "progress should be monotonic: {updates:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serialize env mutation for `MARROW_INGEST_PARSE_QUEUE` (process-global).
+    static INGEST_QUEUE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn graph_fingerprint_calls(conn: &Connection, repo_id: &str) -> (Vec<String>, Vec<String>) {
+        let mut stmt = conn
+            .prepare("SELECT id FROM nodes WHERE repo_id = ?1 ORDER BY id")
+            .unwrap();
+        let node_ids: Vec<String> = stmt
+            .query_map(rusqlite::params![repo_id], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut estmt = conn
+            .prepare(
+                "SELECT e.source_id, e.target_id FROM edges e \
+                 JOIN nodes n ON n.id = e.source_id \
+                 WHERE e.relationship_type = 'CALLS' AND n.repo_id = ?1 \
+                 ORDER BY e.source_id, e.target_id",
+            )
+            .unwrap();
+        let edge_keys: Vec<String> = estmt
+            .query_map(rusqlite::params![repo_id], |row| {
+                Ok(format!(
+                    "{}->{}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?
+                ))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        (node_ids, edge_keys)
+    }
+
+    #[test]
+    fn test_ingest_multiple_files_parse_queue_k_equivalence() {
+        let _guard = INGEST_QUEUE_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("marrow_test_parse_queue_k_equiv");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def a_fn():\n    pass\n").unwrap();
+        std::fs::write(dir.join("b.py"), "def b_fn():\n    c_fn()\n").unwrap();
+        std::fs::write(dir.join("c.py"), "def c_fn():\n    a_fn()\n").unwrap();
+
+        let root_str = dir.to_string_lossy().to_string();
+
+        std::env::set_var("MARROW_INGEST_PARSE_QUEUE", "1");
+        let conn_low = crate::db::init_db(":memory:").unwrap();
+        conn_low
+            .execute(
+                "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+                rusqlite::params!["test", root_str.as_str()],
+            )
+            .unwrap();
+        run_ingestion(&conn_low, "test", &dir).unwrap();
+        let fp_low = graph_fingerprint_calls(&conn_low, "test");
+
+        std::env::set_var("MARROW_INGEST_PARSE_QUEUE", "64");
+        let conn_high = crate::db::init_db(":memory:").unwrap();
+        conn_high
+            .execute(
+                "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+                rusqlite::params!["test", root_str.as_str()],
+            )
+            .unwrap();
+        run_ingestion(&conn_high, "test", &dir).unwrap();
+        let fp_high = graph_fingerprint_calls(&conn_high, "test");
+
+        std::env::remove_var("MARROW_INGEST_PARSE_QUEUE");
+
+        assert_eq!(fp_low, fp_high, "CALLS graph should match for queue K=1 vs K=64");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -7,7 +7,7 @@ use std::io::Write;
 #[test]
 #[ignore = "requires running daemon; run manually with `cargo test -- --ignored`"]
 fn mcp_proxy_forwards_initialize() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rust-ast-context-engine"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_marrow"))
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -46,7 +46,7 @@ jobs:
         with:
           # (optional) Comma-separated list of binary names (non-extension portion of filename) to build and upload.
           # Note that glob pattern is not supported yet.
-          bin: rust-ast-context-engine # Make sure this matches your Cargo.toml package name!
+          bin: marrow # Must match Cargo.toml [package] name / default binary name
           # rename the binary in the tarball to 'marrow'
           archive: marrow-${{ matrix.target }}
           target: ${{ matrix.target }}

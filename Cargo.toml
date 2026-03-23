@@ -1,5 +1,5 @@
 [package]
-name = "rust-ast-context-engine"
+name = "marrow"
 version = "0.1.0"
 edition = "2021"
 
@@ -62,6 +62,9 @@ futures-util    = "0.3"
 # Background file watching for live graph updates
 notify              = "7"
 notify-debouncer-mini = "0.5"
+
+# `getrusage` for perf-harness RSS hint (MARROW-PERF-002)
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

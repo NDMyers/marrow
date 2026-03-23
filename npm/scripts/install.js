@@ -86,17 +86,18 @@ async function main() {
   await tar.extract({
     file: archivePath,
     cwd: DIST_DIR,
-    // The release action uploads it as rust-ast-context-engine or rust-ast-context-engine.exe
-    filter: (filePath) => path.basename(filePath).startsWith("rust-ast-context-engine"),
+    // Release archives ship the binary as marrow / marrow.exe (see .github/workflows/release.yml)
+    filter: (filePath) => path.basename(filePath).startsWith("marrow"),
   });
 
   fs.unlinkSync(archivePath);
 
-  const extractedBinaryName = process.platform === "win32" ? "rust-ast-context-engine.exe" : "rust-ast-context-engine";
+  const extractedBinaryName =
+    process.platform === "win32" ? "marrow.exe" : "marrow";
   const extractedPath = path.join(DIST_DIR, extractedBinaryName);
   const binaryPath = path.join(DIST_DIR, BINARY_NAME);
 
-  if (fs.existsSync(extractedPath)) {
+  if (fs.existsSync(extractedPath) && extractedPath !== binaryPath) {
     fs.renameSync(extractedPath, binaryPath);
   }
 
