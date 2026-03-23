@@ -46,14 +46,14 @@ _After **002**: **004**, **005**, **006**, and **014** can run in parallel (keep
 - [x] MARROW-PERF-014 — Capsule & MCP payload caps audit *(env-capped outbound/inbound/impact; see `docs/mcp-payload-limits.md`)*
 - [x] MARROW-PERF-007 — Spec: incremental / streaming ingest *(Peter `Task`; bounded queue + spill + single txn)*
 - [x] MARROW-PERF-008 — Implement incremental / streaming ingest MVP *(Linus `Task`; Cobalt follow-up: panic `catch_unwind` + spill read caps + `0600` spill on Unix; Ralph `cargo test` ALL_PASS)*
-- [ ] MARROW-PERF-009 — Narrow `name_to_ids` / `CALLS` rebuild scope
+- [x] MARROW-PERF-009 — Narrow `name_to_ids` / `CALLS` rebuild scope
 - [ ] MARROW-PERF-010 — SQLite indexes & batch insert tuning
 - [ ] MARROW-PERF-011 — Incremental edge rebuild
 - [ ] MARROW-PERF-012 — Cross-repo pass: opt-in or scoping
 - [ ] MARROW-PERF-013 — Spike spec: optional worker process (Phase C)
 - [ ] MARROW-PERF-015 — CI / regression gate for perf & RSS
 
-**Last updated:** 2026-03-23 (M2: **007–008** — `MARROW_INGEST_PARSE_QUEUE`, spill + drainer; sub-agents: Peter → Linus → Cobalt → Ralph)
+**Last updated:** 2026-03-23 (M2: **007–009** — bounded ingest queue + spill; narrow `name_to_ids` via temp-table join + `test_partial_reingest_resolves_calls_to_unchanged_file`)
 
 Agents and maintainers should update the checkboxes above when merging story PRs (use `[~]` on the active branch if helpful).
 

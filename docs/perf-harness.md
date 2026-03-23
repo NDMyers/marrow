@@ -47,6 +47,14 @@ Fields emitted with `--json`:
 
 Record the stress repo’s `git rev-parse HEAD` in [`perf-baseline-runbook.md`](./perf-baseline-runbook.md). CI may omit the full Accrualify tree; use a smaller generated fixture or gate the job behind a label.
 
+## MARROW-PERF-009 — `name_to_ids` scope (CALLS targets)
+
+**Before:** After applying node updates, CALLS resolution loaded every `(symbol_name, id)` in the repo into a `HashMap`, then inserted edges only for symbols in changed files.
+
+**After:** Collect callee names referenced from **changed files only**, then join `nodes` against a temp table of those names (`build_name_to_ids_for_symbol_names` in `ingestion.rs`). Unchanged files are not scanned for the map. The watcher uses the same helper for single-file reindexes.
+
+Re-run `perf-harness` on Accrualify-scale fixtures to measure ingest/rebuild phase deltas vs the baseline row in [`perf-baseline-runbook.md`](./perf-baseline-runbook.md).
+
 ## See also
 
 - [Performance baseline runbook](./perf-baseline-runbook.md)

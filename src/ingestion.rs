@@ -840,6 +840,94 @@ where
 
 // ── Phase C: brief DB write ───────────────────────────────────────────────────
 
+/// Map `symbol_name -> node id` for a bounded set of names (MARROW-PERF-009).
+///
+/// Uses a temp table + join so we avoid scanning every row in `nodes` and stay
+/// within SQLite’s bound-parameter limits for large callee sets.
+pub(crate) fn build_name_to_ids_for_symbol_names(
+    conn: &Connection,
+    repo_id: &str,
+    names: &HashSet<String>,
+) -> Result<HashMap<String, Vec<String>>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    if names.is_empty() {
+        return Ok(map);
+    }
+
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS _marrow_callee_lookup;
+         CREATE TEMP TABLE _marrow_callee_lookup (name TEXT NOT NULL PRIMARY KEY);",
+    )?;
+
+    {
+        let mut ins =
+            conn.prepare("INSERT OR IGNORE INTO _marrow_callee_lookup(name) VALUES (?1)")?;
+        for n in names {
+            ins.execute(rusqlite::params![n.as_str()])?;
+        }
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT n.symbol_name, n.id FROM nodes n
+         INNER JOIN _marrow_callee_lookup c ON n.symbol_name = c.name
+         WHERE n.repo_id = ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![repo_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for r in rows {
+        let (name, id) = r?;
+        map.entry(name).or_default().push(id);
+    }
+
+    Ok(map)
+}
+
+/// Callee names referenced from symbols in `file_paths` (excluding self-calls).
+fn callee_names_referenced_in_files(
+    conn: &Connection,
+    repo_id: &str,
+    file_paths: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    let mut callee_names = HashSet::new();
+    for file_path in file_paths {
+        let mut sym_stmt = conn.prepare(
+            "SELECT language, symbol_name, symbol_type, raw_text FROM nodes \
+             WHERE repo_id = ?1 AND file_path = ?2",
+        )?;
+        let mut lang_for_file: Option<String> = None;
+        let mut symbols: Vec<Symbol> = Vec::new();
+        let rows = sym_stmt.query_map(rusqlite::params![repo_id, file_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (lang, name, symbol_type, raw_text) = row?;
+            lang_for_file.get_or_insert(lang);
+            symbols.push(Symbol {
+                name,
+                symbol_type,
+                raw_text,
+            });
+        }
+        let Some(lang) = lang_for_file else {
+            continue;
+        };
+        for sym in &symbols {
+            for callee_name in extract_calls_from_symbol(&sym.raw_text, &lang) {
+                if callee_name != sym.name {
+                    callee_names.insert(callee_name);
+                }
+            }
+        }
+    }
+    Ok(callee_names)
+}
+
 /// Commit the computed changeset in a single transaction.
 /// Returns (total_symbol_count, calls_edge_count).
 ///
@@ -1004,16 +1092,13 @@ where
     }
     maybe_emit_progress(progress, progress_state, 90);
 
-    // Resolve callee names using the full node map for this repo (same as prior in-memory merge + DB).
-    let mut name_to_ids: HashMap<String, Vec<String>> = HashMap::new();
-    let mut stmt = conn.prepare("SELECT symbol_name, id FROM nodes WHERE repo_id = ?1")?;
-    stmt.query_map(rusqlite::params![repo_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?
-    .filter_map(|r| r.ok())
-    .for_each(|(name, id)| {
-        name_to_ids.entry(name).or_default().push(id);
-    });
+    // Resolve callee targets only for names referenced from changed files (MARROW-PERF-009).
+    let callee_names = if changed_paths.is_empty() {
+        HashSet::new()
+    } else {
+        callee_names_referenced_in_files(conn, repo_id, &changed_paths)?
+    };
+    let name_to_ids = build_name_to_ids_for_symbol_names(conn, repo_id, &callee_names)?;
 
     let mut calls_edge_count = 0usize;
     for file_path in &changed_paths {
@@ -1439,6 +1524,48 @@ function foo() {
             |row| row.get(0),
         ).unwrap();
         assert!(edge_count >= 1, "no CALLS edges in DB");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MARROW-PERF-009: only changed files are re-parsed; callee may live in an unchanged file.
+    #[test]
+    fn test_partial_reingest_resolves_calls_to_unchanged_file() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_partial_calls");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("other.py"), "def helper():\n    pass\n").unwrap();
+        std::fs::write(dir.join("caller.py"), "def main():\n    helper()\n").unwrap();
+
+        let (_syms, calls) = ingest_repo(&conn, repo_id, &dir).unwrap();
+        assert!(calls >= 1, "initial ingest should create CALLS to helper");
+
+        // Only caller.py changes; other.py stays out of the changeset.
+        std::fs::write(dir.join("caller.py"), "def main():\n    helper()\n# touch\n").unwrap();
+
+        let (_syms, calls2) = ingest_repo(&conn, repo_id, &dir).unwrap();
+        assert!(
+            calls2 >= 1,
+            "narrow name_to_ids must still resolve helper in unchanged file; got calls={calls2}"
+        );
+
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE relationship_type = 'CALLS'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(edge_count >= 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
