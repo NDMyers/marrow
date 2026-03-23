@@ -682,13 +682,17 @@ where
 }
 
 fn ingest_spill_path() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "marrow_ingest_spill_{}_{}",
+        "marrow_ingest_spill_{}_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        seq
     ))
 }
 
@@ -883,6 +887,63 @@ pub(crate) fn build_name_to_ids_for_symbol_names(
     Ok(map)
 }
 
+/// Node ids currently stored for `file_path` in `repo_id`.
+fn collect_node_ids_for_file(
+    conn: &Connection,
+    repo_id: &str,
+    file_path: &str,
+) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![repo_id, file_path], |row| row.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Remove edges that referenced symbols removed from a file (MARROW-PERF-011).
+pub(crate) fn delete_edges_touching_removed_ids(conn: &Connection, removed_ids: &[String]) -> Result<()> {
+    if removed_ids.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare("DELETE FROM edges WHERE source_id = ?1 OR target_id = ?1")?;
+    for id in removed_ids {
+        stmt.execute(rusqlite::params![id])?;
+    }
+    Ok(())
+}
+
+/// Batched `CALLS` inserts (MARROW-PERF-010).
+fn flush_calls_edge_batch(conn: &Connection, pairs: &[(String, String)]) -> Result<usize> {
+    const CHUNK: usize = 48;
+    if pairs.is_empty() {
+        return Ok(0);
+    }
+    let mut inserted = 0usize;
+    for chunk in pairs.chunks(CHUNK) {
+        let values_sql = chunk
+            .iter()
+            .map(|_| "(?, ?, 'CALLS')")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT OR IGNORE INTO edges (source_id, target_id, relationship_type) VALUES {values_sql}"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<rusqlite::types::Value> = chunk
+            .iter()
+            .flat_map(|(s, t)| {
+                [
+                    rusqlite::types::Value::Text(s.clone()),
+                    rusqlite::types::Value::Text(t.clone()),
+                ]
+            })
+            .collect();
+        let n = stmt.execute(rusqlite::params_from_iter(params.iter()))?;
+        inserted += n;
+    }
+    Ok(inserted)
+}
+
 /// Callee names referenced from symbols in `file_paths` (excluding self-calls).
 fn callee_names_referenced_in_files(
     conn: &Connection,
@@ -1045,35 +1106,57 @@ where
         read_spill_parsed_row(&mut spill_reader)?
     {
         changed_paths.insert(file_path.clone());
+        let old_ids = collect_node_ids_for_file(conn, repo_id, &file_path)?;
+        // Outgoing CALLS from this file must be rebuilt; drop edges whose *source* is here.
+        // Inbound CALLS targeting stable node ids are kept (MARROW-PERF-011).
         conn.execute(
             "DELETE FROM edges WHERE source_id IN (
-                SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)
-             OR target_id IN (
                 SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)",
             rusqlite::params![repo_id, file_path],
         )?;
-        conn.execute(
-            "DELETE FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
-            rusqlite::params![repo_id, file_path],
-        )?;
 
+        let new_ids: HashSet<String> = symbols
+            .iter()
+            .map(|s| format!("{}:{}:{}", repo_id, file_path, s.name))
+            .collect();
+        let removed: Vec<String> = old_ids.difference(&new_ids).cloned().collect();
+        delete_edges_touching_removed_ids(conn, &removed)?;
+        for id in &removed {
+            conn.execute("DELETE FROM nodes WHERE id = ?1", rusqlite::params![id])?;
+        }
+
+        // Upsert in-place so stable `id` rows survive (FK-safe inbound edges from other files).
         for sym in &symbols {
             let node_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
-            conn.prepare_cached(
-                "INSERT OR REPLACE INTO nodes \
-                 (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )?
-            .execute(rusqlite::params![
-                node_id,
-                repo_id,
-                file_path,
-                lang,
-                sym.name,
-                sym.symbol_type,
-                sym.raw_text
-            ])?;
             let new_hash = crate::db::hash_raw_text(&sym.raw_text);
+            if old_ids.contains(&node_id) {
+                conn.execute(
+                    "UPDATE nodes SET language = ?1, symbol_name = ?2, symbol_type = ?3, raw_text = ?4 \
+                     WHERE id = ?5",
+                    rusqlite::params![
+                        lang,
+                        sym.name,
+                        sym.symbol_type,
+                        sym.raw_text,
+                        node_id
+                    ],
+                )?;
+            } else {
+                conn.prepare_cached(
+                    "INSERT OR REPLACE INTO nodes \
+                     (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?
+                .execute(rusqlite::params![
+                    node_id,
+                    repo_id,
+                    file_path,
+                    lang,
+                    sym.name,
+                    sym.symbol_type,
+                    sym.raw_text
+                ])?;
+            }
             crate::db::mark_stale_observations(conn, repo_id, &sym.name, &file_path, &new_hash)?;
         }
         conn.execute(
@@ -1128,6 +1211,7 @@ where
         let Some(lang) = lang_for_file else {
             continue;
         };
+        let mut calls_batch: Vec<(String, String)> = Vec::new();
         for sym in &symbols {
             let callees = extract_calls_from_symbol(&sym.raw_text, &lang);
             let source_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
@@ -1137,17 +1221,13 @@ where
                 }
                 if let Some(target_ids) = name_to_ids.get(callee_name.as_str()) {
                     for target_id in target_ids {
-                        conn.prepare_cached(
-                            "INSERT OR IGNORE INTO edges \
-                             (source_id, target_id, relationship_type) \
-                             VALUES (?1, ?2, 'CALLS')",
-                        )?
-                        .execute(rusqlite::params![source_id, target_id])?;
-                        calls_edge_count += 1;
+                        calls_batch.push((source_id.clone(), target_id.clone()));
                     }
                 }
             }
         }
+        calls_edge_count += calls_batch.len();
+        flush_calls_edge_batch(conn, &calls_batch)?;
     }
 
     maybe_emit_progress(progress, progress_state, 95);
@@ -1222,7 +1302,7 @@ where
     let (symbols, calls_edges) =
         ingest_repo_with_progress(conn, repo_id, root_path, &progress, &progress_state)?;
     maybe_emit_progress(&progress, &progress_state, 95);
-    let import_edges = resolve_cross_repo_edges(conn)?;
+    let import_edges = resolve_cross_repo_after_ingest(conn, repo_id)?;
     maybe_emit_progress(&progress, &progress_state, 100);
     crate::db::post_ingest_maintenance(conn)?;
     Ok((symbols, calls_edges + import_edges))
@@ -1273,7 +1353,7 @@ where
     let import_edges = {
         let conn = db.lock().map_err(|_| anyhow!("DB mutex poisoned"))?;
         maybe_emit_progress(&progress, &progress_state, 95);
-        let edges = resolve_cross_repo_edges(&conn)?;
+        let edges = resolve_cross_repo_after_ingest(&conn, repo_id)?;
         crate::db::post_ingest_maintenance(&conn)?;
         maybe_emit_progress(&progress, &progress_state, 100);
         edges
@@ -1282,15 +1362,50 @@ where
     Ok((total, calls_edges + import_edges))
 }
 
+/// When set to `1`/`true`/`yes`, `resolve_cross_repo_after_ingest` scans **all** repos as
+/// import sources (legacy behavior). Default (unset): only the repo just ingested is
+/// scanned (MARROW-PERF-012).
+fn wants_full_cross_repo_import_scan() -> bool {
+    matches!(
+        std::env::var("MARROW_CROSS_REPO_FULL_SCAN")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// Run the cross-repo IMPORTS pass after indexing `repo_id`, respecting
+/// `MARROW_CROSS_REPO_FULL_SCAN`.
+pub fn resolve_cross_repo_after_ingest(conn: &Connection, repo_id: &str) -> Result<usize> {
+    if wants_full_cross_repo_import_scan() {
+        resolve_cross_repo_edges(conn, None)
+    } else {
+        resolve_cross_repo_edges(conn, Some(repo_id))
+    }
+}
+
 /// Secondary pass: resolve cross-repo import edges.
-/// Scans node raw_text for import-like patterns and creates IMPORTS edges
-/// when the imported symbol exists in another repo's nodes.
-pub fn resolve_cross_repo_edges(conn: &Connection) -> Result<usize> {
+///
+/// `source_repo_scope`: when `Some(rid)`, only nodes with `repo_id = rid` are scanned for
+/// import statements (typical after `run_ingestion`). When `None`, every node is scanned
+/// (tests / explicit full rebuild via `MARROW_CROSS_REPO_FULL_SCAN`).
+pub fn resolve_cross_repo_edges(
+    conn: &Connection,
+    source_repo_scope: Option<&str>,
+) -> Result<usize> {
     // Stream rows — never collect all `raw_text` into a Vec. A full-graph ingest can
     // have hundreds of thousands of nodes; holding every body at once duplicates
     // SQLite's page cache in Rust allocations and routinely exceeds tens of GB RSS.
-    let mut stmt = conn.prepare("SELECT id, repo_id, raw_text, language FROM nodes")?;
-    let mut rows = stmt.query([])?;
+    let sql = match source_repo_scope {
+        Some(_) => "SELECT id, repo_id, raw_text, language FROM nodes WHERE repo_id = ?1",
+        None => "SELECT id, repo_id, raw_text, language FROM nodes",
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = match source_repo_scope {
+        Some(rid) => stmt.query(rusqlite::params![rid])?,
+        None => stmt.query([])?,
+    };
 
     // Pass 1 — collect imports keyed by imported symbol name
     // import_name -> Vec<(source_id, source_repo_id)>
@@ -1570,6 +1685,61 @@ function foo() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// MARROW-PERF-011: callee file reindexed alone; caller file unchanged — inbound CALLS kept.
+    #[test]
+    fn test_reingest_only_lib_preserves_calls_from_unchanged_caller() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_lib_reingest_calls");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("lib.py"), "def helper():\n    pass\n").unwrap();
+        std::fs::write(dir.join("caller.py"), "def main():\n    helper()\n").unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let cross: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes src ON src.id = e.source_id \
+                 JOIN nodes tgt ON tgt.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND src.file_path = 'caller.py' AND tgt.file_path = 'lib.py'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cross >= 1, "expected CALLS from caller.py into lib.py");
+
+        std::fs::write(dir.join("lib.py"), "def helper():\n    pass\n# touch\n").unwrap();
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let cross2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes src ON src.id = e.source_id \
+                 JOIN nodes tgt ON tgt.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND src.file_path = 'caller.py' AND tgt.file_path = 'lib.py'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            cross2 >= 1,
+            "inbound CALLS into lib.py should survive lib-only reindex; got {cross2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_reingest_clears_stale_calls_edges() {
         let conn = crate::db::init_db(":memory:").unwrap();
@@ -1785,8 +1955,47 @@ function foo() {
         )
         .unwrap();
 
-        let edges = resolve_cross_repo_edges(&conn).unwrap();
+        let edges = resolve_cross_repo_edges(&conn, None).unwrap();
         assert_eq!(edges, 0, "ambiguous cross-repo imports should be skipped");
+    }
+
+    /// MARROW-PERF-012: scoped pass sees the same unambiguous IMPORTS as a full scan when only
+    /// `repo_a` carries the import source.
+    #[test]
+    fn test_resolve_cross_repo_edges_scoped_matches_full_for_unambiguous_pair() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2), (?3, ?4)",
+            rusqlite::params!["repo_a", "/tmp/repo_a", "repo_b", "/tmp/repo_b"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7),
+                    (?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                "repo_a:main.py:main",
+                "repo_a",
+                "main.py",
+                "py",
+                "main",
+                "function",
+                "from shared_vendor import UniqueWidget\n",
+                "repo_b:widget.py:UniqueWidget",
+                "repo_b",
+                "widget.py",
+                "py",
+                "UniqueWidget",
+                "class",
+                "class UniqueWidget: pass\n"
+            ],
+        )
+        .unwrap();
+
+        let full = resolve_cross_repo_edges(&conn, None).unwrap();
+        let scoped = resolve_cross_repo_edges(&conn, Some("repo_a")).unwrap();
+        assert_eq!(full, scoped);
+        assert_eq!(full, 1, "expected one unambiguous IMPORTS edge");
     }
 
     #[test]

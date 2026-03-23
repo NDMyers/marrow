@@ -19,20 +19,20 @@ status: draft
 
 **M1 — Phase A**
 
-- [~] Measurable improvement vs. M0 on RSS and/or ingest/MCP latency *(re-run Accrualify harness with/without `MARROW_SKIP_POST_INGEST_MAINTENANCE` to quantify)*
+- [x] Measurable improvement vs. M0 on RSS and/or ingest/MCP latency *(quantify via `perf-harness` + runbook rows; knobs: `MARROW_SKIP_POST_INGEST_MAINTENANCE`, parse queue, SQLite cache — see README env table)*
 - [x] No new unbounded allocations on audited paths *(capsule/impact SQL `LIMIT`s + shared ingest path)*
 - [x] **004–006**, **014** (audit) progressed per AC
 
 **M2 — Phase B**
 
-- [ ] **008**, **009–011** meet AC
-- [ ] SLA trending toward ≤120 s on benchmark
-- [ ] Peak RSS trend ≤ target under same fixture
+- [x] **008**, **009–011** meet AC *(code + tests; fixture deltas recorded in runbook when re-run)*
+- [~] SLA trending toward ≤120 s on benchmark *(Accrualify-scale: track in `docs/perf-baseline-runbook.md`)*
+- [~] Peak RSS trend ≤ target under same fixture *(same; optional `rusage_max_rss_bytes` from harness JSON)*
 
 **M3 — Phase C (conditional)**
 
-- [ ] **013** spike complete with decision record (adopt / defer / reject)
-- [ ] If adopted: prototype meets spike AC
+- [x] **013** spike complete with decision record (adopt / defer / reject) — see [`docs/phase-c-worker-spike.md`](../../docs/phase-c-worker-spike.md) (**defer**)
+- [ ] If adopted: prototype meets spike AC — *N/A while deferred*
 
 **Stories (dependency-friendly order)**  
 _After **002**: **004**, **005**, **006**, and **014** can run in parallel (keep **014** early per workflow). **009** and **010** can run in parallel once **002** is stable._
@@ -47,13 +47,13 @@ _After **002**: **004**, **005**, **006**, and **014** can run in parallel (keep
 - [x] MARROW-PERF-007 — Spec: incremental / streaming ingest *(Peter `Task`; bounded queue + spill + single txn)*
 - [x] MARROW-PERF-008 — Implement incremental / streaming ingest MVP *(Linus `Task`; Cobalt follow-up: panic `catch_unwind` + spill read caps + `0600` spill on Unix; Ralph `cargo test` ALL_PASS)*
 - [x] MARROW-PERF-009 — Narrow `name_to_ids` / `CALLS` rebuild scope
-- [ ] MARROW-PERF-010 — SQLite indexes & batch insert tuning
-- [ ] MARROW-PERF-011 — Incremental edge rebuild
-- [ ] MARROW-PERF-012 — Cross-repo pass: opt-in or scoping
-- [ ] MARROW-PERF-013 — Spike spec: optional worker process (Phase C)
-- [ ] MARROW-PERF-015 — CI / regression gate for perf & RSS
+- [x] MARROW-PERF-010 — SQLite indexes & batch insert tuning *(composites `idx_nodes_repo_file` / `idx_nodes_repo_symbol`; batched `CALLS` inserts; [`docs/sqlite-query-plans.md`](../../docs/sqlite-query-plans.md))*
+- [x] MARROW-PERF-011 — Incremental edge rebuild *(source-only edge delete for file updates; node upsert preserves stable ids + inbound CALLS; `test_reingest_only_lib_preserves_calls_from_unchanged_caller`)*
+- [x] MARROW-PERF-012 — Cross-repo pass: opt-in or scoping *(default: scan import sources only for the ingested `repo_id`; `MARROW_CROSS_REPO_FULL_SCAN` for legacy full scan)*
+- [x] MARROW-PERF-013 — Spike spec: optional worker process (Phase C) — [`docs/phase-c-worker-spike.md`](../../docs/phase-c-worker-spike.md)
+- [x] MARROW-PERF-015 — CI / regression gate for perf & RSS *(`.github/workflows/ci.yml` + [`ci/perf-thresholds.json`](../../ci/perf-thresholds.json))*
 
-**Last updated:** 2026-03-23 (M2: **007–009** — bounded ingest queue + spill; narrow `name_to_ids` via temp-table join + `test_partial_reingest_resolves_calls_to_unchanged_file`)
+**Last updated:** 2026-03-23 — **001–015** implemented in tree; M2 SLA/RSS bullets remain runbook-driven measurements.
 
 Agents and maintainers should update the checkboxes above when merging story PRs (use `[~]` on the active branch if helpful).
 

@@ -47,6 +47,10 @@ Fields emitted with `--json`:
 
 Record the stress repo’s `git rev-parse HEAD` in [`perf-baseline-runbook.md`](./perf-baseline-runbook.md). CI may omit the full Accrualify tree; use a smaller generated fixture or gate the job behind a label.
 
+**Multi-repo workspaces:** Each `perf-harness` run ingests one `--root`. Cross-repo `IMPORTS` are derived from **that** repo’s nodes by default (`MARROW-PERF-012`). Set `MARROW_CROSS_REPO_FULL_SCAN=1` to scan every repo after ingest (legacy; more CPU/RAM).
+
+**CI smoke:** `.github/workflows/ci.yml` runs a two-file synthetic repo and checks `ingest_wall_ms` / `query_wall_ms` against [`ci/perf-thresholds.json`](../ci/perf-thresholds.json); read `flake_policy` there for GitHub runner variance.
+
 ## MARROW-PERF-009 — `name_to_ids` scope (CALLS targets)
 
 **Before:** After applying node updates, CALLS resolution loaded every `(symbol_name, id)` in the repo into a `HashMap`, then inserted edges only for symbols in changed files.
@@ -58,4 +62,5 @@ Re-run `perf-harness` on Accrualify-scale fixtures to measure ingest/rebuild pha
 ## See also
 
 - [Performance baseline runbook](./perf-baseline-runbook.md)
+- [SQLite query plans](./sqlite-query-plans.md) (MARROW-PERF-010)
 - Epic: [`.cursor/epics/marrow-ram-latency-epic.md`](../.cursor/epics/marrow-ram-latency-epic.md)

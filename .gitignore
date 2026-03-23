@@ -1,4 +1,6 @@
 /target
+.cargo-target/
+.DS_Store
 .worktrees/
 .context_engine/
 Cargo.lock
