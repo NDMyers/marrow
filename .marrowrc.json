@@ -1,8 +1,11 @@
 {
+  "auto_open_ui": true,
+  "enforcement_mode": "strict",
   "ignore": [
     "node_modules",
     "target",
     "dist",
     ".git"
-  ]
+  ],
+  "show_dashboard": true
 }

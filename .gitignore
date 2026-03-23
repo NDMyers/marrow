@@ -1,12 +1,19 @@
 /target
+.worktrees/
 .context_engine/
 Cargo.lock
 CLAUDE.md
+GEMINI.md
 TASK.md
 TASK2.md
+TASK3.md
+TASK4.md
+TASK5.md
+marrow-prd.md
 docs/plans/
 .claude/
 .marrow/
+.agents/
 
 # npm
 node_modules/

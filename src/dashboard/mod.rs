@@ -194,9 +194,9 @@ async fn sse_handler(
 
 #[derive(Serialize)]
 struct StatsResponse {
-    session:    SessionSnapshot,
-    lifetime:   LifetimeSnapshot,
-    db_size_mb: f64,
+    session:  SessionSnapshot,
+    lifetime: LifetimeSnapshot,
+    database: DatabaseSnapshot,
 }
 
 #[derive(Serialize)]
@@ -221,6 +221,24 @@ struct LifetimeSnapshot {
     ambiguous_symbol_requests:    i64,
     stale_capsule_prevented:      i64,
     pipeline_compliance_pct:      f64,
+}
+
+#[derive(Serialize)]
+struct DatabaseSnapshot {
+    path:         String,
+    size_mb:      f64,
+    repo_count:   i64,
+    symbol_count: i64,
+    file_count:   i64,
+    repos:        Vec<IndexedRepoSnapshot>,
+}
+
+#[derive(Serialize)]
+struct IndexedRepoSnapshot {
+    repo_id:      String,
+    root_path:    String,
+    symbol_count: i64,
+    file_count:   i64,
 }
 
 async fn stats_handler(State(state): State<AppState>) -> axum::response::Response {
@@ -277,15 +295,53 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
         }
     };
 
-    let db_size_mb = {
-        let db_path = std::env::var("MARROW_DB_PATH")
-            .unwrap_or_else(|_| ".marrow/graph.db".to_string());
-        std::fs::metadata(&db_path)
+    let database = {
+        let conn = match state.db.lock() {
+            Ok(g)  => g,
+            Err(_) => return axum::Json(serde_json::json!({"error": "lock poisoned"})).into_response(),
+        };
+        let db_path = match crate::db::connected_database_path(&conn) {
+            Ok(path) => path,
+            Err(e) => {
+                return axum::Json(serde_json::json!({
+                    "error": format!("Could not determine attached database path: {e}")
+                }))
+                .into_response()
+            }
+        };
+        let size_mb = std::fs::metadata(&db_path)
             .map(|m| m.len() as f64 / 1_048_576.0)
-            .unwrap_or(0.0)
+            .unwrap_or(0.0);
+        let scope = match crate::db::database_scope_snapshot(&conn) {
+            Ok(scope) => scope,
+            Err(e) => {
+                return axum::Json(serde_json::json!({
+                    "error": format!("Could not inspect attached database: {e}")
+                }))
+                .into_response()
+            }
+        };
+
+        DatabaseSnapshot {
+            path: db_path,
+            size_mb,
+            repo_count: scope.repo_count,
+            symbol_count: scope.symbol_count,
+            file_count: scope.file_count,
+            repos: scope
+                .repos
+                .into_iter()
+                .map(|repo| IndexedRepoSnapshot {
+                    repo_id: repo.repo_id,
+                    root_path: repo.root_path,
+                    symbol_count: repo.symbol_count,
+                    file_count: repo.file_count,
+                })
+                .collect(),
+        }
     };
 
-    axum::Json(StatsResponse { session, lifetime, db_size_mb }).into_response()
+    axum::Json(StatsResponse { session, lifetime, database }).into_response()
 }
 
 // ── Compare handler ───────────────────────────────────────────────────────────
@@ -358,7 +414,7 @@ async fn compare_handler(
                 Ok(g)  => g,
                 Err(_) => return axum::Json(serde_json::json!({"error": "DB mutex poisoned"})).into_response(),
             };
-            match crate::retrieval::get_context_capsule(&conn, &symbol, &repo) {
+            match crate::retrieval::get_context_capsule(&conn, &symbol, &repo, None) {
                 Ok(result) => {
                     // Both lengths use the same len()/4 heuristic so the delta
                     // modal matches the telemetry emitted by the MCP tool.
