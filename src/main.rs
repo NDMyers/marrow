@@ -47,6 +47,33 @@ fn trace_enabled() -> bool {
 
 /// Emit a `[MARROW TRACE]` line to stderr **iff** `MARROW_TRACE` is set.
 /// Uses macro syntax so the format string is zero-cost when tracing is off.
+/// Best-effort high-water RSS from `getrusage` (Darwin: bytes; Linux: KiB → bytes).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rusage_max_rss_bytes() -> Option<u64> {
+    use std::mem;
+    let mut usage: libc::rusage = unsafe { mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return None;
+    }
+    let v = usage.ru_maxrss;
+    if v == 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(v as u64 * 1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(v as u64)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rusage_max_rss_bytes() -> Option<u64> {
+    None
+}
+
 macro_rules! trace {
     ($($arg:tt)*) => {
         if crate::trace_enabled() {
@@ -1311,6 +1338,14 @@ impl ServerHandler for ContextEngine {
                             .ok();
                         }
                         writeln!(out, "\n{} node(s) affected.", result.affected.len()).ok();
+                        if result.truncated {
+                            writeln!(
+                                out,
+                                "\n[Note: impact list truncated at MARROW_IMPACT_MAX_ROWS ({}); raise for more rows.]",
+                                retrieval::impact_max_rows()
+                            )
+                            .ok();
+                        }
                     }
 
                     let event = DashboardEvent::ImpactAnalyzed {
@@ -1901,6 +1936,14 @@ impl ServerHandler for ContextEngine {
                                         typ = n.symbol_type, repo = n.repo_id, file = n.file_path).ok();
                                 }
                                 writeln!(out, "\n{} node(s) affected.", result.affected.len()).ok();
+                                if result.truncated {
+                                    writeln!(
+                                        out,
+                                        "\n[Note: impact list truncated at MARROW_IMPACT_MAX_ROWS ({}); raise for more rows.]",
+                                        retrieval::impact_max_rows()
+                                    )
+                                    .ok();
+                                }
                             }
 
                             let event = DashboardEvent::ImpactAnalyzed {
@@ -3548,126 +3591,209 @@ fn cmd_validate() -> Result<()> {
     Ok(())
 }
 
-/// `marrow index` — walk the current directory, parse ASTs, and populate
-/// `.marrow/graph.db` inside a single SQLite transaction.
+/// `marrow perf-harness` — MARROW-PERF-002: ingest via `run_ingestion`, then time capsule + impact.
+fn cmd_perf_harness(cli_args: &[String]) -> Result<()> {
+    if cli_args
+        .first()
+        .map(|s| s.as_str())
+        .is_some_and(|s| s == "--help" || s == "-h")
+    {
+        eprintln!(
+            "\
+Usage: marrow perf-harness [options]
+
+Options:
+  --root <path>     Repo root to ingest (default: current directory)
+  --repo-id <id>    Graph repo id (default: basename of --root)
+  --db <path>       SQLite file (default: .marrow/perf-graph.db)
+  --symbol <name>   Symbol for query phase (default: first symbol in graph)
+  --fresh           Delete db and SQLite sidecars before ingest
+  --json            Emit one JSON object on stdout; progress on stderr
+  -h, --help        This message
+
+See docs/perf-harness.md and docs/perf-baseline-runbook.md.
+"
+        );
+        return Ok(());
+    }
+
+    let mut root = std::env::current_dir()?;
+    let mut repo_id: Option<String> = None;
+    let mut db_path = ".marrow/perf-graph.db".to_string();
+    let mut symbol_override: Option<String> = None;
+    let mut fresh = false;
+    let mut json_mode = false;
+
+    let mut i = 0usize;
+    while i < cli_args.len() {
+        match cli_args[i].as_str() {
+            "--root" => {
+                let v = cli_args
+                    .get(i + 1)
+                    .context("perf-harness: --root requires a path")?;
+                root = PathBuf::from(v);
+                i += 2;
+            }
+            "--repo-id" => {
+                let v = cli_args
+                    .get(i + 1)
+                    .context("perf-harness: --repo-id requires a value")?;
+                repo_id = Some(v.clone());
+                i += 2;
+            }
+            "--db" => {
+                let v = cli_args
+                    .get(i + 1)
+                    .context("perf-harness: --db requires a path")?;
+                db_path = v.clone();
+                i += 2;
+            }
+            "--symbol" => {
+                let v = cli_args
+                    .get(i + 1)
+                    .context("perf-harness: --symbol requires a value")?;
+                symbol_override = Some(v.clone());
+                i += 2;
+            }
+            "--fresh" => {
+                fresh = true;
+                i += 1;
+            }
+            "--json" => {
+                json_mode = true;
+                i += 1;
+            }
+            other => {
+                anyhow::bail!("perf-harness: unknown argument `{other}` (try --help)");
+            }
+        }
+    }
+
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("perf-harness: cannot canonicalize {}", root.display()))?;
+
+    let rid = repo_id.unwrap_or_else(|| {
+        root.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unnamed")
+            .to_string()
+    });
+
+    if fresh {
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(format!("{db_path}-wal"));
+        let _ = fs::remove_file(format!("{db_path}-shm"));
+    }
+
+    if let Some(parent) = Path::new(&db_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    eprintln!(
+        "[perf-harness] repo_id={rid} root={} db={db_path}",
+        root.display()
+    );
+
+    let t_ingest = Instant::now();
+    let conn = db::init_db_or_memory(&db_path)?;
+    let (symbols, edges) = ingestion::run_ingestion(&conn, &rid, &root)?;
+    let ingest_wall_ms = t_ingest.elapsed().as_millis() as u64;
+
+    let query_symbol = if let Some(s) = symbol_override {
+        s
+    } else {
+        conn.query_row(
+            "SELECT symbol_name FROM nodes WHERE repo_id = ?1 LIMIT 1",
+            [&rid],
+            |row| row.get::<_, String>(0),
+        )
+        .context(
+            "perf-harness: no symbols in graph (empty repo or ingest produced no nodes); pass --symbol after a known ingest",
+        )?
+    };
+
+    let t_query = Instant::now();
+    let _capsule = retrieval::get_context_capsule(&conn, &query_symbol, &rid, None)?;
+    let _impact = retrieval::analyze_impact(&conn, &query_symbol, &rid, None)?;
+    let query_wall_ms = t_query.elapsed().as_millis() as u64;
+
+    let db_file_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let rss = rusage_max_rss_bytes();
+
+    let git_head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string());
+
+    let git_dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| !o.stdout.is_empty());
+
+    let payload = serde_json::json!({
+        "schema_version": 1u32,
+        "repo_id": rid,
+        "root": root.display().to_string(),
+        "db_path": db_path,
+        "ingest_wall_ms": ingest_wall_ms,
+        "query_wall_ms": query_wall_ms,
+        "symbols": symbols,
+        "edges": edges,
+        "query_symbol": query_symbol,
+        "db_file_bytes": db_file_bytes,
+        "rusage_max_rss_bytes": rss,
+        "marrow_version": env!("CARGO_PKG_VERSION"),
+        "marrow_git_sha": git_head,
+        "marrow_git_dirty": git_dirty,
+    });
+
+    if json_mode {
+        println!("{}", serde_json::to_string(&payload)?);
+    } else {
+        eprintln!(
+            "[perf-harness] ingest: {} ms | query: {} ms | symbols: {} | edges: {} | db_bytes: {} | ru_maxrss: {:?}",
+            ingest_wall_ms,
+            query_wall_ms,
+            symbols,
+            edges,
+            db_file_bytes,
+            rss
+        );
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    }
+
+    Ok(())
+}
+
+/// `marrow index` — same pipeline as MCP `ingest_repo` (`ingestion::run_ingestion`).
 fn cmd_index() -> Result<()> {
     let t0 = Instant::now();
-
-    // ── Resolve repo_id from current directory name ──────────────────
     let cwd = std::env::current_dir()?;
-    let repo_id = cwd
+    let root = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| cwd.clone());
+    let repo_id = root
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unnamed")
         .to_string();
 
-    // ── Load ignore patterns from .marrowrc.json (or use defaults) ───
-    let ignore_patterns: Vec<String> = if let Ok(raw) = fs::read_to_string(".marrowrc.json") {
-        let v: serde_json::Value = serde_json::from_str(&raw)?;
-        v.get("ignore")
-            .and_then(|a| a.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        vec![
-            "node_modules".into(),
-            "target".into(),
-            "dist".into(),
-            ".git".into(),
-        ]
-    };
-
-    // ── Build walker using the `ignore` crate ────────────────────────
-    let mut builder = ignore::WalkBuilder::new(&cwd);
-    builder
-        .hidden(true)          // skip hidden files/dirs
-        .git_ignore(true)      // respect .gitignore
-        .git_global(false)
-        .git_exclude(false);
-
-    // Apply custom overrides from .marrowrc.json
-    let mut overrides = ignore::overrides::OverrideBuilder::new(&cwd);
-    for pat in &ignore_patterns {
-        overrides.add(&format!("!{pat}/"))?;
-    }
-    builder.overrides(overrides.build()?);
-
-    let supported_exts = ["cpp", "cc", "cxx", "h", "hpp", "py", "ts", "tsx", "rs", "rb"];
-
-    let files: Vec<PathBuf> = builder
-        .build()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|ext| supported_exts.contains(&ext))
-        })
-        .map(|entry| entry.into_path())
-        .collect();
-
+    let file_count = ingestion::collect_source_files(&root)?.len();
     eprintln!("Repo:  {repo_id}");
-    eprintln!("Root:  {}", cwd.display());
-    eprintln!("Files: {}", files.len());
+    eprintln!("Root:  {}", root.display());
+    eprintln!("Files: {file_count} (discovered)");
 
-    // ── Parse all files in parallel with rayon ───────────────────────
-    use rayon::prelude::*;
-
-    let parsed: Vec<_> = files
-        .par_iter()
-        .filter_map(|path| {
-            let rel = path
-                .strip_prefix(&cwd)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
-            match ingestion::parse_file(path) {
-                Ok((lang, symbols)) => Some((rel, lang, symbols)),
-                Err(e) => {
-                    eprintln!("  skip: {} ({})", path.display(), e);
-                    None
-                }
-            }
-        })
-        .collect();
-
-    // ── Initialize DB and insert inside a single transaction ─────────
     let db_path = ".marrow/graph.db";
     let conn = db::init_db_or_memory(db_path)?;
-
-    conn.execute(
-        "INSERT OR REPLACE INTO repositories (id, root_path) VALUES (?1, ?2)",
-        rusqlite::params![repo_id, cwd.to_string_lossy().as_ref()],
-    )?;
-
-    let tx = conn.unchecked_transaction()?;
-    let mut symbol_count: usize = 0;
-
-    for (file_path, lang, symbols) in &parsed {
-        for sym in symbols {
-            let node_id = format!("{repo_id}:{file_path}:{}", sym.name);
-            tx.execute(
-                "INSERT OR REPLACE INTO nodes \
-                 (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    node_id, repo_id, file_path, lang,
-                    sym.name, sym.symbol_type, sym.raw_text
-                ],
-            )?;
-            symbol_count += 1;
-        }
-    }
-    tx.commit()?;
-
-    // ── Cross-repo edge resolution ───────────────────────────────────
-    let edge_count = ingestion::resolve_cross_repo_edges(&conn)?;
+    let (symbol_count, edge_count) = ingestion::run_ingestion(&conn, &repo_id, &root)?;
 
     let elapsed = t0.elapsed();
     eprintln!("\n── Index complete ──────────────────────────────────────────");
@@ -3785,165 +3911,68 @@ pub fn run_integrate_command(workspace_root: &Path) -> Result<()> {
 }
 
 /// Parse all source files in `workspace_root` and build the AST graph in SQLite.
-/// Displays a real-time `indicatif` progress bar while files are parsed in parallel.
+/// Uses `ingestion::run_ingestion_with_progress` (same as MCP ingest).
 pub fn run_index_command(workspace_root: &Path) -> Result<()> {
     use console::style;
     use indicatif::{ProgressBar, ProgressStyle};
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     let t0 = Instant::now();
-
-    let repo_id = workspace_root
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let repo_id = root
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unnamed")
         .to_string();
 
-    // Load ignore patterns from .marrowrc.json or use defaults.
-    let ignore_patterns: Vec<String> = if let Ok(raw) = fs::read_to_string(workspace_root.join(".marrowrc.json")) {
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-        v.get("ignore")
-            .and_then(|a| a.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default()
-    } else {
-        vec!["node_modules".into(), "target".into(), "dist".into(), ".git".into()]
-    };
-
-    let mut builder = ignore::WalkBuilder::new(workspace_root);
-    builder.hidden(true).git_ignore(true).git_global(false).git_exclude(false);
-    let mut overrides = ignore::overrides::OverrideBuilder::new(workspace_root);
-    for pat in &ignore_patterns {
-        overrides.add(&format!("!{pat}/"))?;
-    }
-    builder.overrides(overrides.build()?);
-    builder.filter_entry(|e| {
-        let name = e.file_name().to_string_lossy();
-        !matches!(
-            name.as_ref(),
-            "node_modules" | ".git" | "target" | "dist" | "build" | "vendor"
-        )
-    });
-
-    let discovery_spinner = ProgressBar::new_spinner();
-    discovery_spinner.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap()
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+    let file_count = ingestion::collect_source_files(&root)?.len();
+    eprintln!(
+        "{}",
+        style(format!("[Marrow] Indexing {repo_id} — {file_count} files")).cyan()
     );
-    discovery_spinner.set_message("Discovering files and evaluating .gitignore rules...");
-    discovery_spinner.enable_steady_tick(Duration::from_millis(100));
-
-    let supported_exts = ["cpp", "cc", "cxx", "h", "hpp", "py", "ts", "tsx", "rs", "rb"];
-    let files: Vec<PathBuf> = builder
-        .build()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
-        .filter(|e| {
-            e.path().extension().and_then(|x| x.to_str()).is_some_and(|x| supported_exts.contains(&x))
-        })
-        .map(|e| e.into_path())
-        .collect();
-
-    discovery_spinner.finish_and_clear();
-    eprintln!("{}", style(format!("[Marrow] Indexing {} — {} files", repo_id, files.len())).cyan());
-
-    let pb = ProgressBar::new(files.len() as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "[{elapsed_precise}] {spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-        )
-        .unwrap()
-        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
-        .progress_chars("=>-"),
-    );
-    pb.enable_steady_tick(Duration::from_millis(100));
-
-    let completed = Arc::new(AtomicUsize::new(0));
-    let pb_ref = &pb;
-
-    let parsed: Vec<_> = files
-        .par_iter()
-        .filter_map(|path| {
-            let rel = path.strip_prefix(workspace_root).unwrap_or(path).to_string_lossy().to_string();
-            pb_ref.inc(1);
-            completed.fetch_add(1, Ordering::Relaxed);
-            match ingestion::parse_file(path) {
-                Ok((lang, symbols)) => Some((rel, lang, symbols)),
-                Err(_) => None,
-            }
-        })
-        .collect();
-
-    pb.finish_with_message("parsing complete");
 
     let db_dir = workspace_root.join(".marrow");
     fs::create_dir_all(&db_dir)?;
     let db_path = db_dir.join("graph.db");
     let conn = db::init_db_or_memory(&db_path.to_string_lossy())?;
 
-    conn.execute(
-        "INSERT OR REPLACE INTO repositories (id, root_path) VALUES (?1, ?2)",
-        rusqlite::params![repo_id, workspace_root.to_string_lossy().as_ref()],
-    )?;
-
-    // Flatten parsed symbols into rows for chunked insertion
-    let mut all_rows: Vec<(String, String, String, String, String, String, String)> = Vec::new();
-    for (file_path, lang, symbols) in &parsed {
-        for sym in symbols {
-            let node_id = format!("{repo_id}:{file_path}:{}", sym.name);
-            all_rows.push((
-                node_id,
-                repo_id.clone(),
-                file_path.clone(),
-                lang.clone(),
-                sym.name.clone(),
-                sym.symbol_type.clone(),
-                sym.raw_text.clone(),
-            ));
-        }
-    }
-
-    let insert_pb = ProgressBar::new(all_rows.len() as u64);
-    insert_pb.set_style(
+    let pb = ProgressBar::new(100);
+    pb.set_style(
         ProgressStyle::with_template(
-            "[{elapsed_precise}] {spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+            "[{elapsed_precise}] {spinner:.green} [{bar:40.cyan/blue}] {pos}/100 {msg}",
         )
         .unwrap()
         .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
         .progress_chars("=>-"),
     );
-    insert_pb.set_message("Inserting AST Nodes");
-    insert_pb.enable_steady_tick(Duration::from_millis(100));
+    pb.set_message("indexing");
+    pb.enable_steady_tick(Duration::from_millis(120));
 
-    let chunk_size = 5000;
-    let mut symbol_count: usize = 0;
-    for chunk in all_rows.chunks(chunk_size) {
-        // Force an immediate write lock to prevent SQLITE_BUSY upgrade deadlocks.
-        conn.execute("BEGIN IMMEDIATE", [])?;
-        for (node_id, r_id, file_path, lang, name, sym_type, raw_text) in chunk {
-            conn.execute(
-                "INSERT OR REPLACE INTO nodes \
-                 (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![node_id, r_id, file_path, lang, name, sym_type, raw_text],
-            )?;
-            symbol_count += 1;
-        }
-        conn.execute("COMMIT", [])?;
-        insert_pb.inc(chunk.len() as u64);
-    }
-    insert_pb.finish_with_message("insertion complete");
+    let (symbol_count, edge_count) = ingestion::run_ingestion_with_progress(
+        &conn,
+        &repo_id,
+        &root,
+        |pct| {
+            pb.set_position(pct as u64);
+        },
+    )?;
 
-    let edge_count = ingestion::resolve_cross_repo_edges(&conn)?;
+    pb.finish_with_message("indexing complete");
     let elapsed = t0.elapsed();
 
-    eprintln!("{}", style(format!(
-        "[Marrow] Index complete — {} symbols, {} edges in {:.2?}",
-        fmt_num(symbol_count), fmt_num(edge_count), elapsed
-    )).green().bold());
+    eprintln!(
+        "{}",
+        style(format!(
+            "[Marrow] Index complete — {} symbols, {} edges in {:.2?}",
+            fmt_num(symbol_count),
+            fmt_num(edge_count),
+            elapsed
+        ))
+        .green()
+        .bold()
+    );
 
     Ok(())
 }
@@ -4150,6 +4179,18 @@ async fn main() -> Result<()> {
         Some("rules")     => return cmd_rules(),
         Some("index")     => return cmd_index(),
         Some("test-capsules") => return cmd_test_capsules(),
+        Some("perf-harness") => {
+            let rest: Vec<String> = args.iter().skip(2).cloned().collect();
+            return cmd_perf_harness(&rest);
+        }
+        Some("maintenance") => {
+            let db_path = std::env::var("MARROW_DB_PATH")
+                .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+            let conn = db::init_db_or_memory(&db_path)?;
+            db::run_graph_maintenance(&conn)?;
+            println!("[marrow] maintenance complete (WAL checkpoint + incremental_vacuum) on {db_path}");
+            return Ok(());
+        }
         Some("integrate") => return cmd_integrate(),
         Some("validate")  => return cmd_validate(),
 Some("benchmark") => {

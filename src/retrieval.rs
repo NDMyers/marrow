@@ -70,9 +70,37 @@ pub struct ImpactNode {
 pub struct ImpactResult {
     pub pivot_id: String,
     pub affected: Vec<ImpactNode>,
+    /// True when results hit `MARROW_IMPACT_MAX_ROWS` (there may be more dependents).
+    pub truncated: bool,
 }
 
 type NodeRow = (String, String, String, String, String, String);
+
+/// Maximum number of inbound callers to show before truncating in formatted output.
+const MAX_INBOUND_CALLERS: usize = 10;
+
+fn env_usize_positive(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+/// Max outbound neighbors loaded into a context capsule / trace (bounds RAM).
+fn capsule_max_outbound_neighbors() -> usize {
+    env_usize_positive("MARROW_CAPSULE_MAX_OUTBOUND", 500)
+}
+
+/// Max inbound rows fetched from SQLite (display still capped at [`MAX_INBOUND_CALLERS`]).
+fn capsule_max_inbound_neighbors_load() -> usize {
+    env_usize_positive("MARROW_CAPSULE_MAX_INBOUND_LOAD", 64).max(MAX_INBOUND_CALLERS)
+}
+
+/// Max rows returned by `analyze_impact` (breadth × depth cap).
+pub fn impact_max_rows() -> usize {
+    env_usize_positive("MARROW_IMPACT_MAX_ROWS", 5000)
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -202,16 +230,21 @@ fn build_context_capsule_from_resolved(
         text: pivot_raw,
     };
 
+    let out_lim = capsule_max_outbound_neighbors() as i64;
+    let in_lim = capsule_max_inbound_neighbors_load() as i64;
+
     // ── Outbound edges: pivot → targets (things this symbol calls/imports) ──
     let mut outbound_stmt = conn.prepare(
         "SELECT n.id, n.symbol_name, n.symbol_type, n.file_path, n.language,
                 n.raw_text, e.relationship_type
          FROM edges e
          JOIN nodes n ON e.source_id = ?1 AND n.id = e.target_id
-         WHERE n.id != ?1",
+         WHERE n.id != ?1
+         ORDER BY n.symbol_name, n.file_path
+         LIMIT ?2",
     )?;
     let outbound_rows: Vec<(String, String, String, String, String, String, String)> = outbound_stmt
-        .query_map(rusqlite::params![pivot_id], |row| {
+        .query_map(rusqlite::params![pivot_id, out_lim], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
         })?
         .filter_map(|r| r.ok())
@@ -223,10 +256,12 @@ fn build_context_capsule_from_resolved(
                 n.raw_text, e.relationship_type
          FROM edges e
          JOIN nodes n ON e.target_id = ?1 AND n.id = e.source_id
-         WHERE n.id != ?1",
+         WHERE n.id != ?1
+         ORDER BY n.symbol_name, n.file_path
+         LIMIT ?2",
     )?;
     let inbound_rows: Vec<(String, String, String, String, String, String, String)> = inbound_stmt
-        .query_map(rusqlite::params![pivot_id], |row| {
+        .query_map(rusqlite::params![pivot_id, in_lim], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
         })?
         .filter_map(|r| r.ok())
@@ -267,15 +302,10 @@ fn build_context_capsule_from_resolved(
     Ok(ContextCapsule { pivot, neighbors })
 }
 
-/// Maximum number of inbound callers to show before truncating.
-/// Agents rarely need the full caller graph; outbound deps are unlimited.
-const MAX_INBOUND_CALLERS: usize = 10;
-
 /// Format a `ContextCapsule` into the plain-text string sent to the LLM.
 ///
-/// Outbound dependencies (what this calls) are listed first and without a cap —
-/// these are what agents use to build execution models.
-/// Inbound callers (who calls this) are capped at `MAX_INBOUND_CALLERS`.
+/// Outbound dependencies are listed first (bounded by `MARROW_CAPSULE_MAX_OUTBOUND` at query time).
+/// Inbound callers are capped at `MAX_INBOUND_CALLERS` in this output.
 fn format_capsule(capsule: &ContextCapsule) -> String {
     let mut out = String::new();
     writeln!(
@@ -321,6 +351,15 @@ fn format_capsule(capsule: &ContextCapsule) -> String {
                 sig  = signature,
             ).ok();
         }
+    }
+
+    let out_cap = capsule_max_outbound_neighbors();
+    if outbound.len() >= out_cap {
+        writeln!(
+            out,
+            "\n[Note: at most {out_cap} outbound neighbors loaded; set MARROW_CAPSULE_MAX_OUTBOUND to raise.]"
+        )
+        .ok();
     }
 
     // ── Inbound: things that call this symbol (capped) ───────────────────────
@@ -369,7 +408,11 @@ pub fn analyze_impact(
     let pivot_id = match resolve_symbol_or_disambiguate(conn, symbol_name, repo_id, filepath)? {
         SymbolResolution::Unique(row) => row.0,
         SymbolResolution::Ambiguous(payload) => {
-            return Ok(ImpactResult { pivot_id: format!("DISAMBIGUATION:{payload}"), affected: vec![] });
+            return Ok(ImpactResult {
+                pivot_id: format!("DISAMBIGUATION:{payload}"),
+                affected: vec![],
+                truncated: false,
+            });
         }
     };
 
@@ -396,11 +439,13 @@ pub fn analyze_impact(
          FROM ranked r
          JOIN nodes n ON n.id = r.node_id
          WHERE r.rn = 1
-         ORDER BY r.depth",
+         ORDER BY r.depth
+         LIMIT ?2",
     )?;
 
-    let affected = stmt
-        .query_map(rusqlite::params![pivot_id], |row| {
+    let lim = impact_max_rows() as i64;
+    let affected: Vec<ImpactNode> = stmt
+        .query_map(rusqlite::params![pivot_id, lim], |row| {
             Ok(ImpactNode {
                 id: row.get(0)?,
                 symbol_name: row.get(1)?,
@@ -414,7 +459,14 @@ pub fn analyze_impact(
         .filter_map(|r| r.ok())
         .collect();
 
-    Ok(ImpactResult { pivot_id, affected })
+    let max_r = impact_max_rows();
+    let truncated = affected.len() >= max_r;
+
+    Ok(ImpactResult {
+        pivot_id,
+        affected,
+        truncated,
+    })
 }
 
 /// Trace the linear execution flow outward from a pivot symbol.
@@ -455,16 +507,19 @@ pub fn trace_logic_flow(
         text: pivot_raw,
     };
 
+    let out_lim = capsule_max_outbound_neighbors() as i64;
     // Query only outbound edges (what this symbol calls / imports).
     let mut stmt = conn.prepare(
         "SELECT n.id, n.symbol_name, n.symbol_type, n.file_path, n.language,
                 n.raw_text, e.relationship_type
          FROM edges e
          JOIN nodes n ON e.source_id = ?1 AND n.id = e.target_id
-         WHERE n.id != ?1",
+         WHERE n.id != ?1
+         ORDER BY n.symbol_name, n.file_path
+         LIMIT ?2",
     )?;
     let outbound: Vec<NeighborInfo> = stmt
-        .query_map(rusqlite::params![pivot_id], |row| {
+        .query_map(rusqlite::params![pivot_id, out_lim], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -507,6 +562,14 @@ pub fn trace_logic_flow(
         writeln!(out, "  (leaf node — no direct outbound calls)").ok();
     } else {
         writeln!(out, "\n── DIRECT CALLEES (immediate outbound dependencies) ─────────────").ok();
+        if outbound.len() >= capsule_max_outbound_neighbors() {
+            writeln!(
+                out,
+                "[Note: at most {} outbound callees loaded; set MARROW_CAPSULE_MAX_OUTBOUND to raise.]\n",
+                capsule_max_outbound_neighbors()
+            )
+            .ok();
+        }
         for n in &outbound {
             writeln!(
                 out,

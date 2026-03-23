@@ -42,6 +42,33 @@ pub fn init_db_or_memory(db_path: &str) -> Result<Connection> {
     }
 }
 
+/// Tunes SQLite memory behavior for long-lived Marrow processes.
+///
+/// Environment (all optional):
+/// - `MARROW_SQLITE_CACHE_KIB` — page cache size in **kibibytes** (SQLite `cache_size` is set to
+///   the negative of this value). Default `262144` (256 MiB). Larger graphs need a larger cache
+///   for throughput; smaller values reduce idle RSS.
+/// - `MARROW_SQLITE_MMAP_BYTES` — passed to `PRAGMA mmap_size`. Default `0` (disable mmap).
+///   SQLite’s mmap of large `graph.db` files often shows up as multi‑GB RSS in Activity Monitor
+///   even when the working set is smaller. Set to a positive value (bytes) to re‑enable mmap.
+pub fn apply_sqlite_memory_settings(conn: &Connection) -> Result<()> {
+    let cache_kib: i64 = std::env::var("MARROW_SQLITE_CACHE_KIB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(262_144);
+
+    conn.pragma_update(None, "cache_size", -cache_kib)?;
+
+    let mmap_bytes: i64 = std::env::var("MARROW_SQLITE_MMAP_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 0)
+        .unwrap_or(0);
+    conn.pragma_update(None, "mmap_size", mmap_bytes)?;
+    Ok(())
+}
+
 /// Opens (or creates) the database at the given path,
 /// sets WAL mode and synchronous=NORMAL, then creates tables.
 pub fn init_db(db_path: &str) -> Result<Connection> {
@@ -53,6 +80,7 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
          PRAGMA temp_store=MEMORY;
          PRAGMA auto_vacuum=INCREMENTAL;",
     )?;
+    apply_sqlite_memory_settings(&conn)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS repositories (
             id        TEXT PRIMARY KEY,
@@ -114,14 +142,30 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
 }
 
 /// Runs a WAL checkpoint (truncating the WAL file) and an incremental
-/// vacuum pass. Call this after every successful ingestion to keep the
-/// database file from growing unboundedly.
+/// vacuum pass. Used after ingest (unless skipped via env) and by `marrow maintenance`.
 pub fn vacuum_and_checkpoint(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA wal_checkpoint(TRUNCATE);
          PRAGMA incremental_vacuum;",
     )?;
     Ok(())
+}
+
+/// Post-ingest maintenance: checkpoint + incremental vacuum, unless
+/// `MARROW_SKIP_POST_INGEST_MAINTENANCE` is set (any non-empty value).
+///
+/// Skipping reduces I/O latency right after a large ingest; the DB may retain
+/// more WAL space until you run [`run_graph_maintenance`] (`marrow maintenance`).
+pub fn post_ingest_maintenance(conn: &Connection) -> Result<()> {
+    if std::env::var_os("MARROW_SKIP_POST_INGEST_MAINTENANCE").is_some_and(|v| !v.is_empty()) {
+        return Ok(());
+    }
+    vacuum_and_checkpoint(conn)
+}
+
+/// Explicit checkpoint + incremental vacuum (CLI `marrow maintenance`). Always runs.
+pub fn run_graph_maintenance(conn: &Connection) -> Result<()> {
+    vacuum_and_checkpoint(conn)
 }
 
 /// Atomically increments a scalar counter in the stats table.
@@ -203,17 +247,20 @@ pub fn database_scope_snapshot(conn: &Connection) -> Result<DatabaseScopeSnapsho
     let symbol_count = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?;
     let file_count = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
 
+    // Per-repo counts use scalar subqueries instead of joining `nodes` and `files` in one
+    // GROUP BY. A double LEFT JOIN materializes a repo-sized cross product (symbols × files)
+    // before DISTINCT — tens of seconds and large temp stores on ~45k+ node graphs (e.g.
+    // Accrualify-scale). Subqueries keep semantics: COUNT(*) per repo_id matches
+    // COUNT(DISTINCT id) / COUNT(DISTINCT file_path) given primary keys on those tables.
     let mut stmt = conn.prepare(
         "SELECT
             r.id,
             r.root_path,
-            COUNT(DISTINCT n.id)        AS symbol_count,
-            COUNT(DISTINCT f.file_path) AS file_count
+            (SELECT COUNT(*) FROM nodes n WHERE n.repo_id = r.id) AS symbol_count,
+            (SELECT COUNT(*) FROM files f WHERE f.repo_id = r.id) AS file_count
          FROM repositories r
-         LEFT JOIN nodes n ON n.repo_id = r.id
-         LEFT JOIN files f ON f.repo_id = r.id
-         GROUP BY r.id, r.root_path
-         HAVING COUNT(DISTINCT n.id) > 0 OR COUNT(DISTINCT f.file_path) > 0
+         WHERE EXISTS (SELECT 1 FROM nodes n WHERE n.repo_id = r.id)
+            OR EXISTS (SELECT 1 FROM files f WHERE f.repo_id = r.id)
          ORDER BY r.id ASC",
     )?;
 
@@ -491,6 +538,25 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .expect("PRAGMA busy_timeout failed");
         assert_eq!(timeout, 30000, "busy_timeout should be 30000ms");
+    }
+
+    #[test]
+    fn init_db_applies_default_memory_pragmas() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let path_str = db_path.to_str().unwrap();
+        let conn = init_db(path_str).expect("init_db failed");
+        let cache: i64 = conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .expect("PRAGMA cache_size");
+        assert_eq!(
+            cache, -262_144,
+            "default cache_size should be -262144 KiB (256 MiB page cache)"
+        );
+        let mmap: i64 = conn
+            .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+            .expect("PRAGMA mmap_size");
+        assert_eq!(mmap, 0, "default mmap_size should be 0 (mmap disabled)");
     }
 
     #[test]

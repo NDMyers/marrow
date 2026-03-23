@@ -20,3 +20,69 @@ Marrow operates by ingesting source code from multiple programming languages (C+
 - **Parser:** `tree-sitter` (Rust bindings with dynamic language loading)
 - **Database:** SQLite (`rusqlite` in WAL mode) for high-throughput batch inserts and fast spatial graph queries.
 - **Protocol:** Official Model Context Protocol (MCP) SDK over stdio.
+
+## Local development
+
+**Prerequisites:** A stable Rust toolchain (`rustup` recommended) and a working C compiler (required for `tree-sitter` native code), as on macOS with Xcode Command Line Tools.
+
+**Build (from the repository root):**
+
+```bash
+cargo build              # debug binary: target/debug/marrow
+cargo build --release    # release binary: target/release/marrow
+```
+
+**Run without installing** (same args as the installed binary):
+
+```bash
+cargo run -- mcp                    # MCP stdio server (typical for editor integration)
+cargo run -- init                   # workspace setup
+cargo run -- index                  # ingest current tree (same pipeline as MCP ingest_repo)
+cargo run -- maintenance            # WAL checkpoint + incremental_vacuum on graph.db
+cargo run -- test-capsules        # capsule validation
+```
+
+**Checks (optional):**
+
+```bash
+cargo check
+cargo clippy -- -D warnings
+```
+
+**Memory tuning (SQLite + ingestion):** Marrow caps SQLite page cache and disables memory-mapped I/O by default so a large `graph.db` is less likely to show as 10+ GB in Activity Monitor. Override when needed:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MARROW_SQLITE_CACHE_KIB` | `262144` (256 MiB) | SQLite `cache_size` (negative KiB). Lower → less idle RSS; higher → faster queries. |
+| `MARROW_SQLITE_MMAP_BYTES` | `0` | `PRAGMA mmap_size` in bytes; `0` disables mmap. Set positive to re-enable mmap for throughput. |
+| `MARROW_INGEST_THREADS` | `min(8, max(2, cores))` | Rayon workers for hash/parse during ingest; fewer workers lower peak RAM during full reindex. |
+| `MARROW_INGEST_PARSE_QUEUE` | `64` | Max parsed files in the bounded channel between Rayon workers and a drainer thread (serialized to a temp spill file); lower → lower peak RSS on huge reindexes, more back-pressure on workers. Spill reads cap blob size (64 MiB per field) and symbol count per row to limit corrupt-file DoS. |
+| `MARROW_SKIP_POST_INGEST_MAINTENANCE` | *(unset)* | If non-empty, skip WAL checkpoint + `incremental_vacuum` after ingest (faster huge reindexes). Run `marrow maintenance` later. |
+| `MARROW_CAPSULE_MAX_OUTBOUND` | `500` | Max outbound edges loaded per capsule / trace (RAM bound). |
+| `MARROW_CAPSULE_MAX_INBOUND_LOAD` | `64` | Max inbound rows loaded from DB (display still capped at 10). |
+| `MARROW_IMPACT_MAX_ROWS` | `5000` | Max rows returned by `analyze_impact`. |
+
+**Post-ingest DB maintenance:** After a large ingest, or if you used `MARROW_SKIP_POST_INGEST_MAINTENANCE`, run:
+
+```bash
+marrow maintenance
+```
+
+Uses `MARROW_DB_PATH` or defaults to `.marrow/graph.db`. Capsule / impact limits: [`docs/mcp-payload-limits.md`](docs/mcp-payload-limits.md).
+
+## Performance epic
+
+Tracked RAM/latency work (MARROW-PERF-001–015, milestones M0–M3) is listed in [`.cursor/epics/marrow-ram-latency-epic.md`](.cursor/epics/marrow-ram-latency-epic.md); maintainers update checkboxes there as stories land.
+
+**Baseline + harness (M0):**
+
+- Runbook: [`docs/perf-baseline-runbook.md`](docs/perf-baseline-runbook.md)
+- `marrow perf-harness`: [`docs/perf-harness.md`](docs/perf-harness.md) — `cargo build --release && ./target/release/marrow perf-harness --help`
+
+**Global install** (puts the binary on your PATH via `~/.cargo/bin`, which must be on `PATH`):
+
+```bash
+cargo install --path .
+```
+
+This installs the **`marrow`** executable into `~/.cargo/bin` (ensure that directory is on your `PATH`).
