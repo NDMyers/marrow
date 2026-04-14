@@ -296,6 +296,24 @@ pub fn parse_file(path: &Path) -> Result<(String, Vec<Symbol>)> {
     let config =
         lang_config_for_ext(&ext).ok_or_else(|| anyhow!("Unsupported extension: {}", ext))?;
 
+    // Guard: skip files larger than MARROW_MAX_FILE_BYTES (default 2 MiB).
+    // tree-sitter builds an in-memory AST that is 3–10× the source size. With 8 parallel
+    // rayon workers, a single 20 MB generated file (GraphQL schema, protobuf output,
+    // API client codegen, accidentally committed bundle) creates ~1.4 GB of RSS pressure.
+    // These files contribute zero architectural signal to the AST graph.
+    // Full source is always available on disk via normal file reads.
+    const DEFAULT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
+    let max_bytes: u64 = std::env::var("MARROW_MAX_FILE_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_FILE_BYTES);
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > max_bytes {
+            return Ok((ext, Vec::new())); // silently skip; file is on disk, not lost
+        }
+    }
+
     let source = std::fs::read_to_string(path)?;
     let source_bytes = source.as_bytes();
 
@@ -944,50 +962,6 @@ fn flush_calls_edge_batch(conn: &Connection, pairs: &[(String, String)]) -> Resu
     Ok(inserted)
 }
 
-/// Callee names referenced from symbols in `file_paths` (excluding self-calls).
-fn callee_names_referenced_in_files(
-    conn: &Connection,
-    repo_id: &str,
-    file_paths: &HashSet<String>,
-) -> Result<HashSet<String>> {
-    let mut callee_names = HashSet::new();
-    for file_path in file_paths {
-        let mut sym_stmt = conn.prepare(
-            "SELECT language, symbol_name, symbol_type, raw_text FROM nodes \
-             WHERE repo_id = ?1 AND file_path = ?2",
-        )?;
-        let mut lang_for_file: Option<String> = None;
-        let mut symbols: Vec<Symbol> = Vec::new();
-        let rows = sym_stmt.query_map(rusqlite::params![repo_id, file_path], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (lang, name, symbol_type, raw_text) = row?;
-            lang_for_file.get_or_insert(lang);
-            symbols.push(Symbol {
-                name,
-                symbol_type,
-                raw_text,
-            });
-        }
-        let Some(lang) = lang_for_file else {
-            continue;
-        };
-        for sym in &symbols {
-            for callee_name in extract_calls_from_symbol(&sym.raw_text, &lang) {
-                if callee_name != sym.name {
-                    callee_names.insert(callee_name);
-                }
-            }
-        }
-    }
-    Ok(callee_names)
-}
 
 /// Commit the computed changeset in a single transaction.
 /// Returns (total_symbol_count, calls_edge_count).
@@ -1099,7 +1073,12 @@ where
     }
 
     // Apply each parsed file from the spill file (bounded channel + drainer limited parse-phase RSS).
+    // While writing symbols to the DB, accumulate (source_node_id, callee_name) pairs directly
+    // from the spill data — raw_text is already in memory here, so we avoid re-querying the DB
+    // a second time for the CALLS edge resolution pass (eliminates two redundant full-table scans).
     let mut changed_paths: HashSet<String> = HashSet::new();
+    let mut all_callee_names: HashSet<String> = HashSet::new();
+    let mut pending_calls: Vec<(String, String)> = Vec::new();
     let spill_file = fs::File::open(&parsed_spill)?;
     let mut spill_reader = BufReader::new(spill_file);
     while let Some((file_path, lang, symbols, hash, mtime)) =
@@ -1158,6 +1137,16 @@ where
                 ])?;
             }
             crate::db::mark_stale_observations(conn, repo_id, &sym.name, &file_path, &new_hash)?;
+
+            // Accumulate callees while raw_text is live in the spill buffer.
+            // This replaces the two separate post-write DB scans (callee_names_referenced_in_files
+            // + the second symbols loop), cutting two full raw_text column reads per ingest.
+            for callee_name in extract_calls_from_symbol(&sym.raw_text, &lang) {
+                if callee_name != sym.name {
+                    all_callee_names.insert(callee_name.clone());
+                    pending_calls.push((node_id.clone(), callee_name));
+                }
+            }
         }
         conn.execute(
             "INSERT OR REPLACE INTO files (repo_id, file_path, mtime_secs, content_hash)
@@ -1175,60 +1164,20 @@ where
     }
     maybe_emit_progress(progress, progress_state, 90);
 
-    // Resolve callee targets only for names referenced from changed files (MARROW-PERF-009).
-    let callee_names = if changed_paths.is_empty() {
-        HashSet::new()
-    } else {
-        callee_names_referenced_in_files(conn, repo_id, &changed_paths)?
-    };
-    let name_to_ids = build_name_to_ids_for_symbol_names(conn, repo_id, &callee_names)?;
+    // Resolve callee names → node IDs in one bulk lookup (MARROW-PERF-009).
+    // Callee names were collected during the spill-read above — no DB re-scan needed.
+    let name_to_ids = build_name_to_ids_for_symbol_names(conn, repo_id, &all_callee_names)?;
 
-    let mut calls_edge_count = 0usize;
-    for file_path in &changed_paths {
-        let mut sym_stmt = conn.prepare(
-            "SELECT language, symbol_name, symbol_type, raw_text FROM nodes \
-             WHERE repo_id = ?1 AND file_path = ?2",
-        )?;
-        let mut lang_for_file: Option<String> = None;
-        let mut symbols: Vec<Symbol> = Vec::new();
-        let rows = sym_stmt.query_map(rusqlite::params![repo_id, file_path], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (lang, name, symbol_type, raw_text) = row?;
-            lang_for_file.get_or_insert(lang);
-            symbols.push(Symbol {
-                name,
-                symbol_type,
-                raw_text,
-            });
-        }
-        let Some(lang) = lang_for_file else {
-            continue;
-        };
-        let mut calls_batch: Vec<(String, String)> = Vec::new();
-        for sym in &symbols {
-            let callees = extract_calls_from_symbol(&sym.raw_text, &lang);
-            let source_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
-            for callee_name in &callees {
-                if callee_name == &sym.name {
-                    continue;
-                }
-                if let Some(target_ids) = name_to_ids.get(callee_name.as_str()) {
-                    for target_id in target_ids {
-                        calls_batch.push((source_id.clone(), target_id.clone()));
-                    }
-                }
+    let mut calls_batch: Vec<(String, String)> = Vec::new();
+    for (source_id, callee_name) in &pending_calls {
+        if let Some(target_ids) = name_to_ids.get(callee_name.as_str()) {
+            for target_id in target_ids {
+                calls_batch.push((source_id.clone(), target_id.clone()));
             }
         }
-        calls_edge_count += calls_batch.len();
-        flush_calls_edge_batch(conn, &calls_batch)?;
     }
+    let calls_edge_count = calls_batch.len();
+    flush_calls_edge_batch(conn, &calls_batch)?;
 
     maybe_emit_progress(progress, progress_state, 95);
 
@@ -2132,6 +2081,137 @@ function foo() {
         std::env::remove_var("MARROW_INGEST_PARSE_QUEUE");
 
         assert_eq!(fp_low, fp_high, "CALLS graph should match for queue K=1 vs K=64");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A source file larger than the 2 MiB default must be silently skipped
+    /// (returns Ok with empty symbol list, no error or panic).
+    #[test]
+    fn parse_file_skips_file_exceeding_default_size_limit() {
+        let dir = std::env::temp_dir().join("marrow_test_parse_file_size_guard");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a >2 MiB Python file containing one valid function followed by comment padding.
+        let big_path = dir.join("huge.py");
+        let header = b"def oversize_fn():\n    pass\n";
+        let padding = vec![b'#'; 3 * 1024 * 1024]; // 3 MiB of comment bytes
+        let mut content = header.to_vec();
+        content.extend_from_slice(&padding);
+        std::fs::write(&big_path, &content).unwrap();
+
+        let result = parse_file(&big_path);
+        assert!(result.is_ok(), "parse_file should not error on oversized file");
+        let (_lang, symbols) = result.unwrap();
+        assert!(
+            symbols.is_empty(),
+            "oversized file must produce zero symbols, got {}", symbols.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file well below the 2 MiB limit is parsed normally.
+    #[test]
+    fn parse_file_parses_file_below_size_limit() {
+        let dir = std::env::temp_dir().join("marrow_test_parse_file_normal");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("small.py");
+        std::fs::write(&path, b"def small_fn():\n    pass\n").unwrap();
+
+        let (lang, symbols) = parse_file(&path).expect("parse_file should succeed for small file");
+        assert_eq!(lang, "py");
+        assert!(!symbols.is_empty(), "small file should produce at least one symbol");
+        assert!(symbols.iter().any(|s| s.name == "small_fn"), "expected 'small_fn' in symbols");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Oversized files in a repo are silently excluded from the AST graph;
+    /// the ingest completes without error and no symbols from that file appear.
+    #[test]
+    fn ingest_silently_excludes_oversized_files_from_graph() {
+        let dir = std::env::temp_dir().join("marrow_test_ingest_oversize_exclusion");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Small file that should be indexed normally.
+        std::fs::write(dir.join("normal.py"), b"def normal_fn():\n    pass\n").unwrap();
+
+        // Oversized file — 3 MiB Python file that must be silently skipped.
+        let big_path = dir.join("oversize.py");
+        let header = b"def oversize_fn():\n    pass\n";
+        let padding = vec![b'#'; 3 * 1024 * 1024];
+        let mut big_content = header.to_vec();
+        big_content.extend_from_slice(&padding);
+        std::fs::write(&big_path, &big_content).unwrap();
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        ingest_repo(&conn, "test", &dir).expect("ingest_repo must succeed even with oversized files");
+
+        // The oversized file's symbol must not appear in the graph.
+        let oversize_fn_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test' AND symbol_name = 'oversize_fn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(oversize_fn_count, 0, "oversize_fn from 3 MiB file must not appear in the graph");
+
+        // The normal file's symbol must still be present.
+        let normal_fn_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test' AND symbol_name = 'normal_fn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normal_fn_count, 1, "normal_fn from small file must still be indexed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CALLS edges built via the spill-phase accumulation (new path) must be
+    /// identical to what the old two-pass DB scan approach would have produced.
+    /// This regression test catches any divergence in the refactored write_changeset_body.
+    #[test]
+    fn calls_edges_match_after_spill_phase_callee_accumulation() {
+        let dir = std::env::temp_dir().join("marrow_test_calls_spill_accumulation");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("caller.py"), b"def caller():\n    callee()\n").unwrap();
+        std::fs::write(dir.join("callee.py"), b"def callee():\n    pass\n").unwrap();
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        ingest_repo(&conn, "proj", &dir).expect("ingest should succeed");
+
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE relationship_type = 'CALLS'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(edge_count > 0, "at least one CALLS edge must exist after ingest");
+
+        // Verify the specific edge: caller → callee
+        let edge_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes src ON src.id = e.source_id \
+                 JOIN nodes tgt ON tgt.id = e.target_id \
+                 WHERE src.symbol_name = 'caller' AND tgt.symbol_name = 'callee' \
+                   AND e.relationship_type = 'CALLS'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_exists, 1, "CALLS edge from 'caller' to 'callee' must exist");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
