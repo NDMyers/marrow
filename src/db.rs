@@ -52,11 +52,14 @@ pub fn init_db_or_memory(db_path: &str) -> Result<Connection> {
 ///   SQLite’s mmap of large `graph.db` files often shows up as multi‑GB RSS in Activity Monitor
 ///   even when the working set is smaller. Set to a positive value (bytes) to re‑enable mmap.
 pub fn apply_sqlite_memory_settings(conn: &Connection) -> Result<()> {
+    // 32 MiB is sufficient for any realistic AST query workload.
+    // The old 256 MiB default added ~224 MiB of permanent idle RSS per server instance.
+    // Override with MARROW_SQLITE_CACHE_KIB (kibibytes) if a larger cache is needed.
     let cache_kib: i64 = std::env::var("MARROW_SQLITE_CACHE_KIB")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(262_144);
+        .unwrap_or(32_768); // 32 MiB
 
     conn.pragma_update(None, "cache_size", -cache_kib)?;
 
@@ -77,7 +80,7 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
          PRAGMA busy_timeout=30000;
-         PRAGMA temp_store=MEMORY;
+         PRAGMA temp_store=FILE;
          PRAGMA auto_vacuum=INCREMENTAL;",
     )?;
     apply_sqlite_memory_settings(&conn)?;
@@ -563,8 +566,8 @@ mod tests {
             .query_row("PRAGMA cache_size", [], |row| row.get(0))
             .expect("PRAGMA cache_size");
         assert_eq!(
-            cache, -262_144,
-            "default cache_size should be -262144 KiB (256 MiB page cache)"
+            cache, -32_768,
+            "default cache_size should be -32768 KiB (32 MiB page cache)"
         );
         let mmap: i64 = conn
             .query_row("PRAGMA mmap_size", [], |row| row.get(0))
