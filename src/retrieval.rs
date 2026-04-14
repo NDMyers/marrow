@@ -6,6 +6,39 @@ use tree_sitter::{Language, Parser, Query, QueryCursor};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+/// How `get_context_capsule` fills `CapsuleResult::original_text` (env-driven).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapsuleOriginalMode {
+    /// Default: do not load touched files into `original_text` (empty string on success).
+    None,
+    /// Legacy: concatenate full file contents of touched paths (bounded by
+    /// `MARROW_CAPSULE_ORIGINAL_MAX_BYTES` when set).
+    Full,
+}
+
+/// Resolved from `MARROW_CAPSULE_ORIGINAL_MODE`, with `MARROW_CAPSULE_ORIGINAL_LEGACY=1` → [`CapsuleOriginalMode::Full`].
+pub fn capsule_original_mode() -> CapsuleOriginalMode {
+    if env_truthy("MARROW_CAPSULE_ORIGINAL_LEGACY") {
+        return CapsuleOriginalMode::Full;
+    }
+    match std::env::var("MARROW_CAPSULE_ORIGINAL_MODE") {
+        Ok(s) if s.eq_ignore_ascii_case("full") => CapsuleOriginalMode::Full,
+        Ok(s) if s.eq_ignore_ascii_case("none") => CapsuleOriginalMode::None,
+        Err(_) => CapsuleOriginalMode::None,
+        Ok(_) => CapsuleOriginalMode::None,
+    }
+}
+
+fn env_truthy(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(s) => {
+            let t = s.trim();
+            matches!(t, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        }
+        Err(_) => false,
+    }
+}
+
 /// Returned by `get_context_capsule`: both strings are derived from a single
 /// graph traversal, ensuring telemetry and the compare endpoint use identical
 /// source data.
@@ -13,8 +46,12 @@ use tree_sitter::{Language, Parser, Query, QueryCursor};
 pub struct CapsuleResult {
     /// The condensed capsule text sent to the LLM (optimized).
     pub optimized_text: String,
-    /// Concatenated raw file contents of every file touched by the capsule.
+    /// Raw file payload for telemetry / compare. Empty when [`CapsuleOriginalMode::None`]
+    /// (default); full concatenation when [`CapsuleOriginalMode::Full`]. Disambiguation
+    /// payloads mirror `optimized_text`.
     pub original_text: String,
+    /// MCP / dashboard `file_tokens` heuristic (`len/4`), mode-aware (metadata sum when not full).
+    pub file_tokens: usize,
 }
 
 #[derive(Debug)]
@@ -79,6 +116,16 @@ type NodeRow = (String, String, String, String, String, String);
 /// Maximum number of inbound callers to show before truncating in formatted output.
 const MAX_INBOUND_CALLERS: usize = 10;
 
+/// Default max bytes for a pivot's full source in `format_capsule`.
+/// Pivots exceeding this are auto-condensed to signatures.
+/// Override with `MARROW_CAPSULE_MAX_PIVOT_BYTES`.
+const DEFAULT_MAX_PIVOT_BYTES: usize = 12_000; // ~3,000 tokens
+
+/// Max bytes for a pivot's full source before auto-condensation.
+fn capsule_max_pivot_bytes() -> usize {
+    env_usize_positive("MARROW_CAPSULE_MAX_PIVOT_BYTES", DEFAULT_MAX_PIVOT_BYTES)
+}
+
 fn env_usize_positive(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -102,12 +149,178 @@ pub fn impact_max_rows() -> usize {
     env_usize_positive("MARROW_IMPACT_MAX_ROWS", 5000)
 }
 
+/// Max total bytes for `CapsuleResult::original_text` (concatenated full files touched by the
+/// capsule). When set, stops reading further files once the budget would be exceeded — avoids
+/// holding hundreds of large source files in RAM at once on low-memory hosts.
+///
+/// Unset or `0` = unlimited (legacy behavior).
+fn capsule_original_text_max_bytes() -> Option<usize> {
+    match std::env::var("MARROW_CAPSULE_ORIGINAL_MAX_BYTES") {
+        Ok(s) => {
+            let n: usize = s.parse().ok()?;
+            (n > 0).then_some(n)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Sum `metadata().len() / 4` over unique touched relative paths (skip missing / unreadable).
+fn file_tokens_metadata_estimate(root: Option<&Path>, touched: &HashSet<String>) -> usize {
+    let mut total: usize = 0;
+    let mut paths: Vec<&String> = touched.iter().collect();
+    paths.sort();
+    for rel_path in paths {
+        let Some(root) = root else {
+            continue;
+        };
+        let abs_path = match resolve_repo_file_path(root, rel_path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let Ok(meta) = fs::metadata(&abs_path) else {
+            continue;
+        };
+        total = total.saturating_add((meta.len() as usize) / 4);
+    }
+    total
+}
+
+/// Concatenate full file contents for touched paths in **sorted path order**.
+/// With `budget` = `Some(max)`, uses `metadata().len()` before `read_to_string` and skips files
+/// that would exceed the remaining budget (returns `(text, truncated, omitted_paths)`).
+pub(crate) fn concat_full_original_text_sorted(
+    root: Option<&Path>,
+    touched: &HashSet<String>,
+    budget: Option<usize>,
+) -> (String, bool, Vec<String>) {
+    let mut parts = Vec::new();
+    let mut paths: Vec<&String> = touched.iter().collect();
+    paths.sort();
+    let mut truncated_original = false;
+    let mut omitted_paths: Vec<String> = Vec::new();
+
+    match budget {
+        Some(max_bytes) => {
+            let mut used: usize = 0;
+            for rel_path in paths {
+                let Some(root) = root else {
+                    continue;
+                };
+                let abs_path = match resolve_repo_file_path(root, rel_path) {
+                    Ok(path) => path,
+                    Err(_) => continue,
+                };
+                let file_len = match fs::metadata(&abs_path) {
+                    Ok(m) => m.len() as usize,
+                    Err(_) => continue,
+                };
+                let sep = if parts.is_empty() { 0 } else { 1 };
+                let next = used.saturating_add(sep).saturating_add(file_len);
+                if next > max_bytes {
+                    truncated_original = true;
+                    omitted_paths.push(rel_path.clone());
+                    continue;
+                }
+                let text = match fs::read_to_string(&abs_path) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                used = used.saturating_add(sep).saturating_add(text.len());
+                parts.push(text);
+            }
+        }
+        None => {
+            for rel_path in paths {
+                let Some(root) = root else {
+                    continue;
+                };
+                let abs_path = match resolve_repo_file_path(root, rel_path) {
+                    Ok(path) => path,
+                    Err(_) => continue,
+                };
+                match fs::read_to_string(&abs_path) {
+                    Ok(text) => parts.push(text),
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+
+    (parts.join("\n"), truncated_original, omitted_paths)
+}
+
+/// Tiktoken (cl100k_base) token count summed per touched file, streaming one file at a time.
+pub fn sum_precise_tokens_touched_by_capsule(
+    conn: &Connection,
+    symbol_name: &str,
+    repo_id: &str,
+    filepath: Option<&str>,
+) -> Result<usize> {
+    let (pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw) =
+        match resolve_symbol_or_disambiguate(conn, symbol_name, repo_id, filepath)? {
+            SymbolResolution::Unique(row) => row,
+            SymbolResolution::Ambiguous(_) => return Ok(0),
+        };
+
+    let capsule = build_context_capsule_from_resolved(
+        conn,
+        pivot_id,
+        pivot_name,
+        pivot_type,
+        pivot_path,
+        pivot_lang,
+        pivot_raw,
+    )?;
+
+    let mut touched: HashSet<String> = HashSet::new();
+    touched.insert(capsule.pivot.file_path.clone());
+    for n in &capsule.neighbors {
+        touched.insert(n.node.file_path.clone());
+    }
+
+    let root_path: String = conn
+        .query_row(
+            "SELECT root_path FROM repositories WHERE id = ?1",
+            rusqlite::params![repo_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+
+    let root = if root_path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(&root_path))
+    };
+
+    let bpe = tiktoken_rs::cl100k_base().map_err(|e| anyhow!("tiktoken: {e}"))?;
+    let mut paths: Vec<&String> = touched.iter().collect();
+    paths.sort();
+    let mut total = 0usize;
+    for rel_path in paths {
+        let Some(root) = root.as_ref() else {
+            continue;
+        };
+        let abs_path = match resolve_repo_file_path(root, rel_path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let contents = match fs::read_to_string(&abs_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        total = total.saturating_add(bpe.encode_with_special_tokens(&contents).len());
+    }
+    Ok(total)
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Fetch the pivot node's full source and all depth-1 neighbors condensed.
-/// Returns a `CapsuleResult` with both the optimized capsule text and the
-/// concatenated raw file contents of every file the capsule touches — ensuring
-/// telemetry and the compare endpoint share a single source of truth.
+///
+/// [`CapsuleResult::optimized_text`] is always the primary LLM payload. [`CapsuleResult::original_text`]
+/// follows [`capsule_original_mode`]: default `none` leaves it empty (no concat read); `full` loads
+/// full touched files (sorted paths, optional byte budget). [`CapsuleResult::file_tokens`] matches
+/// dashboard/MCP telemetry (`metadata_len/4` when not `full`, else `original_text.len()/4`).
 ///
 /// When `symbol_name` is ambiguous (matches multiple files), returns `Ok` with
 /// a Disambiguation Payload the agent can use to retry with a specific filepath.
@@ -123,9 +336,11 @@ pub fn get_context_capsule(
             SymbolResolution::Unique(row) => row,
             SymbolResolution::Ambiguous(payload) => {
                 // Surface as a successful capsule — agents should parse and retry.
+                let file_tokens = payload.len() / 4;
                 return Ok(CapsuleResult {
                     optimized_text: payload.clone(),
                     original_text: payload,
+                    file_tokens,
                 });
             }
         };
@@ -157,28 +372,43 @@ pub fn get_context_capsule(
         Some(PathBuf::from(&root_path))
     };
 
-    let mut parts = Vec::new();
-    for rel_path in &touched {
-        let Some(root) = root.as_ref() else {
-            continue;
-        };
-        let abs_path = match resolve_repo_file_path(root, rel_path) {
-            Ok(path) => path,
-            Err(_) => {
-                // File was deleted or moved after ingestion — skip it.
-                continue;
-            }
-        };
-        match fs::read_to_string(&abs_path) {
-            Ok(text) => parts.push(text),
-            Err(_) => {
-                // File unreadable (permissions, encoding) — skip it.
-                continue;
-            }
+    let mode = capsule_original_mode();
+    let budget = capsule_original_text_max_bytes();
+    let mut truncated_original = false;
+    let mut omitted_paths: Vec<String> = Vec::new();
+
+    let mut original_text = if mode == CapsuleOriginalMode::None {
+        String::new()
+    } else {
+        let (text, trunc, omit) =
+            concat_full_original_text_sorted(root.as_deref(), &touched, budget);
+        truncated_original = trunc;
+        omitted_paths = omit;
+        text
+    };
+
+    if truncated_original {
+        if let Some(lim) = budget {
+            let note = format!(
+                "\n\n── MARROW: original_text truncated (MARROW_CAPSULE_ORIGINAL_MAX_BYTES={lim}) ──\n\
+                 Omitted {} file(s) (not loaded to cap RAM). Example paths: {}\n",
+                omitted_paths.len(),
+                omitted_paths
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            original_text.push_str(&note);
         }
     }
-    parts.sort();
-    let original_text = parts.join("\n");
+
+    let file_tokens = if mode == CapsuleOriginalMode::Full {
+        original_text.len() / 4
+    } else {
+        file_tokens_metadata_estimate(root.as_deref(), &touched)
+    };
 
     // Append any stored observations for the pivot symbol.
     let observations = query_observations_for_capsule(
@@ -205,7 +435,11 @@ pub fn get_context_capsule(
         out
     };
 
-    Ok(CapsuleResult { optimized_text, original_text })
+    Ok(CapsuleResult {
+        optimized_text,
+        original_text,
+        file_tokens,
+    })
 }
 
 
@@ -315,8 +549,24 @@ fn format_capsule(capsule: &ContextCapsule) -> String {
     ).ok();
     writeln!(out, "File : {}", capsule.pivot.file_path).ok();
     writeln!(out, "Type : {}", capsule.pivot.symbol_type).ok();
-    writeln!(out, "\n── FULL SOURCE ──────────────────────────────────────────────").ok();
-    writeln!(out, "{}", capsule.pivot.text).ok();
+
+    let max_pivot = capsule_max_pivot_bytes();
+    if capsule.pivot.text.len() > max_pivot {
+        // Auto-condense oversized pivots (e.g. large classes with hundreds of scopes/methods).
+        let condensed = condense(&capsule.pivot.text, &capsule.pivot.language);
+        writeln!(out, "\n── CONDENSED SOURCE (pivot exceeded {max_pivot}B cap) ─────────────").ok();
+        writeln!(out, "{}", condensed).ok();
+        writeln!(
+            out,
+            "[Note: full source ({orig}B) condensed to save tokens. \
+             Use read_node or native file read for the complete body. \
+             Set MARROW_CAPSULE_MAX_PIVOT_BYTES to adjust threshold.]",
+            orig = capsule.pivot.text.len()
+        ).ok();
+    } else {
+        writeln!(out, "\n── FULL SOURCE ──────────────────────────────────────────────").ok();
+        writeln!(out, "{}", capsule.pivot.text).ok();
+    }
 
     let outbound: Vec<&NeighborInfo> = capsule.neighbors.iter()
         .filter(|n| n.direction == EdgeDirection::Outbound)
@@ -491,9 +741,11 @@ pub fn trace_logic_flow(
         match resolve_symbol_or_disambiguate(conn, symbol_name, repo_id, filepath)? {
             SymbolResolution::Unique(row) => row,
             SymbolResolution::Ambiguous(payload) => {
+                let file_tokens = payload.len() / 4;
                 return Ok(CapsuleResult {
                     optimized_text: payload.clone(),
                     original_text: payload,
+                    file_tokens,
                 });
             }
         };
@@ -583,9 +835,11 @@ pub fn trace_logic_flow(
         }
     }
 
+    let file_tokens = out.len() / 4;
     Ok(CapsuleResult {
         optimized_text: out.clone(),
         original_text: out,
+        file_tokens,
     })
 }
 
@@ -970,7 +1224,10 @@ pub fn get_project_skeleton(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    static CAPSULE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1463,6 +1720,89 @@ mod tests {
         assert!(result.original_text.is_empty(), "original_text should be empty when file is missing");
     }
 
+    #[test]
+    fn concat_full_original_sorted_by_path_not_by_content() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("z.txt"), "zzz").unwrap();
+        fs::write(root.join("a.txt"), "aaa").unwrap();
+        let mut touched = HashSet::new();
+        touched.insert("z.txt".to_string());
+        touched.insert("a.txt".to_string());
+        let (s, trunc, omit) = concat_full_original_text_sorted(Some(root), &touched, None);
+        assert!(!trunc);
+        assert!(omit.is_empty());
+        assert_eq!(s, "aaa\nzzz");
+    }
+
+    #[test]
+    fn concat_full_original_budget_skips_using_metadata_without_full_read() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "small").unwrap();
+        fs::write(root.join("b.bin"), vec![b'y'; 100_000]).unwrap();
+        let mut touched = HashSet::new();
+        touched.insert("a.txt".to_string());
+        touched.insert("b.bin".to_string());
+        let (s, trunc, omit) = concat_full_original_text_sorted(Some(root), &touched, Some(20));
+        assert!(trunc);
+        assert_eq!(s, "small");
+        assert!(omit.iter().any(|p| p == "b.bin"));
+    }
+
+    #[test]
+    fn capsule_none_mode_empty_original_metadata_file_tokens() {
+        let _g = CAPSULE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MARROW_CAPSULE_ORIGINAL_MODE");
+        std::env::remove_var("MARROW_CAPSULE_ORIGINAL_LEGACY");
+        std::env::remove_var("MARROW_CAPSULE_ORIGINAL_MAX_BYTES");
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.py"), "aaaa").unwrap();
+        fs::write(root.join("src/b.py"), "bbbbbbbb").unwrap();
+
+        let conn = make_db();
+        insert_repo(&conn, "r", &root.to_string_lossy());
+        insert_node(
+            &conn,
+            "r:src/a.py:fa",
+            "r",
+            "src/a.py",
+            "py",
+            "fa",
+            "function",
+            "def fa():\n  pass\n",
+        );
+        insert_node(
+            &conn,
+            "r:src/b.py:fb",
+            "r",
+            "src/b.py",
+            "py",
+            "fb",
+            "function",
+            "def fb():\n  pass\n",
+        );
+        insert_edge(&conn, "r:src/a.py:fa", "r:src/b.py:fb", "CALLS");
+
+        let result = get_context_capsule(&conn, "fa", "r", None).unwrap();
+        assert!(result.original_text.is_empty());
+        assert!(!result.optimized_text.is_empty());
+        assert_eq!(result.file_tokens, 3, "4/4 + 8/4 = 1 + 2");
+
+        // Same DB + `MARROW_CAPSULE_ORIGINAL_LEGACY=1` → full concat for one release.
+        std::env::set_var("MARROW_CAPSULE_ORIGINAL_LEGACY", "1");
+        let result_full = get_context_capsule(&conn, "fa", "r", None).unwrap();
+        assert!(
+            result_full.original_text.contains("aaaa"),
+            "legacy full mode should load sources: {}",
+            result_full.original_text
+        );
+        std::env::remove_var("MARROW_CAPSULE_ORIGINAL_LEGACY");
+    }
+
     // ── condense (unit tests on raw text) ──────────────────────────────────
 
     #[test]
@@ -1583,6 +1923,58 @@ mod tests {
         let result = analyze_impact(&conn, "bulk_update", "r", Some("src/a.py")).unwrap();
         assert_eq!(result.affected.len(), 1);
         assert_eq!(result.affected[0].symbol_name, "caller");
+    }
+
+    #[test]
+    fn capsule_auto_condenses_oversized_pivot() {
+        // Build a pivot whose raw_text exceeds DEFAULT_MAX_PIVOT_BYTES.
+        let conn = make_db();
+        let big_body = format!(
+            "class BigModel < ApplicationRecord\n{}end\n",
+            "  has_many :things\n".repeat(2000)
+        );
+        assert!(
+            big_body.len() > DEFAULT_MAX_PIVOT_BYTES,
+            "test fixture must exceed cap: {} vs {}",
+            big_body.len(),
+            DEFAULT_MAX_PIVOT_BYTES
+        );
+        insert_node(&conn, "r:m.rb:BigModel", "r", "m.rb", "rb", "BigModel", "class", &big_body);
+        let result = get_context_capsule(&conn, "BigModel", "r", None).unwrap();
+        assert!(
+            result.optimized_text.contains("CONDENSED SOURCE"),
+            "oversized pivot should be condensed: {}",
+            &result.optimized_text[..200.min(result.optimized_text.len())]
+        );
+        assert!(
+            result.optimized_text.contains("MARROW_CAPSULE_MAX_PIVOT_BYTES"),
+            "condensed output should mention the env var"
+        );
+        // The condensed text should NOT contain the full repeated body.
+        assert!(
+            result.optimized_text.len() < big_body.len(),
+            "condensed capsule ({}) should be smaller than raw pivot ({})",
+            result.optimized_text.len(),
+            big_body.len()
+        );
+    }
+
+    #[test]
+    fn capsule_small_pivot_gets_full_source() {
+        let conn = make_db();
+        let small_body = "def tiny():\n    return 1\n";
+        assert!(small_body.len() < DEFAULT_MAX_PIVOT_BYTES);
+        insert_node(&conn, "r:f.py:tiny", "r", "f.py", "py", "tiny", "function", small_body);
+        let result = get_context_capsule(&conn, "tiny", "r", None).unwrap();
+        assert!(
+            result.optimized_text.contains("FULL SOURCE"),
+            "small pivot should get full source: {}",
+            result.optimized_text
+        );
+        assert!(
+            !result.optimized_text.contains("CONDENSED SOURCE"),
+            "small pivot should not be condensed"
+        );
     }
 
     #[test]
