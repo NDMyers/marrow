@@ -8,13 +8,13 @@ use std::{
 
 use anyhow::Result;
 use axum::{
-    Router,
     extract::{Query, State},
     response::{
-        IntoResponse,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse,
     },
     routing::get,
+    Router,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -24,6 +24,27 @@ use tower_http::cors::CorsLayer;
 
 static INDEX_HTML: &str = include_str!("index.html");
 static D3_JS: &str = include_str!("d3-v7.min.js");
+const GRAPH_INITIAL_NODE_CAP: usize = 500;
+const GRAPH_TOP_NODES_SQL: &str = "SELECT n.id, n.symbol_name, n.file_path, \
+            COALESCE(n.symbol_type, 'unknown'), gd.degree \
+     FROM graph_node_degrees gd \
+     JOIN nodes n ON n.id = gd.node_id \
+     WHERE gd.repo_id = ?1 AND n.repo_id = ?1 \
+     ORDER BY gd.degree DESC, n.file_path ASC, n.symbol_name ASC, n.id ASC \
+     LIMIT ?2";
+const GRAPH_RETURNED_EDGES_SQL: &str = "WITH top_nodes AS ( \
+        SELECT n.id \
+        FROM graph_node_degrees gd \
+        JOIN nodes n ON n.id = gd.node_id \
+        WHERE gd.repo_id = ?1 AND n.repo_id = ?1 \
+        ORDER BY gd.degree DESC, n.file_path ASC, n.symbol_name ASC, n.id ASC \
+        LIMIT ?2 \
+     ) \
+     SELECT e.source_id, e.target_id, COALESCE(e.relationship_type, 'CALLS') \
+     FROM edges e \
+     JOIN top_nodes src ON src.id = e.source_id \
+     JOIN top_nodes tgt ON tgt.id = e.target_id \
+     ORDER BY e.source_id ASC, e.target_id ASC, e.relationship_type ASC";
 
 // ── Event types ───────────────────────────────────────────────────────────────
 
@@ -102,29 +123,29 @@ pub fn now_ts() -> u64 {
 
 #[derive(Default)]
 pub struct SessionStats {
-    pub total_requests:       usize,
+    pub total_requests: usize,
     pub total_capsule_tokens: usize,
-    pub total_file_tokens:    usize,
-    pub total_tokens_saved:   usize,
-    pub recent_events:        VecDeque<DashboardEvent>,
+    pub total_file_tokens: usize,
+    pub total_tokens_saved: usize,
+    pub recent_events: VecDeque<DashboardEvent>,
     /// Token delta text cache keyed by `"symbol@repo@ts"`.
     /// Populated from the telemetry POST body so the compare endpoint works
     /// even when the Axum server (Hub) is running against a different DB than
     /// the process that served the capsule (Spoke).
-    pub capsule_text_cache:   HashMap<String, (String, String)>,
+    pub capsule_text_cache: HashMap<String, (String, String)>,
 }
 
 impl SessionStats {
     pub fn record_capsule(
         &mut self,
         capsule_tokens: usize,
-        file_tokens:    usize,
-        event:          DashboardEvent,
+        file_tokens: usize,
+        event: DashboardEvent,
     ) {
-        self.total_requests       += 1;
+        self.total_requests += 1;
         self.total_capsule_tokens += capsule_tokens;
-        self.total_file_tokens    += file_tokens;
-        self.total_tokens_saved   += file_tokens.saturating_sub(capsule_tokens);
+        self.total_file_tokens += file_tokens;
+        self.total_tokens_saved += file_tokens.saturating_sub(capsule_tokens);
 
         // Extract and cache texts before stripping them from the stored event.
         // The cache lets the compare endpoint serve delta views without re-querying
@@ -136,12 +157,14 @@ impl SessionStats {
             ref optimized_text,
             ts,
             ..
-        } = event {
+        } = event
+        {
             let mut cached = false;
             if let (Some(orig), Some(opt)) = (original_text, optimized_text) {
                 if !orig.is_empty() {
                     let key = format!("{}@{}@{}", symbol, repo, ts);
-                    self.capsule_text_cache.insert(key, (orig.clone(), opt.clone()));
+                    self.capsule_text_cache
+                        .insert(key, (orig.clone(), opt.clone()));
                     cached = true;
                     // Prevent unbounded growth; a simple clear-on-overflow is fine
                     // for a local dashboard cache that holds at most ~50 entries.
@@ -153,10 +176,26 @@ impl SessionStats {
             // Strip the large text blobs before pushing into recent_events so
             // the SSE broadcast and the /stats payload stay lean.
             if let DashboardEvent::CapsuleServed {
-                symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts, ..
-            } = event {
+                symbol,
+                repo,
+                file,
+                capsule_tokens,
+                file_tokens,
+                tokens_saved,
+                origin,
+                ts,
+                ..
+            } = event
+            {
                 DashboardEvent::CapsuleServed {
-                    symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts,
+                    symbol,
+                    repo,
+                    file,
+                    capsule_tokens,
+                    file_tokens,
+                    tokens_saved,
+                    origin,
+                    ts,
                     original_text: None,
                     optimized_text: None,
                     has_cached_delta: cached,
@@ -179,9 +218,9 @@ impl SessionStats {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub tx:      broadcast::Sender<DashboardEvent>,
+    pub tx: broadcast::Sender<DashboardEvent>,
     pub session: Arc<Mutex<SessionStats>>,
-    pub db:      Arc<Mutex<rusqlite::Connection>>,
+    pub db: Arc<Mutex<rusqlite::Connection>>,
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
@@ -201,66 +240,69 @@ async fn sse_handler(
     State(state): State<AppState>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.tx.subscribe();
-    let stream = tokio_stream::StreamExt::filter_map(BroadcastStream::new(rx), |msg: Result<DashboardEvent, _>| {
-        let event = msg.ok()?;
-        let json  = serde_json::to_string(&event).ok()?;
-        Some(Ok::<Event, Infallible>(Event::default().data(json)))
-    });
+    let stream = tokio_stream::StreamExt::filter_map(
+        BroadcastStream::new(rx),
+        |msg: Result<DashboardEvent, _>| {
+            let event = msg.ok()?;
+            let json = serde_json::to_string(&event).ok()?;
+            Some(Ok::<Event, Infallible>(Event::default().data(json)))
+        },
+    );
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 #[derive(Serialize)]
 struct StatsResponse {
-    session:  SessionSnapshot,
+    session: SessionSnapshot,
     lifetime: LifetimeSnapshot,
     database: DatabaseSnapshot,
 }
 
 #[derive(Serialize)]
 struct SessionSnapshot {
-    total_requests:       usize,
+    total_requests: usize,
     total_capsule_tokens: usize,
-    total_file_tokens:    usize,
-    total_tokens_saved:   usize,
-    reduction_pct:        f64,
-    recent_events:        Vec<DashboardEvent>,
+    total_file_tokens: usize,
+    total_tokens_saved: usize,
+    reduction_pct: f64,
+    recent_events: Vec<DashboardEvent>,
 }
 
 #[derive(Serialize)]
 struct LifetimeSnapshot {
-    total_requests:               i64,
-    total_tokens_saved:           i64,
-    total_file_tokens:            i64,
-    reduction_pct:                f64,
-    pipeline_requests:            i64,
-    direct_low_level_autorouted:  i64,
-    direct_low_level_rejected:    i64,
-    ambiguous_symbol_requests:    i64,
-    stale_capsule_prevented:      i64,
-    pipeline_compliance_pct:      f64,
+    total_requests: i64,
+    total_tokens_saved: i64,
+    total_file_tokens: i64,
+    reduction_pct: f64,
+    pipeline_requests: i64,
+    direct_low_level_autorouted: i64,
+    direct_low_level_rejected: i64,
+    ambiguous_symbol_requests: i64,
+    stale_capsule_prevented: i64,
+    pipeline_compliance_pct: f64,
 }
 
 #[derive(Serialize)]
 struct DatabaseSnapshot {
-    path:         String,
-    size_mb:      f64,
-    repo_count:   i64,
+    path: String,
+    size_mb: f64,
+    repo_count: i64,
     symbol_count: i64,
-    file_count:   i64,
-    repos:        Vec<IndexedRepoSnapshot>,
+    file_count: i64,
+    repos: Vec<IndexedRepoSnapshot>,
 }
 
 #[derive(Serialize)]
 struct IndexedRepoSnapshot {
-    repo_id:      String,
-    root_path:    String,
+    repo_id: String,
+    root_path: String,
     symbol_count: i64,
-    file_count:   i64,
+    file_count: i64,
 }
 
 async fn stats_handler(State(state): State<AppState>) -> axum::response::Response {
     let sess = match state.session.lock() {
-        Ok(g)  => g,
+        Ok(g) => g,
         Err(_) => return axum::Json(serde_json::json!({"error": "lock poisoned"})).into_response(),
     };
     let reduction_pct = if sess.total_file_tokens == 0 {
@@ -269,10 +311,10 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
         (sess.total_tokens_saved as f64 / sess.total_file_tokens as f64) * 100.0
     };
     let session = SessionSnapshot {
-        total_requests:       sess.total_requests,
+        total_requests: sess.total_requests,
         total_capsule_tokens: sess.total_capsule_tokens,
-        total_file_tokens:    sess.total_file_tokens,
-        total_tokens_saved:   sess.total_tokens_saved,
+        total_file_tokens: sess.total_file_tokens,
+        total_tokens_saved: sess.total_tokens_saved,
         reduction_pct,
         recent_events: sess.recent_events.iter().cloned().collect(),
     };
@@ -280,13 +322,19 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
 
     let lifetime = {
         let conn = match state.db.lock() {
-            Ok(g)  => g,
-            Err(_) => return axum::Json(serde_json::json!({"error": "lock poisoned"})).into_response(),
+            Ok(g) => g,
+            Err(_) => {
+                return axum::Json(serde_json::json!({"error": "lock poisoned"})).into_response()
+            }
         };
-        let req   = crate::db::read_stat(&conn, "total_requests");
+        let req = crate::db::read_stat(&conn, "total_requests");
         let saved = crate::db::read_stat(&conn, "total_tokens_saved");
-        let file  = crate::db::read_stat(&conn, "total_file_tokens");
-        let rpct  = if file == 0 { 0.0 } else { (saved as f64 / file as f64) * 100.0 };
+        let file = crate::db::read_stat(&conn, "total_file_tokens");
+        let rpct = if file == 0 {
+            0.0
+        } else {
+            (saved as f64 / file as f64) * 100.0
+        };
         let pipeline = crate::db::read_stat(&conn, "pipeline_requests");
         let autorouted = crate::db::read_stat(&conn, "direct_low_level_autorouted");
         let rejected = crate::db::read_stat(&conn, "direct_low_level_rejected");
@@ -299,23 +347,25 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
             (pipeline as f64 / compliance_total as f64) * 100.0
         };
         LifetimeSnapshot {
-            total_requests:              req,
-            total_tokens_saved:          saved,
-            total_file_tokens:           file,
-            reduction_pct:               rpct,
-            pipeline_requests:           pipeline,
+            total_requests: req,
+            total_tokens_saved: saved,
+            total_file_tokens: file,
+            reduction_pct: rpct,
+            pipeline_requests: pipeline,
             direct_low_level_autorouted: autorouted,
-            direct_low_level_rejected:   rejected,
-            ambiguous_symbol_requests:   ambiguous,
-            stale_capsule_prevented:     stale,
-            pipeline_compliance_pct:     compliance_pct,
+            direct_low_level_rejected: rejected,
+            ambiguous_symbol_requests: ambiguous,
+            stale_capsule_prevented: stale,
+            pipeline_compliance_pct: compliance_pct,
         }
     };
 
     let database = {
         let conn = match state.db.lock() {
-            Ok(g)  => g,
-            Err(_) => return axum::Json(serde_json::json!({"error": "lock poisoned"})).into_response(),
+            Ok(g) => g,
+            Err(_) => {
+                return axum::Json(serde_json::json!({"error": "lock poisoned"})).into_response()
+            }
         };
         let db_path = match crate::db::connected_database_path(&conn) {
             Ok(path) => path,
@@ -358,7 +408,12 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
         }
     };
 
-    axum::Json(StatsResponse { session, lifetime, database }).into_response()
+    axum::Json(StatsResponse {
+        session,
+        lifetime,
+        database,
+    })
+    .into_response()
 }
 
 // ── Compare handler ───────────────────────────────────────────────────────────
@@ -366,18 +421,18 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
 #[derive(Deserialize)]
 struct CompareQuery {
     #[allow(dead_code)] // Deserialized from query params but no longer used for file reads (C-1)
-    filepath:  String,
+    filepath: String,
     tool_used: String,
-    symbol:    Option<String>,
-    repo:      Option<String>,
-    ts:        Option<u64>,
+    symbol: Option<String>,
+    repo: Option<String>,
+    ts: Option<u64>,
 }
 
 #[derive(Serialize)]
 struct CompareResponse {
-    original_text:    String,
-    optimized_text:   String,
-    original_length:  usize,
+    original_text: String,
+    optimized_text: String,
+    original_length: usize,
     optimized_length: usize,
 }
 
@@ -394,15 +449,21 @@ async fn compare_handler(
         "get_context_capsule" => {
             let symbol = match params.symbol.as_deref().filter(|s| !s.is_empty()) {
                 Some(s) => s.to_string(),
-                None => return axum::Json(serde_json::json!({
-                    "error": "Missing 'symbol' parameter for get_context_capsule"
-                })).into_response(),
+                None => {
+                    return axum::Json(serde_json::json!({
+                        "error": "Missing 'symbol' parameter for get_context_capsule"
+                    }))
+                    .into_response()
+                }
             };
             let repo = match params.repo.as_deref().filter(|r| !r.is_empty()) {
                 Some(r) => r.to_string(),
-                None => return axum::Json(serde_json::json!({
-                    "error": "Missing 'repo' parameter for get_context_capsule"
-                })).into_response(),
+                None => {
+                    return axum::Json(serde_json::json!({
+                        "error": "Missing 'repo' parameter for get_context_capsule"
+                    }))
+                    .into_response()
+                }
             };
 
             // Check the in-memory text cache first. This is populated from the
@@ -412,15 +473,18 @@ async fn compare_handler(
             // (e.g., Cursor + Copilot both running Marrow from different CWDs).
             let cache_key = format!("{}@{}@{}", symbol, repo, params.ts.unwrap_or_default());
             if let Ok(sess) = state.session.lock() {
-                if let Some((original_text, optimized_text)) = sess.capsule_text_cache.get(&cache_key) {
-                    let original_length  = original_text.len() / 4;
+                if let Some((original_text, optimized_text)) =
+                    sess.capsule_text_cache.get(&cache_key)
+                {
+                    let original_length = original_text.len() / 4;
                     let optimized_length = optimized_text.len() / 4;
                     return axum::Json(CompareResponse {
-                        original_text:    original_text.clone(),
-                        optimized_text:   optimized_text.clone(),
+                        original_text: original_text.clone(),
+                        optimized_text: optimized_text.clone(),
                         original_length,
                         optimized_length,
-                    }).into_response();
+                    })
+                    .into_response();
                 }
             }
 
@@ -430,7 +494,9 @@ async fn compare_handler(
                 })).into_response();
             }
 
-            if crate::retrieval::capsule_original_mode() == crate::retrieval::CapsuleOriginalMode::None {
+            if crate::retrieval::capsule_original_mode()
+                == crate::retrieval::CapsuleOriginalMode::None
+            {
                 return axum::Json(serde_json::json!({
                     "error": "Compare baseline unavailable: full-file original text is not retained when MARROW_CAPSULE_ORIGINAL_MODE is none (default). Pass a snapshot timestamp from telemetry, or set MARROW_CAPSULE_ORIGINAL_MODE=full to rebuild from disk."
                 })).into_response();
@@ -440,23 +506,28 @@ async fn compare_handler(
             // the Hub and the capsule-serving process share the same DB file,
             // or when the cache was evicted (>100 entries).
             let conn = match state.db.lock() {
-                Ok(g)  => g,
-                Err(_) => return axum::Json(serde_json::json!({"error": "DB mutex poisoned"})).into_response(),
+                Ok(g) => g,
+                Err(_) => {
+                    return axum::Json(serde_json::json!({"error": "DB mutex poisoned"}))
+                        .into_response()
+                }
             };
             match crate::retrieval::get_context_capsule(&conn, &symbol, &repo, None) {
                 Ok(result) => {
-                    let original_length  = result.file_tokens;
+                    let original_length = result.file_tokens;
                     let optimized_length = result.optimized_text.len() / 4;
                     axum::Json(CompareResponse {
-                        original_text:    result.original_text,
-                        optimized_text:   result.optimized_text,
+                        original_text: result.original_text,
+                        optimized_text: result.optimized_text,
                         original_length,
                         optimized_length,
-                    }).into_response()
+                    })
+                    .into_response()
                 }
                 Err(e) => axum::Json(serde_json::json!({
                     "error": format!("Could not build capsule for '{}': {}", symbol, e)
-                })).into_response(),
+                }))
+                .into_response(),
             }
         }
         _ => {
@@ -472,10 +543,7 @@ async fn compare_handler(
 /// Allowed dashboard origins for handler-level validation.
 /// Requests with no Origin header are allowed (local/internal clients).
 /// Only the dashboard's own localhost origins are trusted.
-const ALLOWED_ORIGINS: &[&str] = &[
-    "http://127.0.0.1:8765",
-    "http://localhost:8765",
-];
+const ALLOWED_ORIGINS: &[&str] = &["http://127.0.0.1:8765", "http://localhost:8765"];
 
 /// Validate the Origin header: allow if absent (internal/local) or matching
 /// a trusted localhost origin. Returns `Err(403)` for untrusted origins.
@@ -512,19 +580,21 @@ async fn emit_handler(
     let sess_result = state.session.lock();
     match sess_result {
         Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        Ok(mut sess) => {
-            match &event {
-                DashboardEvent::CapsuleServed { capsule_tokens, file_tokens, .. } => {
-                    sess.record_capsule(*capsule_tokens, *file_tokens, event.clone());
-                }
-                other => {
-                    sess.recent_events.push_front(other.clone());
-                    if sess.recent_events.len() > 50 {
-                        sess.recent_events.pop_back();
-                    }
+        Ok(mut sess) => match &event {
+            DashboardEvent::CapsuleServed {
+                capsule_tokens,
+                file_tokens,
+                ..
+            } => {
+                sess.record_capsule(*capsule_tokens, *file_tokens, event.clone());
+            }
+            other => {
+                sess.recent_events.push_front(other.clone());
+                if sess.recent_events.len() > 50 {
+                    sess.recent_events.pop_back();
                 }
             }
-        }
+        },
     }
     // Strip text blobs from SSE broadcast. The full texts are already cached
     // inside SessionStats.capsule_text_cache — browsers don't need them in
@@ -532,11 +602,27 @@ async fn emit_handler(
     // whether the delta viewer button should be enabled.
     let broadcast_event = match event {
         DashboardEvent::CapsuleServed {
-            symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts, has_cached_delta, ..
+            symbol,
+            repo,
+            file,
+            capsule_tokens,
+            file_tokens,
+            tokens_saved,
+            origin,
+            ts,
+            has_cached_delta,
+            ..
         } => DashboardEvent::CapsuleServed {
-            symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts,
-            original_text:    None,
-            optimized_text:   None,
+            symbol,
+            repo,
+            file,
+            capsule_tokens,
+            file_tokens,
+            tokens_saved,
+            origin,
+            ts,
+            original_text: None,
+            optimized_text: None,
             has_cached_delta,
         },
         other => other,
@@ -559,26 +645,34 @@ struct GraphNeighborsQuery {
 
 #[derive(Serialize)]
 struct GraphNodeDto {
-    id:          String,
-    label:       String,
-    file_path:   String,
+    id: String,
+    label: String,
+    file_path: String,
     symbol_type: String,
-    degree:      i64,
+    degree: i64,
 }
 
 #[derive(Serialize)]
 struct GraphEdgeDto {
-    source:       String,
-    target:       String,
+    source: String,
+    target: String,
     relationship: String,
 }
 
 #[derive(Serialize)]
 struct GraphResponse {
-    nodes:            Vec<GraphNodeDto>,
-    edges:            Vec<GraphEdgeDto>,
-    truncated:        bool,
+    nodes: Vec<GraphNodeDto>,
+    edges: Vec<GraphEdgeDto>,
+    truncated: bool,
     total_node_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    performance: Option<GraphPerformanceDto>,
+}
+
+#[derive(Serialize)]
+struct GraphPerformanceDto {
+    initial_node_cap: usize,
+    degree_cache: &'static str,
 }
 
 #[derive(Serialize)]
@@ -592,8 +686,10 @@ async fn graph_handler(
     Query(params): Query<GraphQuery>,
 ) -> axum::response::Response {
     let conn = match state.db.lock() {
-        Ok(g)  => g,
-        Err(_) => return axum::Json(serde_json::json!({"error": "DB mutex poisoned"})).into_response(),
+        Ok(g) => g,
+        Err(_) => {
+            return axum::Json(serde_json::json!({"error": "DB mutex poisoned"})).into_response()
+        }
     };
 
     let total_node_count: i64 = conn
@@ -604,84 +700,78 @@ async fn graph_handler(
         )
         .unwrap_or(0);
 
-    // Pre-aggregate edge degrees in a single scan rather than using a
-    // correlated subquery in ORDER BY (which was O(n × m)).
+    let degree_cache_rebuilt = match crate::db::ensure_graph_degrees(&conn, &params.repo_id) {
+        Ok(rebuilt) => rebuilt,
+        Err(e) => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+    };
+
     let nodes: Vec<GraphNodeDto> = {
-        let mut stmt = match conn.prepare(
-            "WITH edge_counts AS ( \
-               SELECT id, COUNT(*) AS cnt FROM ( \
-                 SELECT source_id AS id FROM edges \
-                 UNION ALL \
-                 SELECT target_id AS id FROM edges \
-               ) GROUP BY id \
-             ) \
-             SELECT n.id, n.symbol_name, n.file_path, \
-                    COALESCE(n.symbol_type, 'unknown'), \
-                    COALESCE(ec.cnt, 0) AS degree \
-             FROM nodes n \
-             LEFT JOIN edge_counts ec ON ec.id = n.id \
-             WHERE n.repo_id = ?1 \
-             ORDER BY degree DESC \
-             LIMIT 500",
-        ) {
-            Ok(s)  => s,
-            Err(e) => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+        let mut stmt = match conn.prepare(GRAPH_TOP_NODES_SQL) {
+            Ok(s) => s,
+            Err(e) => {
+                return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response()
+            }
         };
-        let result: Vec<GraphNodeDto> = match stmt.query_map(rusqlite::params![params.repo_id], |row| {
-            Ok(GraphNodeDto {
-                id:          row.get(0)?,
-                label:       row.get(1)?,
-                file_path:   row.get(2)?,
-                symbol_type: row.get(3)?,
-                degree:      row.get(4)?,
-            })
-        }) {
+        let result: Vec<GraphNodeDto> = match stmt.query_map(
+            rusqlite::params![params.repo_id, GRAPH_INITIAL_NODE_CAP as i64],
+            |row| {
+                Ok(GraphNodeDto {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    file_path: row.get(2)?,
+                    symbol_type: row.get(3)?,
+                    degree: row.get(4)?,
+                })
+            },
+        ) {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e)   => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+            Err(e) => {
+                return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response()
+            }
         };
         result
     };
 
     let edges: Vec<GraphEdgeDto> = {
-        let mut stmt = match conn.prepare(
-            "WITH edge_counts AS ( \
-               SELECT id, COUNT(*) AS cnt FROM ( \
-                 SELECT source_id AS id FROM edges \
-                 UNION ALL \
-                 SELECT target_id AS id FROM edges \
-               ) GROUP BY id \
-             ), \
-             top_nodes AS ( \
-               SELECT n.id \
-               FROM nodes n \
-               LEFT JOIN edge_counts ec ON ec.id = n.id \
-               WHERE n.repo_id = ?1 \
-               ORDER BY COALESCE(ec.cnt, 0) DESC \
-               LIMIT 500 \
-             ) \
-             SELECT e.source_id, e.target_id, COALESCE(e.relationship_type, 'CALLS') \
-             FROM edges e \
-             WHERE e.source_id IN (SELECT id FROM top_nodes) \
-               AND e.target_id IN (SELECT id FROM top_nodes)",
-        ) {
-            Ok(s)  => s,
-            Err(e) => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+        let mut stmt = match conn.prepare(GRAPH_RETURNED_EDGES_SQL) {
+            Ok(s) => s,
+            Err(e) => {
+                return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response()
+            }
         };
-        let result: Vec<GraphEdgeDto> = match stmt.query_map(rusqlite::params![params.repo_id], |row| {
-            Ok(GraphEdgeDto {
-                source:       row.get(0)?,
-                target:       row.get(1)?,
-                relationship: row.get(2)?,
-            })
-        }) {
+        let result: Vec<GraphEdgeDto> = match stmt.query_map(
+            rusqlite::params![params.repo_id, GRAPH_INITIAL_NODE_CAP as i64],
+            |row| {
+                Ok(GraphEdgeDto {
+                    source: row.get(0)?,
+                    target: row.get(1)?,
+                    relationship: row.get(2)?,
+                })
+            },
+        ) {
             Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e)   => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+            Err(e) => {
+                return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response()
+            }
         };
         result
     };
 
-    axum::Json(GraphResponse { truncated: total_node_count > 500, total_node_count, nodes, edges })
-        .into_response()
+    axum::Json(GraphResponse {
+        truncated: total_node_count > GRAPH_INITIAL_NODE_CAP as i64,
+        total_node_count,
+        nodes,
+        edges,
+        performance: Some(GraphPerformanceDto {
+            initial_node_cap: GRAPH_INITIAL_NODE_CAP,
+            degree_cache: if degree_cache_rebuilt {
+                "rebuilt"
+            } else {
+                "ready"
+            },
+        }),
+    })
+    .into_response()
 }
 
 async fn graph_neighbors_handler(
@@ -689,8 +779,10 @@ async fn graph_neighbors_handler(
     Query(params): Query<GraphNeighborsQuery>,
 ) -> axum::response::Response {
     let conn = match state.db.lock() {
-        Ok(g)  => g,
-        Err(_) => return axum::Json(serde_json::json!({"error": "DB mutex poisoned"})).into_response(),
+        Ok(g) => g,
+        Err(_) => {
+            return axum::Json(serde_json::json!({"error": "DB mutex poisoned"})).into_response()
+        }
     };
 
     let nodes: Vec<GraphNodeDto> = {
@@ -718,21 +810,26 @@ async fn graph_neighbors_handler(
              LEFT JOIN deg ON deg.id = n.id \
              WHERE n.id = ?1 OR n.id IN (SELECT id FROM neighbor_ids)",
         ) {
-            Ok(s)  => s,
-            Err(e) => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+            Ok(s) => s,
+            Err(e) => {
+                return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response()
+            }
         };
-        let result: Vec<GraphNodeDto> = match stmt.query_map(rusqlite::params![params.node_id], |row| {
-            Ok(GraphNodeDto {
-                id:          row.get(0)?,
-                label:       row.get(1)?,
-                file_path:   row.get(2)?,
-                symbol_type: row.get(3)?,
-                degree:      row.get(4)?,
-            })
-        }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e)   => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
-        };
+        let result: Vec<GraphNodeDto> =
+            match stmt.query_map(rusqlite::params![params.node_id], |row| {
+                Ok(GraphNodeDto {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    file_path: row.get(2)?,
+                    symbol_type: row.get(3)?,
+                    degree: row.get(4)?,
+                })
+            }) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(e) => {
+                    return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response()
+                }
+            };
         result
     };
 
@@ -742,19 +839,24 @@ async fn graph_neighbors_handler(
              FROM edges \
              WHERE source_id = ?1 OR target_id = ?1",
         ) {
-            Ok(s)  => s,
-            Err(e) => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+            Ok(s) => s,
+            Err(e) => {
+                return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response()
+            }
         };
-        let result: Vec<GraphEdgeDto> = match stmt.query_map(rusqlite::params![params.node_id], |row| {
-            Ok(GraphEdgeDto {
-                source:       row.get(0)?,
-                target:       row.get(1)?,
-                relationship: row.get(2)?,
-            })
-        }) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(e)   => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
-        };
+        let result: Vec<GraphEdgeDto> =
+            match stmt.query_map(rusqlite::params![params.node_id], |row| {
+                Ok(GraphEdgeDto {
+                    source: row.get(0)?,
+                    target: row.get(1)?,
+                    relationship: row.get(2)?,
+                })
+            }) {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(e) => {
+                    return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response()
+                }
+            };
         result
     };
 
@@ -769,14 +871,14 @@ async fn graph_neighbors_handler(
 /// server is running in the background. Returns `HubRole::Spoke` if the
 /// port is already taken — the caller continues in headless mode.
 pub async fn start(
-    tx:           broadcast::Sender<DashboardEvent>,
-    session:      Arc<Mutex<SessionStats>>,
-    db:           Arc<Mutex<rusqlite::Connection>>,
+    tx: broadcast::Sender<DashboardEvent>,
+    session: Arc<Mutex<SessionStats>>,
+    db: Arc<Mutex<rusqlite::Connection>>,
     auto_open_ui: bool,
 ) -> Result<HubRole> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 8765));
     let listener = match TcpListener::bind(addr).await {
-        Ok(l)  => l,
+        Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             return Ok(HubRole::Spoke);
         }
@@ -788,22 +890,24 @@ pub async fn start(
     let state = AppState { tx, session, db };
 
     let router = Router::new()
-        .route("/",                    get(index_handler))
-        .route("/d3-v7.min.js",        get(d3_handler))
-        .route("/stream",              get(sse_handler))
-        .route("/stats",               get(stats_handler))
-        .route("/api/compare",         get(compare_handler))
-        .route("/api/emit",            axum::routing::post(emit_handler))
-        .route("/api/graph",           get(graph_handler))
+        .route("/", get(index_handler))
+        .route("/d3-v7.min.js", get(d3_handler))
+        .route("/stream", get(sse_handler))
+        .route("/stats", get(stats_handler))
+        .route("/api/compare", get(compare_handler))
+        .route("/api/emit", axum::routing::post(emit_handler))
+        .route("/api/graph", get(graph_handler))
         .route("/api/graph/neighbors", get(graph_neighbors_handler))
         // C-1 FIX: Restrict CORS to same-origin. The dashboard is served from
         // http://127.0.0.1:8765 — only allow that origin rather than wildcard *.
         // Use from_static to avoid fallible parsing and .expect() in production.
         .layer(
             CorsLayer::new()
-                .allow_origin(axum::http::HeaderValue::from_static("http://127.0.0.1:8765"))
+                .allow_origin(axum::http::HeaderValue::from_static(
+                    "http://127.0.0.1:8765",
+                ))
                 .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
-                .allow_headers(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
         )
         .with_state(state);
 
@@ -844,7 +948,12 @@ mod tests {
 
         // 1 MiB + 1 byte should be rejected
         let oversized = Bytes::from(vec![0u8; EMIT_MAX_BODY_BYTES + 1]);
-        let response = emit_handler(axum::http::HeaderMap::new(), State(state.clone()), oversized).await;
+        let response = emit_handler(
+            axum::http::HeaderMap::new(),
+            State(state.clone()),
+            oversized,
+        )
+        .await;
         let response = axum::response::IntoResponse::into_response(response);
         assert_eq!(
             response.status(),
@@ -886,7 +995,11 @@ mod tests {
 
     #[test]
     fn emit_cap_is_one_mib() {
-        assert_eq!(EMIT_MAX_BODY_BYTES, 1024 * 1024, "emit cap must be exactly 1 MiB");
+        assert_eq!(
+            EMIT_MAX_BODY_BYTES,
+            1024 * 1024,
+            "emit cap must be exactly 1 MiB"
+        );
     }
 
     #[test]
@@ -987,5 +1100,353 @@ mod tests {
             axum::http::StatusCode::FORBIDDEN,
             "compare must reject untrusted origins"
         );
+    }
+
+    fn graph_test_state(conn: rusqlite::Connection) -> AppState {
+        let (tx, _rx) = broadcast::channel(4);
+        AppState {
+            tx,
+            session: Arc::new(Mutex::new(SessionStats::default())),
+            db: Arc::new(Mutex::new(conn)),
+        }
+    }
+
+    fn insert_graph_node(conn: &rusqlite::Connection, repo_id: &str, index: usize) -> String {
+        let id = format!("{repo_id}:node:{index:03}");
+        conn.execute(
+            "INSERT INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+             VALUES (?1, ?2, ?3, 'rs', ?4, 'function', ?5)",
+            rusqlite::params![
+                id,
+                repo_id,
+                format!("src/file_{index:03}.rs"),
+                format!("sym_{index:03}"),
+                format!("fn sym_{index:03}() {{}}")
+            ],
+        )
+        .unwrap();
+        format!("{repo_id}:node:{index:03}")
+    }
+
+    async fn graph_json(state: AppState, repo_id: &str) -> serde_json::Value {
+        use axum::body::to_bytes;
+        use axum::extract::{Query, State};
+
+        let response = graph_handler(
+            State(state),
+            Query(GraphQuery {
+                repo_id: repo_id.to_string(),
+            }),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn graph_neighbors_json(state: AppState, node_id: &str) -> serde_json::Value {
+        use axum::body::to_bytes;
+        use axum::extract::{Query, State};
+
+        let response = graph_neighbors_handler(
+            State(state),
+            Query(GraphNeighborsQuery {
+                node_id: node_id.to_string(),
+            }),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn insert_many_graph_nodes(conn: &mut rusqlite::Connection, repo_id: &str, count: usize) {
+        let tx = conn.transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+                     VALUES (?1, ?2, ?3, 'rs', ?4, 'function', ?5)",
+                )
+                .unwrap();
+            for index in 0..count {
+                let id = format!("{repo_id}:node:{index:06}");
+                stmt.execute(rusqlite::params![
+                    id,
+                    repo_id,
+                    format!("src/file_{index:06}.rs"),
+                    format!("sym_{index:06}"),
+                    format!("fn sym_{index:06}() {{}}")
+                ])
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    fn html_between(start_marker: &str, end_marker: &str) -> &'static str {
+        let start = INDEX_HTML.find(start_marker).unwrap();
+        let rest = &INDEX_HTML[start..];
+        let end = rest.find(end_marker).unwrap();
+        &rest[..end]
+    }
+
+    #[test]
+    fn graph_top_nodes_query_uses_cached_degree_rank_data() {
+        assert!(GRAPH_TOP_NODES_SQL.contains("graph_node_degrees"));
+        assert!(!GRAPH_TOP_NODES_SQL.contains("edge_counts"));
+        assert!(!GRAPH_TOP_NODES_SQL.contains("UNION ALL"));
+    }
+
+    #[tokio::test]
+    async fn graph_handler_caps_large_repo_and_filters_edges_to_returned_nodes() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES ('repo', '/tmp/repo')",
+            [],
+        )
+        .unwrap();
+        let ids: Vec<String> = (0..505)
+            .map(|i| insert_graph_node(&conn, "repo", i))
+            .collect();
+        for target in ids.iter().skip(1) {
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relationship_type) VALUES (?1, ?2, 'CALLS')",
+                rusqlite::params![ids[0], target],
+            )
+            .unwrap();
+        }
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relationship_type) VALUES (?1, 'missing', 'CALLS')",
+            rusqlite::params![ids[0]],
+        )
+        .unwrap();
+
+        let data = graph_json(graph_test_state(conn), "repo").await;
+        let nodes = data["nodes"].as_array().unwrap();
+        let edges = data["edges"].as_array().unwrap();
+        assert_eq!(nodes.len(), GRAPH_INITIAL_NODE_CAP);
+        assert_eq!(data["truncated"], true);
+        assert_eq!(data["total_node_count"], 505);
+        assert_eq!(nodes[0]["id"], ids[0]);
+
+        let returned: std::collections::HashSet<String> = nodes
+            .iter()
+            .map(|node| node["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!returned.contains(&ids[500]));
+        assert!(edges.iter().all(|edge| {
+            returned.contains(edge["source"].as_str().unwrap())
+                && returned.contains(edge["target"].as_str().unwrap())
+        }));
+        assert_eq!(edges.len(), GRAPH_INITIAL_NODE_CAP - 1);
+    }
+
+    #[tokio::test]
+    async fn graph_handler_caps_large_synthetic_repo_with_stable_degree_ranking() {
+        let mut conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES ('large', '/tmp/large')",
+            [],
+        )
+        .unwrap();
+        insert_many_graph_nodes(&mut conn, "large", 94_001);
+        let tx = conn.transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO edges (source_id, target_id, relationship_type)
+                     VALUES (?1, ?2, 'CALLS')",
+                )
+                .unwrap();
+            for target in 0..40 {
+                stmt.execute(rusqlite::params![
+                    "large:node:093000",
+                    format!("large:node:{target:06}")
+                ])
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let state = graph_test_state(conn);
+        let first = graph_json(state.clone(), "large").await;
+        let second = graph_json(state, "large").await;
+        let first_nodes = first["nodes"].as_array().unwrap();
+        let second_nodes = second["nodes"].as_array().unwrap();
+
+        assert_eq!(first_nodes.len(), GRAPH_INITIAL_NODE_CAP);
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["total_node_count"], 94_001);
+        assert_eq!(
+            first["performance"]["initial_node_cap"],
+            GRAPH_INITIAL_NODE_CAP
+        );
+        assert_eq!(first["nodes"][0]["id"], "large:node:093000");
+
+        let first_ids: Vec<&str> = first_nodes
+            .iter()
+            .take(25)
+            .map(|node| node["id"].as_str().unwrap())
+            .collect();
+        let second_ids: Vec<&str> = second_nodes
+            .iter()
+            .take(25)
+            .map(|node| node["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(first_ids, second_ids);
+    }
+
+    #[tokio::test]
+    async fn graph_handler_rebuilds_dirty_degree_cache_before_ranking() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES ('repo', '/tmp/repo')",
+            [],
+        )
+        .unwrap();
+        let ids: Vec<String> = (0..505)
+            .map(|i| insert_graph_node(&conn, "repo", i))
+            .collect();
+        for target in ids.iter().skip(1) {
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relationship_type) VALUES (?1, ?2, 'CALLS')",
+                rusqlite::params![ids[0], target],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO graph_node_degrees (repo_id, node_id, degree) VALUES ('repo', ?1, 9999)",
+            rusqlite::params![ids[504]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO graph_degree_cache_meta (repo_id, node_count, dirty, refreshed_at)
+             VALUES ('repo', 505, 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        let data = graph_json(graph_test_state(conn), "repo").await;
+        assert_eq!(data["nodes"][0]["id"], ids[0]);
+    }
+
+    #[tokio::test]
+    async fn graph_handler_returns_stable_capped_nodes_for_repo_without_edges() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES ('repo', '/tmp/repo')",
+            [],
+        )
+        .unwrap();
+        let ids: Vec<String> = (0..502)
+            .map(|i| insert_graph_node(&conn, "repo", i))
+            .collect();
+
+        let data = graph_json(graph_test_state(conn), "repo").await;
+        let nodes = data["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), GRAPH_INITIAL_NODE_CAP);
+        assert_eq!(data["edges"].as_array().unwrap().len(), 0);
+        assert_eq!(data["truncated"], true);
+        assert_eq!(data["total_node_count"], 502);
+        assert_eq!(nodes[0]["id"], ids[0]);
+        assert_eq!(nodes[GRAPH_INITIAL_NODE_CAP - 1]["id"], ids[499]);
+    }
+
+    #[tokio::test]
+    async fn graph_neighbors_returns_direct_neighbors_without_initial_cap() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES ('repo', '/tmp/repo')",
+            [],
+        )
+        .unwrap();
+        let ids: Vec<String> = (0..620)
+            .map(|i| insert_graph_node(&conn, "repo", i))
+            .collect();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relationship_type) VALUES (?1, ?2, 'CALLS'), (?1, ?3, 'CALLS')",
+            rusqlite::params![ids[610], ids[611], ids[612]],
+        )
+        .unwrap();
+
+        let data = graph_neighbors_json(graph_test_state(conn), &ids[610]).await;
+        let returned: std::collections::HashSet<String> = data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(returned.len(), 3);
+        assert!(returned.contains(&ids[610]));
+        assert!(returned.contains(&ids[611]));
+        assert!(returned.contains(&ids[612]));
+        assert_eq!(data["edges"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn legacy_graph_clients_can_ignore_optional_metadata() {
+        #[derive(serde::Deserialize)]
+        struct LegacyGraphResponse {
+            nodes: Vec<serde_json::Value>,
+            edges: Vec<serde_json::Value>,
+            truncated: bool,
+            total_node_count: i64,
+        }
+
+        let with_metadata = serde_json::json!({
+            "nodes": [{"id": "n1"}],
+            "edges": [],
+            "truncated": true,
+            "total_node_count": 2,
+            "performance": {"initial_node_cap": 500, "degree_cache": "ready"},
+            "future_metadata": {"ignored": true}
+        });
+        let without_metadata = serde_json::json!({
+            "nodes": [],
+            "edges": [],
+            "truncated": false,
+            "total_node_count": 0
+        });
+
+        let parsed_with: LegacyGraphResponse = serde_json::from_value(with_metadata).unwrap();
+        let parsed_without: LegacyGraphResponse = serde_json::from_value(without_metadata).unwrap();
+
+        assert_eq!(parsed_with.nodes.len(), 1);
+        assert_eq!(parsed_with.edges.len(), 0);
+        assert!(parsed_with.truncated);
+        assert_eq!(parsed_with.total_node_count, 2);
+        assert_eq!(parsed_without.nodes.len(), 0);
+        assert_eq!(parsed_without.edges.len(), 0);
+        assert!(!parsed_without.truncated);
+        assert_eq!(parsed_without.total_node_count, 0);
+    }
+
+    #[test]
+    fn dashboard_html_keeps_sidebar_rebuild_out_of_simulation_ticks() {
+        let tick_handler = html_between("treeSim.on('tick'", "treeSim.on('end'");
+        assert!(tick_handler.contains("drawFrame();"));
+        assert!(!tick_handler.contains("treeRebuildDirTree"));
+
+        let render_handler = html_between("function treeRenderPrepared", "function treeSetFocus");
+        assert!(render_handler.contains("treeRebuildDirTree();"));
+    }
+
+    #[test]
+    fn dashboard_html_has_progress_stale_load_and_render_failure_guards() {
+        let select_repo = html_between("function treeSelectRepo", "function treeOnTabActivate");
+        assert!(select_repo.contains("const loadId = ++treeLoadSeq"));
+        assert!(select_repo.contains("treeLoadAbort.abort()"));
+        assert!(select_repo.contains("treeSetLoadState('fetching'"));
+        assert!(select_repo.contains("treeSetLoadState('preparing'"));
+        assert!(select_repo.contains("treeSetLoadState('layout'"));
+        assert!(select_repo.contains("if (loadId !== treeLoadSeq) return"));
+        assert!(select_repo.contains("treeClearLoadState(loadId)"));
+        assert!(select_repo.contains("treeShowLoadError(loadId, 'Render failed: ' + err.message)"));
+        assert!(select_repo.contains("treeShowLoadError(loadId, 'Fetch failed: ' + err.message)"));
+
+        let cache_refresh = html_between("function treeRefreshShapeCaches", "// ── Canvas init");
+        assert!(cache_refresh.contains("const cadence = denseGraph && simAlpha > 0.06 ? 8 : 1"));
+        assert!(cache_refresh.contains("treeFrameCounter - treeLastHullFrame < cadence"));
+        assert!(cache_refresh.contains("treeLastHullFrame = treeFrameCounter"));
     }
 }

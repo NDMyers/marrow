@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Result};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use std::fs;
 use rayon::ThreadPoolBuilder;
 use rusqlite::Connection;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, SyncSender};
@@ -29,8 +29,17 @@ pub struct Symbol {
 /// Build a stable node ID that disambiguates same-name symbols in the same file
 /// (e.g. C++ `class Widget` vs constructor `Widget`, or two same-name nested functions).
 /// Format: `repo_id:file_path:symbol_type:symbol_name:start_byte`
-pub fn make_node_id(repo_id: &str, file_path: &str, symbol_type: &str, symbol_name: &str, start_byte: usize) -> String {
-    format!("{}:{}:{}:{}:{}", repo_id, file_path, symbol_type, symbol_name, start_byte)
+pub fn make_node_id(
+    repo_id: &str,
+    file_path: &str,
+    symbol_type: &str,
+    symbol_name: &str,
+    start_byte: usize,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        repo_id, file_path, symbol_type, symbol_name, start_byte
+    )
 }
 
 /// One indexed file’s parse output: rel path, language tag, symbols, content hash, mtime (ns).
@@ -405,8 +414,8 @@ pub fn is_safe_to_parse(path: &Path) -> bool {
     const BLOCKED_EXTENSIONS: &[&str] = &[
         "pem", "key", "pkcs12", "pfx", // credentials
         "map", "pdf", "png", "jpg", "jpeg", "gif", "webp", // binary/noise
-        "zip", "gz", "tar",             // archives
-        "sqlite", "db",                 // databases
+        "zip", "gz", "tar", // archives
+        "sqlite", "db", // databases
     ];
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if BLOCKED_EXTENSIONS.contains(&ext) {
@@ -583,7 +592,10 @@ fn read_utf8_blob_capped(r: &mut impl Read, max_len: u64) -> std::io::Result<Str
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     String::from_utf8(buf).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("ingest spill: {e}"))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("ingest spill: {e}"),
+        )
     })
 }
 
@@ -639,7 +651,13 @@ fn read_spill_parsed_row(r: &mut impl Read) -> Result<Option<ParsedFileBatchRow>
         for _ in 0..callee_count {
             callees.push(read_utf8_blob(r)?);
         }
-        symbols.push(Symbol { name, symbol_type, raw_text, callees, start_byte });
+        symbols.push(Symbol {
+            name,
+            symbol_type,
+            raw_text,
+            callees,
+            start_byte,
+        });
     }
     Ok(Some((path, lang, symbols, hash, mtime)))
 }
@@ -657,16 +675,22 @@ fn load_known_files(
         "INSERT OR REPLACE INTO repositories (id, root_path) VALUES (?1, ?2)",
         rusqlite::params![repo_id, root_path.to_string_lossy().as_ref()],
     )?;
-    let mut stmt = conn.prepare(
-        "SELECT file_path, mtime_secs, content_hash FROM files WHERE repo_id = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT file_path, mtime_secs, content_hash FROM files WHERE repo_id = ?1")?;
     let rows: Vec<(String, i64, String)> = stmt
         .query_map(rusqlite::params![repo_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?
         .filter_map(|r| r.ok())
         .collect();
-    Ok(rows.into_iter().map(|(path, mtime, hash)| (path, (mtime, hash))).collect())
+    Ok(rows
+        .into_iter()
+        .map(|(path, mtime, hash)| (path, (mtime, hash)))
+        .collect())
 }
 
 // ── Phase B: pure CPU/IO — no DB connection held ──────────────────────────────
@@ -711,10 +735,8 @@ where
         .collect();
 
     let changed_total = changed.len().max(1);
-    let parse_outcome = changed
-        .par_iter()
-        .enumerate()
-        .try_for_each(|(idx, (rel, path, mtime, hash))| -> Result<()> {
+    let parse_outcome = changed.par_iter().enumerate().try_for_each(
+        |(idx, (rel, path, mtime, hash))| -> Result<()> {
             let tx = parsed_tx.clone();
             let result = match parse_file(path) {
                 Ok((lang, symbols)) => Some((rel.clone(), lang, symbols, hash.clone(), *mtime)),
@@ -731,7 +753,8 @@ where
                 })?;
             }
             Ok(())
-        });
+        },
+    );
     drop(parsed_tx);
     parse_outcome?;
     maybe_emit_progress(progress, progress_state, 80);
@@ -815,8 +838,15 @@ where
         .iter()
         .filter_map(|path| {
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            let rel = canonical.strip_prefix(root_path).ok()?.to_string_lossy().to_string();
-            let mtime = std::fs::metadata(path).ok()?.modified().ok()
+            let rel = canonical
+                .strip_prefix(root_path)
+                .ok()?
+                .to_string_lossy()
+                .to_string();
+            let mtime = std::fs::metadata(path)
+                .ok()?
+                .modified()
+                .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0);
@@ -839,41 +869,41 @@ where
 
     // Ensure `parsed_tx` is always dropped (closing the channel) even if Rayon panics,
     // so `spill_drainer_loop` cannot block forever in `recv`.
-    let parse_caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        match ThreadPoolBuilder::new()
-            .num_threads(ingest_threads)
-            .build()
-        {
-            Ok(pool) => pool.install(|| {
-                parallel_hash_and_parse_candidates(
-                    &candidates,
-                    known_files,
-                    parsed_tx,
-                    progress,
-                    progress_state,
-                )
-            }),
-            Err(e) => {
-                eprintln!(
-                    "[marrow] ingest thread pool build failed ({e}); using default rayon pool"
-                );
-                parallel_hash_and_parse_candidates(
-                    &candidates,
-                    known_files,
-                    parsed_tx,
-                    progress,
-                    progress_state,
-                )
-            }
-        }
-    }));
+    let parse_caught =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || match ThreadPoolBuilder::new().num_threads(ingest_threads).build() {
+                Ok(pool) => pool.install(|| {
+                    parallel_hash_and_parse_candidates(
+                        &candidates,
+                        known_files,
+                        parsed_tx,
+                        progress,
+                        progress_state,
+                    )
+                }),
+                Err(e) => {
+                    eprintln!(
+                        "[marrow] ingest thread pool build failed ({e}); using default rayon pool"
+                    );
+                    parallel_hash_and_parse_candidates(
+                        &candidates,
+                        known_files,
+                        parsed_tx,
+                        progress,
+                        progress_state,
+                    )
+                }
+            },
+        ));
 
     let parse_res = match parse_caught {
         Ok(r) => r,
         Err(_) => Err(anyhow!("ingest parse phase panicked")),
     };
 
-    let drain_res = drainer.join().map_err(|_| anyhow!("ingest spill drainer panicked"))?;
+    let drain_res = drainer
+        .join()
+        .map_err(|_| anyhow!("ingest spill drainer panicked"))?;
     if parse_res.is_err() || drain_res.is_err() {
         let _ = fs::remove_file(&spill_path);
     }
@@ -931,7 +961,11 @@ pub(crate) fn build_name_to_ids_for_symbol_names(
          WHERE n.repo_id = ?1",
     )?;
     let rows = stmt.query_map(rusqlite::params![repo_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     })?;
     for r in rows {
         let (name, id, file_path) = r?;
@@ -947,15 +981,16 @@ fn collect_node_ids_for_file(
     repo_id: &str,
     file_path: &str,
 ) -> Result<HashSet<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
-    )?;
+    let mut stmt = conn.prepare("SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2")?;
     let rows = stmt.query_map(rusqlite::params![repo_id, file_path], |row| row.get(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 /// Remove edges that referenced symbols removed from a file (MARROW-PERF-011).
-pub(crate) fn delete_edges_touching_removed_ids(conn: &Connection, removed_ids: &[String]) -> Result<()> {
+pub(crate) fn delete_edges_touching_removed_ids(
+    conn: &Connection,
+    removed_ids: &[String],
+) -> Result<()> {
     if removed_ids.is_empty() {
         return Ok(());
     }
@@ -998,7 +1033,6 @@ fn flush_calls_edge_batch(conn: &Connection, pairs: &[(String, String)]) -> Resu
     Ok(inserted)
 }
 
-
 /// Commit the computed changeset in a single transaction.
 /// Returns (total_symbol_count, calls_edge_count).
 ///
@@ -1016,6 +1050,8 @@ fn write_changeset<F>(
 where
     F: Fn(u8) + Send + Sync,
 {
+    crate::db::mark_graph_degrees_dirty(conn, repo_id)?;
+
     // BEGIN IMMEDIATE acquires a RESERVED lock immediately.
     // Other processes can still read but cannot write while this transaction runs.
     //
@@ -1079,9 +1115,8 @@ where
     // Remove nodes + file records for deleted files
     for file_path in &removed_rels {
         let syms: Vec<String> = {
-            let mut s = conn.prepare(
-                "SELECT symbol_name FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
-            )?;
+            let mut s = conn
+                .prepare("SELECT symbol_name FROM nodes WHERE repo_id = ?1 AND file_path = ?2")?;
             let collected: Vec<String> = s
                 .query_map(rusqlite::params![repo_id, file_path], |row| row.get(0))?
                 .filter_map(|r| r.ok())
@@ -1146,7 +1181,13 @@ where
 
         // Upsert in-place so stable `id` rows survive (FK-safe inbound edges from other files).
         for sym in &symbols {
-            let node_id = make_node_id(repo_id, &file_path, &sym.symbol_type, &sym.name, sym.start_byte);
+            let node_id = make_node_id(
+                repo_id,
+                &file_path,
+                &sym.symbol_type,
+                &sym.name,
+                sym.start_byte,
+            );
             let new_hash = crate::db::hash_raw_text(&sym.raw_text);
             if old_ids.contains(&node_id) {
                 conn.execute(
@@ -1247,10 +1288,7 @@ where
         )?;
         let abs_path = PathBuf::from(&repo_root).join(file_path);
         if let Ok(source) = fs::read_to_string(&abs_path) {
-            let lang_ext = abs_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let lang_ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let imports = extract_imports(&source, lang_ext);
             if !imports.is_empty() {
                 let mut ins = conn.prepare_cached(
@@ -1264,6 +1302,8 @@ where
     }
 
     maybe_emit_progress(progress, progress_state, 95);
+
+    crate::db::refresh_graph_degrees(conn, repo_id)?;
 
     let total: usize = conn.query_row(
         "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
@@ -1291,7 +1331,10 @@ where
         .unwrap_or_else(|_| root_path.to_path_buf());
 
     if !root_path.exists() {
-        return Err(anyhow!("The specified root_path does not exist: {}", root_path.display()));
+        return Err(anyhow!(
+            "The specified root_path does not exist: {}",
+            root_path.display()
+        ));
     }
 
     maybe_emit_progress(progress, progress_state, 5);
@@ -1361,7 +1404,10 @@ where
         .unwrap_or_else(|_| root_path.to_path_buf());
 
     if !root_path.exists() {
-        return Err(anyhow!("The specified root_path does not exist: {}", root_path.display()));
+        return Err(anyhow!(
+            "The specified root_path does not exist: {}",
+            root_path.display()
+        ));
     }
 
     let progress_state = Mutex::new(0u8);
@@ -1500,7 +1546,11 @@ pub fn resolve_cross_repo_edges(
             .collect();
         conn.prepare(&sql)?
             .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?
             .filter_map(|r| r.ok())
             .for_each(|(name, id, repo)| {
@@ -1511,6 +1561,7 @@ pub fn resolve_cross_repo_edges(
     // Pass 3 — resolve edges in memory, insert in one transaction
     let tx = conn.unchecked_transaction()?;
     let mut edge_count = 0;
+    let mut touched_repos: HashSet<String> = HashSet::new();
 
     for (import_name, sources) in &import_map {
         let Some(targets) = target_map.get(import_name) else {
@@ -1518,24 +1569,38 @@ pub fn resolve_cross_repo_edges(
         };
         for (source_id, source_repo) in sources {
             // Only cross-repo targets
-            let cross_repo: Vec<&String> = targets
+            let cross_repo: Vec<(&String, &String)> = targets
                 .iter()
                 .filter(|(_, target_repo)| target_repo != source_repo)
-                .map(|(id, _)| id)
+                .map(|(id, repo)| (id, repo))
                 .collect();
             // Skip ambiguous (multiple targets across repos)
             if cross_repo.len() == 1 {
-                tx.execute(
+                let (target_id, target_repo) = cross_repo[0];
+                let inserted = tx.execute(
                     "INSERT OR IGNORE INTO edges (source_id, target_id, relationship_type)
                      VALUES (?1, ?2, 'IMPORTS')",
-                    rusqlite::params![source_id, cross_repo[0]],
+                    rusqlite::params![source_id, target_id],
                 )?;
+                if inserted > 0 {
+                    touched_repos.insert(source_repo.clone());
+                    touched_repos.insert(target_repo.clone());
+                }
                 edge_count += 1;
             }
         }
     }
 
+    let mut touched_repo_list: Vec<String> = touched_repos.into_iter().collect();
+    touched_repo_list.sort();
+    for repo_id in &touched_repo_list {
+        crate::db::mark_graph_degrees_dirty(&tx, repo_id)?;
+    }
+
     tx.commit()?;
+    for repo_id in touched_repo_list {
+        crate::db::refresh_graph_degrees(conn, &repo_id)?;
+    }
     Ok(edge_count)
 }
 
@@ -1627,7 +1692,10 @@ def foo():
 "#;
         let calls = extract_calls_from_symbol(src, "py");
         assert!(calls.contains(&"bar".to_string()), "missing bar: {calls:?}");
-        assert!(calls.contains(&"method".to_string()), "missing method: {calls:?}");
+        assert!(
+            calls.contains(&"method".to_string()),
+            "missing method: {calls:?}"
+        );
         assert!(calls.contains(&"baz".to_string()), "missing baz: {calls:?}");
     }
 
@@ -1641,9 +1709,18 @@ fn foo() {
 }
 "#;
         let calls = extract_calls_from_symbol(src, "rs");
-        assert!(calls.contains(&"helper".to_string()), "missing helper: {calls:?}");
-        assert!(calls.contains(&"method".to_string()), "missing method: {calls:?}");
-        assert!(calls.contains(&"read".to_string()), "missing read: {calls:?}");
+        assert!(
+            calls.contains(&"helper".to_string()),
+            "missing helper: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"method".to_string()),
+            "missing method: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"read".to_string()),
+            "missing read: {calls:?}"
+        );
     }
 
     #[test]
@@ -1656,7 +1733,10 @@ function foo() {
 "#;
         let calls = extract_calls_from_symbol(src, "ts");
         assert!(calls.contains(&"bar".to_string()), "missing bar: {calls:?}");
-        assert!(calls.contains(&"method".to_string()), "missing method: {calls:?}");
+        assert!(
+            calls.contains(&"method".to_string()),
+            "missing method: {calls:?}"
+        );
     }
 
     #[test]
@@ -1668,7 +1748,8 @@ function foo() {
         conn.execute(
             "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
             rusqlite::params![repo_id, "/tmp/test"],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create a temp dir with two Python files
         let dir = std::env::temp_dir().join("marrow_test_calls");
@@ -1683,11 +1764,13 @@ function foo() {
         assert!(calls >= 1, "expected at least 1 CALLS edge, got {calls}");
 
         // Verify edge exists in DB
-        let edge_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM edges WHERE relationship_type = 'CALLS'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE relationship_type = 'CALLS'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(edge_count >= 1, "no CALLS edges in DB");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1715,7 +1798,11 @@ function foo() {
         assert!(calls >= 1, "initial ingest should create CALLS to helper");
 
         // Only caller.py changes; other.py stays out of the changeset.
-        std::fs::write(dir.join("caller.py"), "def main():\n    helper()\n# touch\n").unwrap();
+        std::fs::write(
+            dir.join("caller.py"),
+            "def main():\n    helper()\n# touch\n",
+        )
+        .unwrap();
 
         let (_syms, calls2) = ingest_repo(&conn, repo_id, &dir).unwrap();
         assert!(
@@ -1791,6 +1878,55 @@ function foo() {
     }
 
     #[test]
+    fn run_ingestion_refreshes_graph_degree_cache_after_edge_changes() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        let dir = std::env::temp_dir().join("marrow_test_graph_degree_refresh");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.canonicalize().unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, root.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        std::fs::write(
+            dir.join("main.py"),
+            "def a():\n    b()\n\ndef b():\n    pass\n",
+        )
+        .unwrap();
+        run_ingestion(&conn, repo_id, &dir).unwrap();
+        assert!(crate::db::graph_degrees_are_fresh(&conn, repo_id).unwrap());
+        let max_degree: i64 = conn
+            .query_row(
+                "SELECT MAX(degree) FROM graph_node_degrees WHERE repo_id = ?1",
+                rusqlite::params![repo_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(max_degree, 1);
+
+        std::fs::write(
+            dir.join("main.py"),
+            "def a():\n    pass\n\ndef b():\n    pass\n",
+        )
+        .unwrap();
+        run_ingestion(&conn, repo_id, &dir).unwrap();
+        assert!(crate::db::graph_degrees_are_fresh(&conn, repo_id).unwrap());
+        let max_degree: i64 = conn
+            .query_row(
+                "SELECT MAX(degree) FROM graph_node_degrees WHERE repo_id = ?1",
+                rusqlite::params![repo_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(max_degree, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_reingest_clears_stale_calls_edges() {
         let conn = crate::db::init_db(":memory:").unwrap();
 
@@ -1858,13 +1994,19 @@ function foo() {
         // Uses explicit Ruby call syntax (bar(), baz()) so tree-sitter-ruby parses them
         // as `call` nodes rather than ambiguous local-variable `identifier` nodes.
         let src = "def foo\n  bar()\n  baz()\nend\n";
-        let first  = extract_calls_from_symbol(src, "rb");
+        let first = extract_calls_from_symbol(src, "rb");
         let second = extract_calls_from_symbol(src, "rb");
-        let third  = extract_calls_from_symbol(src, "rb");
+        let third = extract_calls_from_symbol(src, "rb");
         assert_eq!(first, second, "repeated calls must return same result");
         assert_eq!(second, third, "repeated calls must return same result");
-        assert!(first.contains(&"bar".to_string()), "bar must be detected: {first:?}");
-        assert!(first.contains(&"baz".to_string()), "baz must be detected: {first:?}");
+        assert!(
+            first.contains(&"bar".to_string()),
+            "bar must be detected: {first:?}"
+        );
+        assert!(
+            first.contains(&"baz".to_string()),
+            "baz must be detected: {first:?}"
+        );
     }
 
     #[test]
@@ -1903,12 +2045,17 @@ function foo() {
         ingest_repo(&conn, "test", &dir).unwrap();
 
         // Count files records — should have 2
-        let file_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM files WHERE repo_id = 'test'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(file_count, 2, "files table should have 2 entries after first ingest");
+        let file_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE repo_id = 'test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            file_count, 2,
+            "files table should have 2 entries after first ingest"
+        );
 
         // Second ingest without changes — node count must be identical
         let (syms, _) = ingest_repo(&conn, "test", &dir).unwrap();
@@ -1928,9 +2075,16 @@ function foo() {
         ingest_repo(&conn, "test", &dir).unwrap();
 
         // Write new content (different hash) — force mtime change too
-        std::fs::write(dir.join("a.py"), "def alpha():\n    pass\ndef beta():\n    pass\n").unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def alpha():\n    pass\ndef beta():\n    pass\n",
+        )
+        .unwrap();
         let (syms, _) = ingest_repo(&conn, "test", &dir).unwrap();
-        assert_eq!(syms, 2, "modified file should result in 2 symbols (alpha + beta)");
+        assert_eq!(
+            syms, 2,
+            "modified file should result in 2 symbols (alpha + beta)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1949,19 +2103,26 @@ function foo() {
         std::fs::remove_file(dir.join("gone.py")).unwrap();
         ingest_repo(&conn, "test", &dir).unwrap();
 
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test' AND file_path = 'gone.py'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test' AND file_path = 'gone.py'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 0, "nodes for deleted file should be removed");
 
-        let files_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM files WHERE repo_id = 'test' AND file_path = 'gone.py'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(files_count, 0, "files record for deleted file should be removed");
+        let files_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE repo_id = 'test' AND file_path = 'gone.py'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            files_count, 0,
+            "files record for deleted file should be removed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1971,7 +2132,14 @@ function foo() {
         let conn = crate::db::init_db(":memory:").unwrap();
         conn.execute(
             "INSERT INTO repositories (id, root_path) VALUES (?1, ?2), (?3, ?4), (?5, ?6)",
-            rusqlite::params!["repo_a", "/tmp/repo_a", "repo_b", "/tmp/repo_b", "repo_c", "/tmp/repo_c"],
+            rusqlite::params![
+                "repo_a",
+                "/tmp/repo_a",
+                "repo_b",
+                "/tmp/repo_b",
+                "repo_c",
+                "/tmp/repo_c"
+            ],
         )
         .unwrap();
         conn.execute(
@@ -2054,6 +2222,133 @@ function foo() {
     }
 
     #[test]
+    fn resolve_cross_repo_after_ingest_refreshes_degree_cache_after_same_node_count_import_edge() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2), (?3, ?4)",
+            rusqlite::params!["repo_a", "/tmp/repo_a", "repo_b", "/tmp/repo_b"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7),
+                    (?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                "repo_a:main.py:main",
+                "repo_a",
+                "main.py",
+                "py",
+                "main",
+                "function",
+                "from shared_vendor import UniqueWidget\n",
+                "repo_b:widget.py:UniqueWidget",
+                "repo_b",
+                "widget.py",
+                "py",
+                "UniqueWidget",
+                "class",
+                "class UniqueWidget: pass\n"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_imports (repo_id, file_path, import_name) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["repo_a", "main.py", "UniqueWidget"],
+        )
+        .unwrap();
+
+        crate::db::refresh_graph_degrees(&conn, "repo_a").unwrap();
+        crate::db::refresh_graph_degrees(&conn, "repo_b").unwrap();
+        assert!(crate::db::graph_degrees_are_fresh(&conn, "repo_a").unwrap());
+        assert!(crate::db::graph_degrees_are_fresh(&conn, "repo_b").unwrap());
+
+        let edges = resolve_cross_repo_after_ingest(&conn, "repo_a").unwrap();
+        assert_eq!(edges, 1, "expected one unambiguous IMPORTS edge");
+        assert!(crate::db::graph_degrees_are_fresh(&conn, "repo_a").unwrap());
+        assert!(crate::db::graph_degrees_are_fresh(&conn, "repo_b").unwrap());
+
+        let source_degree: i64 = conn
+            .query_row(
+                "SELECT degree FROM graph_node_degrees WHERE repo_id = 'repo_a' AND node_id = 'repo_a:main.py:main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let target_degree: i64 = conn
+            .query_row(
+                "SELECT degree FROM graph_node_degrees WHERE repo_id = 'repo_b' AND node_id = 'repo_b:widget.py:UniqueWidget'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(source_degree, 1);
+        assert_eq!(target_degree, 1);
+    }
+
+    #[test]
+    fn resolve_cross_repo_edges_marks_degree_cache_dirty_before_refresh_failure() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2), (?3, ?4)",
+            rusqlite::params!["repo_a", "/tmp/repo_a", "repo_b", "/tmp/repo_b"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7),
+                    (?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                "repo_a:main.py:main",
+                "repo_a",
+                "main.py",
+                "py",
+                "main",
+                "function",
+                "from shared_vendor import UniqueWidget\n",
+                "repo_b:widget.py:UniqueWidget",
+                "repo_b",
+                "widget.py",
+                "py",
+                "UniqueWidget",
+                "class",
+                "class UniqueWidget: pass\n"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_imports (repo_id, file_path, import_name) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["repo_a", "main.py", "UniqueWidget"],
+        )
+        .unwrap();
+
+        crate::db::refresh_graph_degrees(&conn, "repo_a").unwrap();
+        crate::db::refresh_graph_degrees(&conn, "repo_b").unwrap();
+        assert!(crate::db::graph_degrees_are_fresh(&conn, "repo_a").unwrap());
+        assert!(crate::db::graph_degrees_are_fresh(&conn, "repo_b").unwrap());
+
+        conn.execute_batch(
+            "CREATE TRIGGER fail_graph_degree_refresh
+             BEFORE DELETE ON graph_node_degrees
+             BEGIN
+               SELECT RAISE(ABORT, 'stop graph degree refresh');
+             END;",
+        )
+        .unwrap();
+
+        let result = resolve_cross_repo_edges(&conn, Some("repo_a"));
+        assert!(result.is_err(), "refresh failure should surface to caller");
+        assert!(
+            !crate::db::graph_degrees_are_fresh(&conn, "repo_a").unwrap(),
+            "source repo cache must be dirty if post-commit refresh fails"
+        );
+        assert!(
+            !crate::db::graph_degrees_are_fresh(&conn, "repo_b").unwrap(),
+            "target repo cache must be dirty if post-commit refresh fails"
+        );
+    }
+
+    #[test]
     fn test_ruby_symbol_extraction() {
         let conn = crate::db::init_db(":memory:").unwrap();
         let dir = std::env::temp_dir().join("marrow_test_ruby2");
@@ -2067,8 +2362,10 @@ function foo() {
         .unwrap();
 
         let (syms, _edges) = ingest_repo(&conn, "test", &dir).unwrap();
-        
-        let mut stmt = conn.prepare("SELECT symbol_name, symbol_type FROM nodes WHERE repo_id = 'test'").unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT symbol_name, symbol_type FROM nodes WHERE repo_id = 'test'")
+            .unwrap();
         let rows: Vec<(String, String)> = stmt
             .query_map([], |row| Ok((row.get(0).unwrap(), row.get(1).unwrap())))
             .unwrap()
@@ -2087,7 +2384,10 @@ function foo() {
         let _ = std::fs::remove_dir_all(&dir);
 
         let result = ingest_repo(&conn, "test", &dir);
-        assert!(result.is_err(), "ingest_repo should return Err if the root_path does not exist");
+        assert!(
+            result.is_err(),
+            "ingest_repo should return Err if the root_path does not exist"
+        );
     }
 
     #[test]
@@ -2107,7 +2407,11 @@ function foo() {
 
         let updates = progress_updates.lock().unwrap();
         assert!(!updates.is_empty(), "expected progress callback to fire");
-        assert_eq!(updates.last().copied(), Some(100), "expected final progress to be 100: {updates:?}");
+        assert_eq!(
+            updates.last().copied(),
+            Some(100),
+            "expected final progress to be 100: {updates:?}"
+        );
         assert!(
             updates.windows(2).all(|window| window[0] <= window[1]),
             "progress should be monotonic: {updates:?}"
@@ -2186,7 +2490,10 @@ function foo() {
 
         std::env::remove_var("MARROW_INGEST_PARSE_QUEUE");
 
-        assert_eq!(fp_low, fp_high, "CALLS graph should match for queue K=1 vs K=64");
+        assert_eq!(
+            fp_low, fp_high,
+            "CALLS graph should match for queue K=1 vs K=64"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2208,11 +2515,15 @@ function foo() {
         std::fs::write(&big_path, &content).unwrap();
 
         let result = parse_file(&big_path);
-        assert!(result.is_ok(), "parse_file should not error on oversized file");
+        assert!(
+            result.is_ok(),
+            "parse_file should not error on oversized file"
+        );
         let (_lang, symbols) = result.unwrap();
         assert!(
             symbols.is_empty(),
-            "oversized file must produce zero symbols, got {}", symbols.len()
+            "oversized file must produce zero symbols, got {}",
+            symbols.len()
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2230,8 +2541,14 @@ function foo() {
 
         let (lang, symbols) = parse_file(&path).expect("parse_file should succeed for small file");
         assert_eq!(lang, "py");
-        assert!(!symbols.is_empty(), "small file should produce at least one symbol");
-        assert!(symbols.iter().any(|s| s.name == "small_fn"), "expected 'small_fn' in symbols");
+        assert!(
+            !symbols.is_empty(),
+            "small file should produce at least one symbol"
+        );
+        assert!(
+            symbols.iter().any(|s| s.name == "small_fn"),
+            "expected 'small_fn' in symbols"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2256,7 +2573,8 @@ function foo() {
         std::fs::write(&big_path, &big_content).unwrap();
 
         let conn = crate::db::init_db(":memory:").unwrap();
-        ingest_repo(&conn, "test", &dir).expect("ingest_repo must succeed even with oversized files");
+        ingest_repo(&conn, "test", &dir)
+            .expect("ingest_repo must succeed even with oversized files");
 
         // The oversized file's symbol must not appear in the graph.
         let oversize_fn_count: i64 = conn
@@ -2266,7 +2584,10 @@ function foo() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(oversize_fn_count, 0, "oversize_fn from 3 MiB file must not appear in the graph");
+        assert_eq!(
+            oversize_fn_count, 0,
+            "oversize_fn from 3 MiB file must not appear in the graph"
+        );
 
         // The normal file's symbol must still be present.
         let normal_fn_count: i64 = conn
@@ -2276,7 +2597,10 @@ function foo() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(normal_fn_count, 1, "normal_fn from small file must still be indexed");
+        assert_eq!(
+            normal_fn_count, 1,
+            "normal_fn from small file must still be indexed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2303,7 +2627,10 @@ function foo() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(edge_count > 0, "at least one CALLS edge must exist after ingest");
+        assert!(
+            edge_count > 0,
+            "at least one CALLS edge must exist after ingest"
+        );
 
         // Verify the specific edge: caller → callee
         let edge_exists: i64 = conn
@@ -2317,7 +2644,10 @@ function foo() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(edge_exists, 1, "CALLS edge from 'caller' to 'callee' must exist");
+        assert_eq!(
+            edge_exists, 1,
+            "CALLS edge from 'caller' to 'callee' must exist"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2357,10 +2687,22 @@ function foo() {
 
         // Verify expected canonical kinds exist
         let kinds: Vec<&str> = rows.iter().map(|(_, k)| k.as_str()).collect();
-        assert!(kinds.contains(&"function"), "expected 'function' kind in: {kinds:?}");
-        assert!(kinds.contains(&"struct"), "expected 'struct' kind in: {kinds:?}");
-        assert!(kinds.contains(&"trait"), "expected 'trait' kind in: {kinds:?}");
-        assert!(kinds.contains(&"enum"), "expected 'enum' kind in: {kinds:?}");
+        assert!(
+            kinds.contains(&"function"),
+            "expected 'function' kind in: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"struct"),
+            "expected 'struct' kind in: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"trait"),
+            "expected 'trait' kind in: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"enum"),
+            "expected 'enum' kind in: {kinds:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2385,7 +2727,8 @@ public:
 
 void processWidget() {}
 "#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let conn = crate::db::init_db(":memory:").unwrap();
         ingest_repo(&conn, "test", &dir).unwrap();
@@ -2416,7 +2759,10 @@ void processWidget() {}
     fn make_node_id_includes_start_byte() {
         let id_a = make_node_id("r", "f.py", "function", "foo", 0);
         let id_b = make_node_id("r", "f.py", "function", "foo", 100);
-        assert_ne!(id_a, id_b, "same-name same-kind at different positions must differ");
+        assert_ne!(
+            id_a, id_b,
+            "same-name same-kind at different positions must differ"
+        );
     }
 
     /// .marrowrc.json ignore patterns exclude matching directories from ingestion.
@@ -2427,14 +2773,15 @@ void processWidget() {}
         std::fs::create_dir_all(&dir).unwrap();
 
         // Create a .marrowrc.json that ignores "generated"
-        std::fs::write(
-            dir.join(".marrowrc.json"),
-            r#"{"ignore": ["generated"]}"#,
-        ).unwrap();
+        std::fs::write(dir.join(".marrowrc.json"), r#"{"ignore": ["generated"]}"#).unwrap();
 
         // Create files in the ignored directory and a normal directory
         std::fs::create_dir_all(dir.join("generated")).unwrap();
-        std::fs::write(dir.join("generated").join("auto.py"), "def auto():\n    pass\n").unwrap();
+        std::fs::write(
+            dir.join("generated").join("auto.py"),
+            "def auto():\n    pass\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("real.py"), "def real():\n    pass\n").unwrap();
 
         let conn = crate::db::init_db(":memory:").unwrap();
@@ -2448,7 +2795,10 @@ void processWidget() {}
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(auto_count, 0, "files under ignored 'generated/' dir should be excluded");
+        assert_eq!(
+            auto_count, 0,
+            "files under ignored 'generated/' dir should be excluded"
+        );
 
         // real.py should be included
         let real_count: i64 = conn
@@ -2458,7 +2808,10 @@ void processWidget() {}
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(real_count, 1, "real.py outside ignored dir should be indexed");
+        assert_eq!(
+            real_count, 1,
+            "real.py outside ignored dir should be indexed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2471,10 +2824,7 @@ void processWidget() {}
         std::fs::create_dir_all(&dir).unwrap();
 
         // Pattern uses trailing slash: "output/"
-        std::fs::write(
-            dir.join(".marrowrc.json"),
-            r#"{"ignore": ["output/"]}"#,
-        ).unwrap();
+        std::fs::write(dir.join(".marrowrc.json"), r#"{"ignore": ["output/"]}"#).unwrap();
 
         std::fs::create_dir_all(dir.join("output")).unwrap();
         std::fs::write(dir.join("output").join("gen.py"), "def gen():\n    pass\n").unwrap();
@@ -2490,7 +2840,10 @@ void processWidget() {}
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(gen_count, 0, "'output/' with trailing slash should still exclude");
+        assert_eq!(
+            gen_count, 0,
+            "'output/' with trailing slash should still exclude"
+        );
 
         let keep_count: i64 = conn
             .query_row(

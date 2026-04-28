@@ -12,10 +12,10 @@ use tokio::sync::broadcast;
 use crate::dashboard::{self, DashboardEvent};
 use crate::ingestion;
 
-fn indexed_repos(
-    db: &Arc<Mutex<rusqlite::Connection>>,
-) -> Result<Vec<(String, PathBuf)>> {
-    let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+fn indexed_repos(db: &Arc<Mutex<rusqlite::Connection>>) -> Result<Vec<(String, PathBuf)>> {
+    let conn = db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
     let mut stmt = conn.prepare("SELECT id, root_path FROM repositories")?;
     let repos = stmt
         .query_map([], |row| {
@@ -61,18 +61,21 @@ pub fn spawn_watcher(
     std::thread::spawn(move || {
         let rt_tx = fs_tx;
         let new_watch_rx = watch_rx;
-        let mut debouncer = match new_debouncer(debounce_dur, move |res: Result<Vec<notify_debouncer_mini::DebouncedEvent>, _>| {
-            if let Ok(events) = res {
-                let paths: Vec<PathBuf> = events
-                    .into_iter()
-                    .filter(|e| e.kind == DebouncedEventKind::Any)
-                    .map(|e| e.path)
-                    .collect();
-                if !paths.is_empty() {
-                    let _ = rt_tx.blocking_send(paths);
+        let mut debouncer = match new_debouncer(
+            debounce_dur,
+            move |res: Result<Vec<notify_debouncer_mini::DebouncedEvent>, _>| {
+                if let Ok(events) = res {
+                    let paths: Vec<PathBuf> = events
+                        .into_iter()
+                        .filter(|e| e.kind == DebouncedEventKind::Any)
+                        .map(|e| e.path)
+                        .collect();
+                    if !paths.is_empty() {
+                        let _ = rt_tx.blocking_send(paths);
+                    }
                 }
-            }
-        }) {
+            },
+        ) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("Marrow watcher init error: {e}");
@@ -81,7 +84,10 @@ pub fn spawn_watcher(
         };
 
         for path in &watch_paths {
-            if let Err(e) = debouncer.watcher().watch(path, notify::RecursiveMode::Recursive) {
+            if let Err(e) = debouncer
+                .watcher()
+                .watch(path, notify::RecursiveMode::Recursive)
+            {
                 eprintln!("Marrow watcher: failed to watch {}: {e}", path.display());
             } else if let Ok(mut watched) = watched_roots_thread.lock() {
                 watched.insert(path.clone());
@@ -99,7 +105,10 @@ pub fn spawn_watcher(
                 if already_watched {
                     continue;
                 }
-                if let Err(e) = debouncer.watcher().watch(&path, notify::RecursiveMode::Recursive) {
+                if let Err(e) = debouncer
+                    .watcher()
+                    .watch(&path, notify::RecursiveMode::Recursive)
+                {
                     eprintln!("Marrow watcher: failed to watch {}: {e}", path.display());
                 } else if let Ok(mut watched) = watched_roots_thread.lock() {
                     watched.insert(path);
@@ -197,6 +206,7 @@ async fn handle_file_change(
             .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
 
         let tx_db = conn.unchecked_transaction()?;
+        crate::db::mark_graph_degrees_dirty(&tx_db, &repo_id_clone)?;
 
         let existing_symbols: Vec<String> = tx_db
             .prepare(
@@ -426,6 +436,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_file_change_marks_degree_cache_dirty_after_same_node_count_edge_change() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let db = Arc::new(Mutex::new(conn));
+
+        let dir = std::env::temp_dir().join("marrow_watcher_test_degree_dirty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+
+        {
+            let c = db.lock().unwrap();
+            c.execute(
+                "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+                rusqlite::params!["test", dir.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        }
+
+        let repos = vec![("test".to_string(), dir.clone())];
+        let (tx, _rx) = broadcast::channel::<DashboardEvent>(16);
+        let file = dir.join("calls.py");
+
+        std::fs::write(
+            &file,
+            "def alpha():\n    beta()\n\ndef beta():\n    pass\n\ndef gamma():\n    pass\n",
+        )
+        .unwrap();
+        handle_file_change(&file, &db, &repos, &tx).await.unwrap();
+
+        {
+            let c = db.lock().unwrap();
+            crate::db::refresh_graph_degrees(&c, "test").unwrap();
+            assert!(crate::db::graph_degrees_are_fresh(&c, "test").unwrap());
+        }
+
+        std::fs::write(
+            &file,
+            "def delta():\n    zeta()\n\ndef epsilon():\n    pass\n\ndef zeta():\n    pass\n",
+        )
+        .unwrap();
+        handle_file_change(&file, &db, &repos, &tx).await.unwrap();
+
+        {
+            let c = db.lock().unwrap();
+            assert!(
+                !crate::db::graph_degrees_are_fresh(&c, "test").unwrap(),
+                "same-node-count CALLS changes should invalidate the degree cache"
+            );
+            crate::db::ensure_graph_degrees(&c, "test").unwrap();
+
+            let zeta_degree: i64 = c
+                .query_row(
+                    "SELECT gd.degree
+                     FROM graph_node_degrees gd
+                     JOIN nodes n ON n.id = gd.node_id
+                     WHERE n.repo_id = 'test' AND n.symbol_name = 'zeta'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert_eq!(zeta_degree, 1);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_handle_file_change_deleted_file() {
         let conn = crate::db::init_db(":memory:").unwrap();
         let db = Arc::new(Mutex::new(conn));
@@ -539,7 +617,10 @@ mod tests {
         rt.block_on(async {
             let handle = spawn_watcher(db, tx, 500).unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
-            assert!(!handle.is_finished(), "watcher should stay alive to pick up repos indexed later");
+            assert!(
+                !handle.is_finished(),
+                "watcher should stay alive to pick up repos indexed later"
+            );
             handle.abort();
         });
     }

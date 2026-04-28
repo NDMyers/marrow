@@ -823,7 +823,42 @@
       margin-bottom: 8px;
     }
     #tree-empty-sub { color: #3a5a3a; font-size: 12px; }
-    #tree-loading { color: var(--dim); font-size: 11px; letter-spacing: 0.08em; }
+    #tree-loading {
+      color: var(--dim);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      flex-direction: column;
+      gap: 10px;
+      text-align: center;
+      padding: 16px;
+    }
+    #tree-loading-phase {
+      color: var(--green);
+      text-transform: uppercase;
+      text-shadow: 0 0 8px var(--green-glow);
+    }
+    #tree-loading-detail {
+      color: var(--dim);
+      font-size: 10px;
+      max-width: min(460px, 80vw);
+      overflow-wrap: anywhere;
+    }
+    #tree-loading-track {
+      width: min(320px, 70vw);
+      height: 3px;
+      background: #142214;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    #tree-loading-bar {
+      display: block;
+      width: 12%;
+      height: 100%;
+      background: var(--green);
+      box-shadow: 0 0 10px var(--green-glow);
+      transition: width 0.18s ease;
+    }
 
     #tree-truncation-banner {
       position: absolute;
@@ -1052,7 +1087,11 @@
               <div id="tree-empty-sub">Choose an indexed workspace to visualize its symbol graph.</div>
             </div>
           </div>
-          <div id="tree-loading" style="display:none">Loading graph…</div>
+          <div id="tree-loading" data-phase="idle" style="display:none">
+            <div id="tree-loading-phase">Loading graph…</div>
+            <div id="tree-loading-track"><span id="tree-loading-bar"></span></div>
+            <div id="tree-loading-detail">Starting request</div>
+          </div>
           <div id="tree-truncation-banner"></div>
         </div>
       </div>
@@ -1692,6 +1731,23 @@
   let treeSearchTimer = null;
   let treeFileGroups  = {};
   let treeFileColors  = {};
+  let treeFileEntries = [];
+  let treeNodesByColor = {};
+  let treeCachedHulls = [];
+  let treeCachedClusterLabels = [];
+  let treeFrameCounter = 0;
+  let treeLastHullFrame = -999;
+  let treeLoadSeq = 0;
+  let treeLoadAbort = null;
+
+  const TREE_LOAD_PHASES = {
+    fetching:  ['Fetching graph', 24],
+    preparing: ['Preparing graph data', 48],
+    layout:    ['Running layout', 72],
+    drawing:   ['Drawing graph', 92],
+    ready:     ['Ready', 100],
+    error:     ['Graph load failed', 100],
+  };
 
   const FILE_HULL_PALETTE = [
     [0,150,70], [0,100,160], [160,120,0], [100,0,160],
@@ -1756,6 +1812,52 @@
     return 1;
   }
 
+  function treeSetLoadState(phase, detail) {
+    const loading = document.getElementById('tree-loading');
+    const phaseEl = document.getElementById('tree-loading-phase');
+    const detailEl = document.getElementById('tree-loading-detail');
+    const bar = document.getElementById('tree-loading-bar');
+    const [label, pct] = TREE_LOAD_PHASES[phase] || TREE_LOAD_PHASES.fetching;
+    loading.dataset.phase = phase;
+    loading.style.display = 'flex';
+    phaseEl.textContent = label;
+    detailEl.textContent = detail || '';
+    bar.style.width = pct + '%';
+  }
+
+  function treeClearLoadState(loadId) {
+    if (loadId != null && loadId !== treeLoadSeq) return;
+    const loading = document.getElementById('tree-loading');
+    loading.dataset.phase = 'idle';
+    loading.style.display = 'none';
+  }
+
+  function treeShowLoadError(loadId, message) {
+    if (loadId != null && loadId !== treeLoadSeq) return;
+    treeSetLoadState('error', message);
+    window.setTimeout(() => treeClearLoadState(loadId), 1200);
+    treeResetGraphView();
+    document.getElementById('tree-empty').style.display = 'flex';
+    document.getElementById('tree-empty-sub').textContent = message;
+  }
+
+  function treeResetGraphView() {
+    if (treeSim) treeSim.stop();
+    treeAllNodes = [];
+    treeAllEdges = [];
+    treeFocusId = null;
+    treeActivePath = null;
+    treeNodeById = {};
+    treeFileGroups = {};
+    treeFileEntries = [];
+    treeNodesByColor = {};
+    treeCachedHulls = [];
+    treeCachedClusterLabels = [];
+    const dir = document.getElementById('tree-dir-tree');
+    if (dir) dir.innerHTML = '';
+    if (treeCtx && treeCanvas) treeCtx.clearRect(0, 0, treeCanvas.width, treeCanvas.height);
+  }
+
   function treeEdgeOpacity(e) {
     if (treeActivePath) {
       const srcPath = e.source.file_path || e.source;
@@ -1800,9 +1902,13 @@
     const W = treeCanvas.width, H = treeCanvas.height;
     const k = treeTransform.k;
     const hasFilter = treeFocusId !== null || treeSearchStr || treeActivePath;
-    const showLabels = k >= 0.75;
+    const simAlpha = treeSim && typeof treeSim.alpha === 'function' ? treeSim.alpha() : 0;
+    const denseGraph = treeAllNodes.length > 260;
+    const showLabels = k >= 0.75 && (!denseGraph || hasFilter || simAlpha < 0.06);
+    treeFrameCounter++;
 
     treeCtx.clearRect(0, 0, W, H);
+    treeRefreshShapeCaches(false);
 
     // ── Graph-space rendering ──
     treeCtx.save();
@@ -1810,24 +1916,12 @@
     treeCtx.scale(k, k);
 
     // ── File cluster hulls (graph space, below edges) ──
-    for (const [fp, fnodes] of Object.entries(treeFileGroups)) {
-      const pts = fnodes.filter(n => n.x != null).map(n => [n.x, n.y]);
-      if (pts.length < 3) continue;
-      if (!treeD3Available) continue;
-      const hull = d3.polygonHull(pts);
-      if (!hull) continue;
-      const hcx = hull.reduce((s, p) => s + p[0], 0) / hull.length;
-      const hcy = hull.reduce((s, p) => s + p[1], 0) / hull.length;
-      const pad = 18;
-      const exp = hull.map(([x, y]) => {
-        const dx = x - hcx, dy = y - hcy;
-        const d  = Math.sqrt(dx * dx + dy * dy) || 1;
-        return [x + dx / d * pad, y + dy / d * pad];
-      });
-      const [r, g, b] = treeFileColors[fp] || [0, 100, 40];
+    for (const hull of treeCachedHulls) {
+      const [r, g, b] = hull.color;
+      const pts = hull.points;
       treeCtx.beginPath();
-      treeCtx.moveTo(exp[0][0], exp[0][1]);
-      for (let i = 1; i < exp.length; i++) treeCtx.lineTo(exp[i][0], exp[i][1]);
+      treeCtx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) treeCtx.lineTo(pts[i][0], pts[i][1]);
       treeCtx.closePath();
       treeCtx.fillStyle   = `rgba(${r},${g},${b},0.09)`;
       treeCtx.strokeStyle = `rgba(${r},${g},${b},0.22)`;
@@ -1898,14 +1992,7 @@
     }
 
     // Nodes — stroke pass (grouped by symbol-type color to minimize strokeStyle changes)
-    const byColor = {};
-    for (const n of treeAllNodes) {
-      if (n.x == null) continue;
-      const c = treeColor(n.symbol_type);
-      if (!byColor[c]) byColor[c] = [];
-      byColor[c].push(n);
-    }
-    for (const [color, bucket] of Object.entries(byColor)) {
+    for (const [color, bucket] of Object.entries(treeNodesByColor)) {
       treeCtx.strokeStyle = color;
       for (const n of bucket) {
         treeCtx.globalAlpha = hasFilter ? treeNodeOpacity(n) : 1;
@@ -1922,20 +2009,16 @@
     if (!hasFilter) {
       treeCtx.font = '10px "JetBrains Mono", monospace';
       treeCtx.textAlign = 'center';
-      for (const [fp, fnodes] of Object.entries(treeFileGroups)) {
-        const valid = fnodes.filter(n => n.x != null);
-        if (valid.length < 2) continue;
-        const gcx = valid.reduce((s, n) => s + n.x, 0) / valid.length;
-        const gcy = valid.reduce((s, n) => s + n.y, 0) / valid.length;
-        const sx  = treeTransform.applyX(gcx);
-        const sy  = treeTransform.applyY(gcy);
+      for (const label of treeCachedClusterLabels) {
+        const sx  = treeTransform.applyX(label.x);
+        const sy  = treeTransform.applyY(label.y);
         if (sx < -60 || sx > W + 60 || sy < -20 || sy > H + 20) continue;
         const alpha = Math.max(0, 1 - k);
         if (alpha < 0.01) continue;
-        const [r, g, b] = treeFileColors[fp] || [0, 150, 70];
+        const [r, g, b] = label.color;
         treeCtx.globalAlpha = alpha;
         treeCtx.fillStyle   = `rgb(${r},${g},${b})`;
-        treeCtx.fillText(fp.split('/').pop() || fp, sx, sy);
+        treeCtx.fillText(label.text, sx, sy);
       }
       treeCtx.globalAlpha = 1;
       treeCtx.textAlign = 'left';
@@ -1958,6 +2041,45 @@
       }
       treeCtx.globalAlpha = 1;
     }
+  }
+
+  function treeRefreshShapeCaches(force) {
+    if (!treeD3Available) return;
+    const denseGraph = treeAllNodes.length > 260;
+    const simAlpha = treeSim && typeof treeSim.alpha === 'function' ? treeSim.alpha() : 0;
+    const cadence = denseGraph && simAlpha > 0.06 ? 8 : 1;
+    if (!force && treeFrameCounter - treeLastHullFrame < cadence) return;
+
+    treeCachedHulls = [];
+    treeCachedClusterLabels = [];
+    for (const [fp, fnodes] of treeFileEntries) {
+      const valid = fnodes.filter(n => n.x != null);
+      if (valid.length >= 3) {
+        const hull = d3.polygonHull(valid.map(n => [n.x, n.y]));
+        if (hull) {
+          const hcx = hull.reduce((s, p) => s + p[0], 0) / hull.length;
+          const hcy = hull.reduce((s, p) => s + p[1], 0) / hull.length;
+          const pad = 18;
+          treeCachedHulls.push({
+            color: treeFileColors[fp] || [0, 100, 40],
+            points: hull.map(([x, y]) => {
+              const dx = x - hcx, dy = y - hcy;
+              const d  = Math.sqrt(dx * dx + dy * dy) || 1;
+              return [x + dx / d * pad, y + dy / d * pad];
+            }),
+          });
+        }
+      }
+      if (valid.length >= 2) {
+        treeCachedClusterLabels.push({
+          x: valid.reduce((s, n) => s + n.x, 0) / valid.length,
+          y: valid.reduce((s, n) => s + n.y, 0) / valid.length,
+          text: fp.split('/').pop() || fp,
+          color: treeFileColors[fp] || [0, 150, 70],
+        });
+      }
+    }
+    treeLastHullFrame = treeFrameCounter;
   }
 
   // ── Canvas init ─────────────────────────────────────────────────────────────
@@ -2078,7 +2200,7 @@
 
   // ── Render cycle ─────────────────────────────────────────────────────────────
 
-  function treeRender(nodes, edges) {
+  function treePrepareGraphData(nodes, edges) {
     treeAllNodes   = nodes;
     treeAllEdges   = edges;
     treeFocusId    = null;
@@ -2121,14 +2243,38 @@
       treeFileColors[fp] = FILE_HULL_PALETTE[i % FILE_HULL_PALETTE.length];
     });
 
+    treeFileEntries = Object.entries(treeFileGroups);
+    treeNodesByColor = {};
+    nodes.forEach(n => {
+      const c = treeColor(n.symbol_type);
+      if (!treeNodesByColor[c]) treeNodesByColor[c] = [];
+      treeNodesByColor[c].push(n);
+    });
+    treeCachedHulls = [];
+    treeCachedClusterLabels = [];
+    treeFrameCounter = 0;
+    treeLastHullFrame = -999;
+
+    return { nodes, edges };
+  }
+
+  function treeRender(nodes, edges, loadId) {
+    const prepared = treePrepareGraphData(nodes, edges);
+    treeRenderPrepared(prepared.nodes, prepared.edges, loadId);
+  }
+
+  function treeRenderPrepared(nodes, edges, loadId) {
+    if (loadId != null && loadId !== treeLoadSeq) return;
+
     if (treeSim) treeSim.stop();
 
     if (!treeD3Available) {
       // Without D3, just draw static nodes without force simulation
+      treeRefreshShapeCaches(true);
       drawFrame();
       treeRebuildDirTree();
       document.getElementById('tree-empty').style.display   = 'none';
-      document.getElementById('tree-loading').style.display = 'none';
+      treeClearLoadState(loadId);
       return;
     }
 
@@ -2148,13 +2294,28 @@
       .alphaDecay(0.05)
       .velocityDecay(0.4);
 
-    treeSim.on('tick', drawFrame);
-    treeSim.on('end',  () => { if (treeFocusId === null) treeZoomFit(750); });
+    let firstDraw = true;
+    treeSim.on('tick', () => {
+      if (loadId != null && loadId !== treeLoadSeq) return;
+      if (firstDraw) {
+        firstDraw = false;
+        treeSetLoadState('drawing', nodes.length.toLocaleString() + ' nodes ready');
+      }
+      drawFrame();
+    });
+    treeSim.on('end',  () => {
+      if (loadId != null && loadId !== treeLoadSeq) return;
+      treeRefreshShapeCaches(true);
+      drawFrame();
+      if (treeFocusId === null) treeZoomFit(750);
+    });
 
     document.getElementById('tree-empty').style.display   = 'none';
-    document.getElementById('tree-loading').style.display = 'none';
+    treeSetLoadState('drawing', nodes.length.toLocaleString() + ' nodes ready');
+    treeRefreshShapeCaches(true);
     drawFrame();
     treeRebuildDirTree();
+    window.requestAnimationFrame(() => treeClearLoadState(loadId));
   }
 
   function treeSetFocus(id) {
@@ -2382,6 +2543,9 @@
 
   function treeSelectRepo(repoId) {
     if (!repoId) return;
+    const loadId = ++treeLoadSeq;
+    if (treeLoadAbort) treeLoadAbort.abort();
+    treeLoadAbort = typeof AbortController !== 'undefined' ? new AbortController() : null;
     if (!treeInitDone) treeInitCanvas();
     if (!treeD3Available) {
       document.getElementById('tree-empty').style.display = 'flex';
@@ -2391,20 +2555,23 @@
     }
 
     document.getElementById('tree-empty').style.display = 'none';
-    document.getElementById('tree-loading').style.display = 'flex';
+    treeSetLoadState('fetching', repoId);
     document.getElementById('tree-info').textContent = '';
+    treeResetGraphView();
 
-    fetch('/api/graph?repo_id=' + encodeURIComponent(repoId))
+    fetch('/api/graph?repo_id=' + encodeURIComponent(repoId), treeLoadAbort ? { signal: treeLoadAbort.signal } : undefined)
       .then(r => r.json())
       .then(data => {
-        document.getElementById('tree-loading').style.display = 'none';
+        if (loadId !== treeLoadSeq) return;
+        treeSetLoadState('preparing', repoId);
 
         if (data.error) {
-          document.getElementById('tree-empty').style.display = 'flex';
-          document.getElementById('tree-empty-sub').textContent = 'Error: ' + data.error;
+          treeShowLoadError(loadId, 'Error: ' + data.error);
           return;
         }
         if (!data.nodes || data.nodes.length === 0) {
+          treeClearLoadState(loadId);
+          treeResetGraphView();
           document.getElementById('tree-empty').style.display = 'flex';
           document.getElementById('tree-empty-sub').textContent =
             'No symbols found for this workspace. Try running ingest_repo first.';
@@ -2423,12 +2590,19 @@
           data.nodes.length.toLocaleString() + ' nodes · ' +
           data.edges.length.toLocaleString() + ' edges';
 
-        treeRender(data.nodes, data.edges);
+        window.requestAnimationFrame(() => {
+          if (loadId !== treeLoadSeq) return;
+          try {
+            treeSetLoadState('layout', data.nodes.length.toLocaleString() + ' nodes · ' + data.edges.length.toLocaleString() + ' edges');
+            treeRender(data.nodes, data.edges, loadId);
+          } catch (err) {
+            treeShowLoadError(loadId, 'Render failed: ' + err.message);
+          }
+        });
       })
       .catch(err => {
-        document.getElementById('tree-loading').style.display = 'none';
-        document.getElementById('tree-empty').style.display = 'flex';
-        document.getElementById('tree-empty-sub').textContent = 'Fetch failed: ' + err.message;
+        if (err.name === 'AbortError' || loadId !== treeLoadSeq) return;
+        treeShowLoadError(loadId, 'Fetch failed: ' + err.message);
       });
   }
 
