@@ -23,6 +23,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 
 static INDEX_HTML: &str = include_str!("index.html");
+static D3_JS: &str = include_str!("d3-v7.min.js");
 
 // ── Event types ───────────────────────────────────────────────────────────────
 
@@ -51,6 +52,10 @@ pub enum DashboardEvent {
         /// Condensed capsule text. Same rationale as `original_text`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         optimized_text: Option<String>,
+        /// Whether the original+optimized texts are cached on the Hub,
+        /// enabling the client-side delta viewer button.
+        #[serde(default)]
+        has_cached_delta: bool,
     },
     RepoIndexed {
         repo_id: String,
@@ -132,13 +137,17 @@ impl SessionStats {
             ts,
             ..
         } = event {
+            let mut cached = false;
             if let (Some(orig), Some(opt)) = (original_text, optimized_text) {
-                let key = format!("{}@{}@{}", symbol, repo, ts);
-                self.capsule_text_cache.insert(key, (orig.clone(), opt.clone()));
-                // Prevent unbounded growth; a simple clear-on-overflow is fine
-                // for a local dashboard cache that holds at most ~50 entries.
-                if self.capsule_text_cache.len() > 100 {
-                    self.capsule_text_cache.clear();
+                if !orig.is_empty() {
+                    let key = format!("{}@{}@{}", symbol, repo, ts);
+                    self.capsule_text_cache.insert(key, (orig.clone(), opt.clone()));
+                    cached = true;
+                    // Prevent unbounded growth; a simple clear-on-overflow is fine
+                    // for a local dashboard cache that holds at most ~50 entries.
+                    if self.capsule_text_cache.len() > 100 {
+                        self.capsule_text_cache.clear();
+                    }
                 }
             }
             // Strip the large text blobs before pushing into recent_events so
@@ -150,6 +159,7 @@ impl SessionStats {
                     symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts,
                     original_text: None,
                     optimized_text: None,
+                    has_cached_delta: cached,
                 }
             } else {
                 unreachable!()
@@ -178,6 +188,13 @@ pub struct AppState {
 
 async fn index_handler() -> impl IntoResponse {
     axum::response::Html(INDEX_HTML)
+}
+
+async fn d3_handler() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+        D3_JS,
+    )
 }
 
 async fn sse_handler(
@@ -348,6 +365,7 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
 
 #[derive(Deserialize)]
 struct CompareQuery {
+    #[allow(dead_code)] // Deserialized from query params but no longer used for file reads (C-1)
     filepath:  String,
     tool_used: String,
     symbol:    Option<String>,
@@ -364,9 +382,14 @@ struct CompareResponse {
 }
 
 async fn compare_handler(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     Query(params): Query<CompareQuery>,
 ) -> axum::response::Response {
+    // M-15 FIX: Reject untrusted origins before processing.
+    if let Err(status) = validate_origin(&headers) {
+        return status.into_response();
+    }
     match params.tool_used.as_str() {
         "get_context_capsule" => {
             let symbol = match params.symbol.as_deref().filter(|s| !s.is_empty()) {
@@ -407,6 +430,12 @@ async fn compare_handler(
                 })).into_response();
             }
 
+            if crate::retrieval::capsule_original_mode() == crate::retrieval::CapsuleOriginalMode::None {
+                return axum::Json(serde_json::json!({
+                    "error": "Compare baseline unavailable: full-file original text is not retained when MARROW_CAPSULE_ORIGINAL_MODE is none (default). Pass a snapshot timestamp from telemetry, or set MARROW_CAPSULE_ORIGINAL_MODE=full to rebuild from disk."
+                })).into_response();
+            }
+
             // Cache miss: fall back to querying the local DB. This works when
             // the Hub and the capsule-serving process share the same DB file,
             // or when the cache was evicted (>100 entries).
@@ -416,9 +445,7 @@ async fn compare_handler(
             };
             match crate::retrieval::get_context_capsule(&conn, &symbol, &repo, None) {
                 Ok(result) => {
-                    // Both lengths use the same len()/4 heuristic so the delta
-                    // modal matches the telemetry emitted by the MCP tool.
-                    let original_length  = result.original_text.len() / 4;
+                    let original_length  = result.file_tokens;
                     let optimized_length = result.optimized_text.len() / 4;
                     axum::Json(CompareResponse {
                         original_text:    result.original_text,
@@ -433,29 +460,55 @@ async fn compare_handler(
             }
         }
         _ => {
-            // Fallback for other tools: read the file from disk.
-            let original_text = match std::fs::read_to_string(&params.filepath) {
-                Ok(s)  => s,
-                Err(e) => return axum::Json(serde_json::json!({
-                    "error": format!("Could not read file '{}': {}", params.filepath, e)
-                })).into_response(),
-            };
-            let original_length  = original_text.len();
-            let optimized_length = original_text.len();
-            axum::Json(CompareResponse {
-                optimized_text: original_text.clone(),
-                original_text,
-                original_length,
-                optimized_length,
-            }).into_response()
+            // C-1 FIX: Never read arbitrary filesystem paths. Compare is only
+            // supported for get_context_capsule via the in-memory text cache.
+            axum::Json(serde_json::json!({
+                "error": "Compare is only supported for get_context_capsule. Use a cached snapshot timestamp."
+            })).into_response()
         }
     }
 }
 
+/// Allowed dashboard origins for handler-level validation.
+/// Requests with no Origin header are allowed (local/internal clients).
+/// Only the dashboard's own localhost origins are trusted.
+const ALLOWED_ORIGINS: &[&str] = &[
+    "http://127.0.0.1:8765",
+    "http://localhost:8765",
+];
+
+/// Validate the Origin header: allow if absent (internal/local) or matching
+/// a trusted localhost origin. Returns `Err(403)` for untrusted origins.
+fn validate_origin(headers: &axum::http::HeaderMap) -> Result<(), axum::http::StatusCode> {
+    if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
+        let origin_str = origin.to_str().unwrap_or("");
+        if !ALLOWED_ORIGINS.contains(&origin_str) {
+            return Err(axum::http::StatusCode::FORBIDDEN);
+        }
+    }
+    Ok(())
+}
+
+/// M-15 FIX: Cap emit request body size to prevent oversized metric payloads.
+const EMIT_MAX_BODY_BYTES: usize = 1024 * 1024; // 1 MiB
+
 async fn emit_handler(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
-    axum::Json(event): axum::Json<DashboardEvent>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    // M-15 FIX: Reject untrusted origins before processing.
+    if let Err(status) = validate_origin(&headers) {
+        return status;
+    }
+    // M-15 FIX: Reject oversized payloads before deserialization.
+    if body.len() > EMIT_MAX_BODY_BYTES {
+        return axum::http::StatusCode::PAYLOAD_TOO_LARGE;
+    }
+    let event: DashboardEvent = match serde_json::from_slice(&body) {
+        Ok(e) => e,
+        Err(_) => return axum::http::StatusCode::BAD_REQUEST,
+    };
     let sess_result = state.session.lock();
     match sess_result {
         Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -475,19 +528,237 @@ async fn emit_handler(
     }
     // Strip text blobs from SSE broadcast. The full texts are already cached
     // inside SessionStats.capsule_text_cache — browsers don't need them in
-    // the live event stream.
+    // the live event stream. Propagate has_cached_delta so the client knows
+    // whether the delta viewer button should be enabled.
     let broadcast_event = match event {
         DashboardEvent::CapsuleServed {
-            symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts, ..
+            symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts, has_cached_delta, ..
         } => DashboardEvent::CapsuleServed {
             symbol, repo, file, capsule_tokens, file_tokens, tokens_saved, origin, ts,
-            original_text:  None,
-            optimized_text: None,
+            original_text:    None,
+            optimized_text:   None,
+            has_cached_delta,
         },
         other => other,
     };
     let _ = state.tx.send(broadcast_event);
     axum::http::StatusCode::OK
+}
+
+// ── Graph API ─────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct GraphQuery {
+    repo_id: String,
+}
+
+#[derive(Deserialize)]
+struct GraphNeighborsQuery {
+    node_id: String,
+}
+
+#[derive(Serialize)]
+struct GraphNodeDto {
+    id:          String,
+    label:       String,
+    file_path:   String,
+    symbol_type: String,
+    degree:      i64,
+}
+
+#[derive(Serialize)]
+struct GraphEdgeDto {
+    source:       String,
+    target:       String,
+    relationship: String,
+}
+
+#[derive(Serialize)]
+struct GraphResponse {
+    nodes:            Vec<GraphNodeDto>,
+    edges:            Vec<GraphEdgeDto>,
+    truncated:        bool,
+    total_node_count: i64,
+}
+
+#[derive(Serialize)]
+struct GraphNeighborsResponse {
+    nodes: Vec<GraphNodeDto>,
+    edges: Vec<GraphEdgeDto>,
+}
+
+async fn graph_handler(
+    State(state): State<AppState>,
+    Query(params): Query<GraphQuery>,
+) -> axum::response::Response {
+    let conn = match state.db.lock() {
+        Ok(g)  => g,
+        Err(_) => return axum::Json(serde_json::json!({"error": "DB mutex poisoned"})).into_response(),
+    };
+
+    let total_node_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
+            rusqlite::params![params.repo_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    // Pre-aggregate edge degrees in a single scan rather than using a
+    // correlated subquery in ORDER BY (which was O(n × m)).
+    let nodes: Vec<GraphNodeDto> = {
+        let mut stmt = match conn.prepare(
+            "WITH edge_counts AS ( \
+               SELECT id, COUNT(*) AS cnt FROM ( \
+                 SELECT source_id AS id FROM edges \
+                 UNION ALL \
+                 SELECT target_id AS id FROM edges \
+               ) GROUP BY id \
+             ) \
+             SELECT n.id, n.symbol_name, n.file_path, \
+                    COALESCE(n.symbol_type, 'unknown'), \
+                    COALESCE(ec.cnt, 0) AS degree \
+             FROM nodes n \
+             LEFT JOIN edge_counts ec ON ec.id = n.id \
+             WHERE n.repo_id = ?1 \
+             ORDER BY degree DESC \
+             LIMIT 500",
+        ) {
+            Ok(s)  => s,
+            Err(e) => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+        };
+        let result: Vec<GraphNodeDto> = match stmt.query_map(rusqlite::params![params.repo_id], |row| {
+            Ok(GraphNodeDto {
+                id:          row.get(0)?,
+                label:       row.get(1)?,
+                file_path:   row.get(2)?,
+                symbol_type: row.get(3)?,
+                degree:      row.get(4)?,
+            })
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e)   => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+        };
+        result
+    };
+
+    let edges: Vec<GraphEdgeDto> = {
+        let mut stmt = match conn.prepare(
+            "WITH edge_counts AS ( \
+               SELECT id, COUNT(*) AS cnt FROM ( \
+                 SELECT source_id AS id FROM edges \
+                 UNION ALL \
+                 SELECT target_id AS id FROM edges \
+               ) GROUP BY id \
+             ), \
+             top_nodes AS ( \
+               SELECT n.id \
+               FROM nodes n \
+               LEFT JOIN edge_counts ec ON ec.id = n.id \
+               WHERE n.repo_id = ?1 \
+               ORDER BY COALESCE(ec.cnt, 0) DESC \
+               LIMIT 500 \
+             ) \
+             SELECT e.source_id, e.target_id, COALESCE(e.relationship_type, 'CALLS') \
+             FROM edges e \
+             WHERE e.source_id IN (SELECT id FROM top_nodes) \
+               AND e.target_id IN (SELECT id FROM top_nodes)",
+        ) {
+            Ok(s)  => s,
+            Err(e) => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+        };
+        let result: Vec<GraphEdgeDto> = match stmt.query_map(rusqlite::params![params.repo_id], |row| {
+            Ok(GraphEdgeDto {
+                source:       row.get(0)?,
+                target:       row.get(1)?,
+                relationship: row.get(2)?,
+            })
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e)   => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+        };
+        result
+    };
+
+    axum::Json(GraphResponse { truncated: total_node_count > 500, total_node_count, nodes, edges })
+        .into_response()
+}
+
+async fn graph_neighbors_handler(
+    State(state): State<AppState>,
+    Query(params): Query<GraphNeighborsQuery>,
+) -> axum::response::Response {
+    let conn = match state.db.lock() {
+        Ok(g)  => g,
+        Err(_) => return axum::Json(serde_json::json!({"error": "DB mutex poisoned"})).into_response(),
+    };
+
+    let nodes: Vec<GraphNodeDto> = {
+        let mut stmt = match conn.prepare(
+            "WITH neighbor_ids AS ( \
+               SELECT target_id AS id FROM edges WHERE source_id = ?1 \
+               UNION \
+               SELECT source_id AS id FROM edges WHERE target_id = ?1 \
+             ), \
+             relevant AS ( \
+               SELECT n.id FROM nodes n WHERE n.id = ?1 \
+               UNION \
+               SELECT n.id FROM nodes n WHERE n.id IN (SELECT id FROM neighbor_ids) \
+             ), \
+             deg AS ( \
+               SELECT id, COUNT(*) AS cnt FROM ( \
+                 SELECT source_id AS id FROM edges WHERE source_id IN (SELECT id FROM relevant) \
+                 UNION ALL \
+                 SELECT target_id AS id FROM edges WHERE target_id IN (SELECT id FROM relevant) \
+               ) GROUP BY id \
+             ) \
+             SELECT DISTINCT n.id, n.symbol_name, n.file_path, \
+                    COALESCE(n.symbol_type, 'unknown'), COALESCE(deg.cnt, 0) \
+             FROM nodes n \
+             LEFT JOIN deg ON deg.id = n.id \
+             WHERE n.id = ?1 OR n.id IN (SELECT id FROM neighbor_ids)",
+        ) {
+            Ok(s)  => s,
+            Err(e) => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+        };
+        let result: Vec<GraphNodeDto> = match stmt.query_map(rusqlite::params![params.node_id], |row| {
+            Ok(GraphNodeDto {
+                id:          row.get(0)?,
+                label:       row.get(1)?,
+                file_path:   row.get(2)?,
+                symbol_type: row.get(3)?,
+                degree:      row.get(4)?,
+            })
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e)   => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+        };
+        result
+    };
+
+    let edges: Vec<GraphEdgeDto> = {
+        let mut stmt = match conn.prepare(
+            "SELECT source_id, target_id, COALESCE(relationship_type, 'CALLS') \
+             FROM edges \
+             WHERE source_id = ?1 OR target_id = ?1",
+        ) {
+            Ok(s)  => s,
+            Err(e) => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+        };
+        let result: Vec<GraphEdgeDto> = match stmt.query_map(rusqlite::params![params.node_id], |row| {
+            Ok(GraphEdgeDto {
+                source:       row.get(0)?,
+                target:       row.get(1)?,
+                relationship: row.get(2)?,
+            })
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e)   => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
+        };
+        result
+    };
+
+    axum::Json(GraphNeighborsResponse { nodes, edges }).into_response()
 }
 
 // ── Server startup ────────────────────────────────────────────────────────────
@@ -517,14 +788,23 @@ pub async fn start(
     let state = AppState { tx, session, db };
 
     let router = Router::new()
-        .route("/",              get(index_handler))
-        .route("/stream",        get(sse_handler))
-        .route("/stats",         get(stats_handler))
-        .route("/api/compare",   get(compare_handler))
-        .route("/api/emit",      axum::routing::post(emit_handler))
-        // permissive CORS is intentional: this server binds only to 127.0.0.1,
-        // and the dashboard UI is served from the same origin.
-        .layer(CorsLayer::permissive())
+        .route("/",                    get(index_handler))
+        .route("/d3-v7.min.js",        get(d3_handler))
+        .route("/stream",              get(sse_handler))
+        .route("/stats",               get(stats_handler))
+        .route("/api/compare",         get(compare_handler))
+        .route("/api/emit",            axum::routing::post(emit_handler))
+        .route("/api/graph",           get(graph_handler))
+        .route("/api/graph/neighbors", get(graph_neighbors_handler))
+        // C-1 FIX: Restrict CORS to same-origin. The dashboard is served from
+        // http://127.0.0.1:8765 — only allow that origin rather than wildcard *.
+        // Use from_static to avoid fallible parsing and .expect() in production.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(axum::http::HeaderValue::from_static("http://127.0.0.1:8765"))
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_headers(tower_http::cors::Any)
+        )
         .with_state(state);
 
     tokio::spawn(async move {
@@ -542,4 +822,170 @@ pub async fn start(
     }
 
     Ok(HubRole::Hub)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// /api/emit must reject payloads larger than 1 MiB.
+    #[tokio::test]
+    async fn emit_rejects_oversized_payload() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+
+        let (tx, _rx) = broadcast::channel(4);
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let state = AppState {
+            tx,
+            session: Arc::new(Mutex::new(SessionStats::default())),
+            db: Arc::new(Mutex::new(conn)),
+        };
+
+        // 1 MiB + 1 byte should be rejected
+        let oversized = Bytes::from(vec![0u8; EMIT_MAX_BODY_BYTES + 1]);
+        let response = emit_handler(axum::http::HeaderMap::new(), State(state.clone()), oversized).await;
+        let response = axum::response::IntoResponse::into_response(response);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "emit must reject payloads > 1 MiB"
+        );
+    }
+
+    /// /api/emit must accept payloads at or below 1 MiB (if valid JSON).
+    #[tokio::test]
+    async fn emit_accepts_valid_payload_under_limit() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+
+        let (tx, _rx) = broadcast::channel(4);
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let state = AppState {
+            tx,
+            session: Arc::new(Mutex::new(SessionStats::default())),
+            db: Arc::new(Mutex::new(conn)),
+        };
+
+        let event = serde_json::json!({
+            "type": "repo_indexed",
+            "repo_id": "test",
+            "symbols": 10,
+            "edges": 5,
+            "ts": 12345
+        });
+        let body = Bytes::from(serde_json::to_vec(&event).unwrap());
+        let response = emit_handler(axum::http::HeaderMap::new(), State(state), body).await;
+        let response = axum::response::IntoResponse::into_response(response);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "emit must accept valid payloads under 1 MiB"
+        );
+    }
+
+    #[test]
+    fn emit_cap_is_one_mib() {
+        assert_eq!(EMIT_MAX_BODY_BYTES, 1024 * 1024, "emit cap must be exactly 1 MiB");
+    }
+
+    #[test]
+    fn validate_origin_allows_no_origin() {
+        let headers = axum::http::HeaderMap::new();
+        assert!(validate_origin(&headers).is_ok());
+    }
+
+    #[test]
+    fn validate_origin_allows_localhost_origins() {
+        for origin in ALLOWED_ORIGINS {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::ORIGIN,
+                axum::http::HeaderValue::from_str(origin).unwrap(),
+            );
+            assert!(validate_origin(&headers).is_ok(), "should allow {origin}");
+        }
+    }
+
+    #[test]
+    fn validate_origin_rejects_foreign_origin() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://evil.com"),
+        );
+        assert_eq!(
+            validate_origin(&headers).unwrap_err(),
+            axum::http::StatusCode::FORBIDDEN,
+        );
+    }
+
+    /// /api/emit must reject requests from untrusted origins.
+    #[tokio::test]
+    async fn emit_rejects_bad_origin() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+
+        let (tx, _rx) = broadcast::channel(4);
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let state = AppState {
+            tx,
+            session: Arc::new(Mutex::new(SessionStats::default())),
+            db: Arc::new(Mutex::new(conn)),
+        };
+
+        let event = serde_json::json!({
+            "type": "repo_indexed",
+            "repo_id": "test",
+            "symbols": 10,
+            "edges": 5,
+            "ts": 12345
+        });
+        let body = Bytes::from(serde_json::to_vec(&event).unwrap());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://evil.com"),
+        );
+        let response = emit_handler(headers, State(state), body).await;
+        let response = axum::response::IntoResponse::into_response(response);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "emit must reject untrusted origins"
+        );
+    }
+
+    /// /api/compare must reject requests from untrusted origins.
+    #[tokio::test]
+    async fn compare_rejects_bad_origin() {
+        use axum::extract::{Query, State};
+
+        let (tx, _rx) = broadcast::channel(4);
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let state = AppState {
+            tx,
+            session: Arc::new(Mutex::new(SessionStats::default())),
+            db: Arc::new(Mutex::new(conn)),
+        };
+
+        let params = CompareQuery {
+            filepath: "test.py".to_string(),
+            tool_used: "get_context_capsule".to_string(),
+            symbol: Some("foo".to_string()),
+            repo: Some("test".to_string()),
+            ts: None,
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://evil.com"),
+        );
+        let response = compare_handler(headers, State(state), Query(params)).await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "compare must reject untrusted origins"
+        );
+    }
 }

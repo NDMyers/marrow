@@ -66,7 +66,6 @@ impl DaemonState {
 pub fn build_router(state: DaemonState) -> Router {
     Router::new()
         .route("/api/health",   get(handle_health))
-        .route("/rpc/mcp",      post(handle_mcp))
         .route("/api/watch",    post(handle_watch))
         .route("/api/shutdown", post(handle_shutdown))
         .with_state(state)
@@ -99,50 +98,15 @@ async fn handle_watch(
     if !path.exists() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path does not exist" })));
     }
-    // Open/touch the DB connection so the pool tracks this repo.
-    let _ = state.pool.get_or_open(&path).await;
-    // Signal the background watcher dispatcher (best-effort; receiver may not be ready yet).
-    let _ = state.watcher_tx.send(path).await;
-    (StatusCode::OK, Json(serde_json::json!({ "watching": req.path })))
-}
-
-/// Forward raw MCP JSON-RPC from `marrow mcp` to the appropriate tool handler.
-///
-/// Parses the JSON body to extract an optional `workspace` field from either
-/// `params.arguments.workspace` or `params.workspace`. If present and the path
-/// exists, the pool is touched (opening a connection if needed) and the path is
-/// forwarded to the background watcher.
-///
-/// Phase 2: pool/watcher registration. Full tool dispatch into the pool (replacing
-/// ContextEngine) is deferred to a follow-on refactor.
-async fn handle_mcp(
-    State(state): State<DaemonState>,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
-    // Extract optional workspace path from the JSON payload.
-    let workspace: Option<std::path::PathBuf> = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| {
-            v.pointer("/params/arguments/workspace")
-                .or_else(|| v.pointer("/params/workspace"))
-                .and_then(|w| w.as_str())
-                .map(std::path::PathBuf::from)
-        });
-
-    if let Some(path) = workspace {
-        if path.exists() {
-            // Touch the pool entry (opens DB if not already open).
-            let _ = state.pool.get_or_open(&path).await;
-            // Register with the background file watcher (best-effort).
-            let _ = state.watcher_tx.send(path).await;
-        }
+    // M-10 FIX: Propagate DB/pool errors through HTTP response.
+    if let Err(e) = state.pool.get_or_open(&path).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("DB pool error: {e}") })));
     }
-
-    (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        body,
-    )
+    // M-10 FIX: Propagate watcher channel send errors.
+    if let Err(e) = state.watcher_tx.send(path).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Watcher channel error: {e}") })));
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "watching": req.path })))
 }
 
 /// Signal the daemon to shut down gracefully.
@@ -175,8 +139,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// M-9: /rpc/mcp route is removed — callers should get 404.
     #[tokio::test]
-    async fn mcp_no_workspace_echoes_body() {
+    async fn mcp_endpoint_returns_404() {
         let app = build_router(DaemonState::new_test());
         let payload = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         let response = app
@@ -190,78 +155,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&body[..], payload);
-    }
-
-    #[tokio::test]
-    async fn mcp_routes_to_pool_connection() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let state = DaemonState::new_test();
-
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "run_pipeline",
-                "arguments": {
-                    "intent": "analyze_repo",
-                    "workspace": dir.path().to_string_lossy()
-                }
-            }
-        });
-
-        let app = build_router(state.clone());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/rpc/mcp")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        // Verify pool now has an entry for this path
-        let map = state.pool.inner.read().await;
-        assert!(!map.is_empty(), "pool should have opened a connection");
-    }
-
-    #[tokio::test]
-    async fn mcp_initialize_registers_workspace() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let state = DaemonState::new_test();
-
-        // MCP initialize carries workspace at params.workspace (not params.arguments.workspace)
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": { "name": "test", "version": "0" },
-                "workspace": dir.path().to_string_lossy()
-            }
-        });
-
-        let app = build_router(state.clone());
-        let _ = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/rpc/mcp")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let map = state.pool.inner.read().await;
-        assert!(!map.is_empty(), "initialize should register workspace in pool");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "/rpc/mcp should no longer exist"
+        );
     }
 }

@@ -141,7 +141,15 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
             mtime_secs   INTEGER NOT NULL,
             content_hash TEXT NOT NULL,
             PRIMARY KEY (repo_id, file_path)
-        );",
+        );
+
+        CREATE TABLE IF NOT EXISTS file_imports (
+            repo_id     TEXT NOT NULL REFERENCES repositories(id),
+            file_path   TEXT NOT NULL,
+            import_name TEXT NOT NULL,
+            PRIMARY KEY (repo_id, file_path, import_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_file_imports_name ON file_imports(import_name);",
     )?;
     ensure_observations_repo_id(&conn)?;
     ensure_performance_indexes(&conn)?;

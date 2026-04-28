@@ -233,9 +233,10 @@ fn format_benchmark_table(
 /// 4. Count tokens in both strings.
 /// 5. Print the table.
 fn run_benchmark(
-    conn:    &rusqlite::Connection,
-    symbol:  &str,
-    repo_id: &str,
+    conn:                 &rusqlite::Connection,
+    symbol:               &str,
+    repo_id:              &str,
+    precise_file_tokens:  bool,
 ) -> anyhow::Result<()> {
     // ── Step 1: resolve file path for display ────────────────────────
     let file_path: String = conn
@@ -249,11 +250,15 @@ fn run_benchmark(
             anyhow::anyhow!("Symbol '{}' not found in repo '{}'.", symbol, repo_id)
         })?;
 
-    // ── Step 2: build capsule (original_text populated by the engine) ─
+    // ── Step 2: build capsule (file_tokens is mode-aware in the engine) ─
     let result = retrieval::get_context_capsule(conn, symbol, repo_id, None)?;
 
     // ── Step 3: count tokens ──────────────────────────────────────────
-    let file_tokens    = count_tokens(&result.original_text)?;
+    let file_tokens = if precise_file_tokens {
+        retrieval::sum_precise_tokens_touched_by_capsule(conn, symbol, repo_id, None)?
+    } else {
+        result.file_tokens
+    };
     let capsule_tokens = count_tokens(&result.optimized_text)?;
 
     // ── Step 4: print table ───────────────────────────────────────────
@@ -527,7 +532,34 @@ fn ensure_repo_ready(
                 repo_id
             ));
         }
+        return Ok(repo_id);
     }
+
+    // M-8 FIX: Bounded JIT auto-indexing — when the resolved repo has no
+    // symbols in the DB (first-run), synchronously ingest the workspace root
+    // so the caller gets a usable graph without a manual ingest_repo step.
+    let symbol_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
+            rusqlite::params![repo_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if symbol_count == 0 && workspace_root.is_dir() {
+        eprintln!(
+            "[MARROW] JIT auto-indexing repo '{}' at {} …",
+            repo_id,
+            workspace_root.display()
+        );
+        let t = Instant::now();
+        ingestion::ingest_repo(conn, &repo_id, workspace_root)?;
+        eprintln!(
+            "[MARROW] JIT auto-indexing complete in {}ms.",
+            t.elapsed().as_millis()
+        );
+    }
+
     Ok(repo_id)
 }
 
@@ -1170,6 +1202,8 @@ impl ServerHandler for ContextEngine {
             let compliance_action = compliance.action;
             let args = compliance.args;
 
+            let mut jit_auto_indexed = false;
+
             let mut result = match compliance.tool_name.as_str() {
                 // ── get_context_capsule ───────────────────────────────────────
                 "get_context_capsule" => {
@@ -1197,9 +1231,7 @@ impl ServerHandler for ContextEngine {
 
                             let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())?;
 
-                            // Both token counts use the same len()/4 heuristic so
-                            // telemetry and the compare endpoint are always in sync.
-                            let full_file_tokens  = capsule_result.original_text.len() / 4;
+                            let full_file_tokens  = capsule_result.file_tokens;
                             let optimized_tokens  = capsule_result.optimized_text.len() / 4;
                             let original_text_out = capsule_result.original_text;
                             let out               = capsule_result.optimized_text;
@@ -1238,6 +1270,15 @@ impl ServerHandler for ContextEngine {
 
                     let tokens_saved = file_tokens.saturating_sub(capsule_tokens);
 
+                    let original_for_emit =
+                        if retrieval::capsule_original_mode() == retrieval::CapsuleOriginalMode::None
+                            && original_text.is_empty()
+                        {
+                            None
+                        } else {
+                            Some(original_text)
+                        };
+
                     let event = DashboardEvent::CapsuleServed {
                         symbol:         sym_for_event,
                         repo:           repo_for_event,
@@ -1247,8 +1288,9 @@ impl ServerHandler for ContextEngine {
                         tokens_saved,
                         origin:         client_name,
                         ts:             dashboard::now_ts(),
-                        original_text:  Some(original_text),
+                        original_text:  original_for_emit,
                         optimized_text: Some(out.clone()),
+                        has_cached_delta: false,
                     };
                     let http_client = self.http_client.clone();
                     tokio::spawn(async move {
@@ -1399,11 +1441,8 @@ impl ServerHandler for ContextEngine {
                         .canonicalize()
                         .unwrap_or_else(|_| root_path.clone());
 
-                    let current_dir = std::env::current_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."));
-                    let current_dir = current_dir
-                        .canonicalize()
-                        .unwrap_or(current_dir);
+                    // C-2 FIX: Bound against canonical workspace root, not CWD.
+                    let workspace_root = current_workspace_root();
 
                     // Phase 2 — Rule 2: Hard system blocklist
                     let blocked_roots = [
@@ -1421,7 +1460,8 @@ impl ServerHandler for ContextEngine {
                         }
                     }
 
-                    let is_inside_workspace = root_path.starts_with(&current_dir);
+                    // C-2 FIX: Check against workspace root, not process CWD
+                    let is_inside_workspace = root_path.starts_with(&workspace_root);
 
                     // Phase 2 — Rule 3: Double opt-in for out-of-bounds paths
                     if !is_inside_workspace && !user_confirmed {
@@ -1571,8 +1611,9 @@ impl ServerHandler for ContextEngine {
                         return Ok(CallToolResult::success(vec![Content::text(msg)]));
                     }
 
-                    // Guard: if the graph is empty the workspace has never been indexed.
-                    // Return an actionable system note rather than an empty/confusing result.
+                    // M-13 FIX: If the graph is empty, perform bounded JIT
+                    // auto-indexing so run_pipeline callers get a usable result
+                    // without a manual ingest_repo step.
                     {
                         let conn = db.lock().map_err(|_| {
                             rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None)
@@ -1581,19 +1622,41 @@ impl ServerHandler for ContextEngine {
                             .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
                             .unwrap_or(0);
                         if node_count == 0 {
-                            return Ok(CallToolResult::success(vec![Content::text(
-                                "[SYSTEM NOTE: The Marrow graph database is empty. \
-                                 The workspace has not been indexed. Please instruct \
-                                 the human user to open their terminal and run 'marrow' \
-                                 to select the 'Watch Workspace' or 'Index Workspace' option.]",
-                            )]));
+                            let cwd = current_workspace_root();
+                            if cwd.is_dir() {
+                                let repo_id = resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
+                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                eprintln!(
+                                    "[MARROW] run_pipeline JIT auto-indexing '{}' at {} …",
+                                    repo_id, cwd.display()
+                                );
+                                let t = Instant::now();
+                                ingestion::ingest_repo(&conn, &repo_id, &cwd)
+                                    .map_err(|e| rmcp::ErrorData::internal_error(
+                                        format!("JIT auto-indexing failed: {e}"), None,
+                                    ))?;
+                                eprintln!(
+                                    "[MARROW] run_pipeline JIT auto-indexing complete in {}ms.",
+                                    t.elapsed().as_millis()
+                                );
+                                jit_auto_indexed = true;
+                            } else {
+                                return Ok(CallToolResult::success(vec![Content::text(
+                                    "[SYSTEM NOTE: The Marrow graph is empty and the workspace \
+                                     directory is not accessible. Run ingest_repo first.]",
+                                )]));
+                            }
                         }
                     }
 
                     match intent.as_str() {
                         "analyze_repo" => {
                             let pipeline_t = Instant::now();
-                            let target_dir = target.clone();
+                            // M-18 FIX: Normalize `.` target to None (repo root).
+                            let target_dir = match target.as_deref() {
+                                Some(".") | Some("./") | Some("") => None,
+                                other => other.map(String::from),
+                            };
                             let target_dir_label = target_dir.clone().unwrap_or_else(|| "(workspace)".to_string());
 
                             trace!("analyze_repo: start — target_dir={target_dir_label}");
@@ -1702,7 +1765,7 @@ impl ServerHandler for ContextEngine {
 
                                     let t_cap = Instant::now();
                                     let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())?;
-                                    let full_file_tokens  = capsule_result.original_text.len() / 4;
+                                    let full_file_tokens  = capsule_result.file_tokens;
                                     let optimized_tokens  = capsule_result.optimized_text.len() / 4;
                                     let original_text_out = capsule_result.original_text;
                                     let out               = capsule_result.optimized_text;
@@ -1740,6 +1803,15 @@ impl ServerHandler for ContextEngine {
                             trace!("explore_symbol: spawn_blocking total [{:?}ms]", pipeline_t.elapsed().as_millis());
 
                             let tokens_saved = file_tokens.saturating_sub(capsule_tokens);
+                            let original_for_emit =
+                                if retrieval::capsule_original_mode() == retrieval::CapsuleOriginalMode::None
+                                    && original_text.is_empty()
+                                {
+                                    None
+                                } else {
+                                    Some(original_text)
+                                };
+
                             let event = DashboardEvent::CapsuleServed {
                                 symbol:         sym_for_event,
                                 repo:           repo_used,
@@ -1749,8 +1821,9 @@ impl ServerHandler for ContextEngine {
                                 tokens_saved,
                                 origin:         client_name,
                                 ts:             dashboard::now_ts(),
-                                original_text:  Some(original_text),
+                                original_text:  original_for_emit,
                                 optimized_text: Some(out.clone()),
+                                has_cached_delta: false,
                             };
                             let http_client = self.http_client.clone();
                             tokio::spawn(async move {
@@ -1807,8 +1880,7 @@ impl ServerHandler for ContextEngine {
                                     let t_trace = Instant::now();
                                     let result = retrieval::trace_logic_flow(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())?;
                                     let optimized_tokens = result.optimized_text.len() / 4;
-                                    // trace_flow original_text is the optimized_text (no separate raw file)
-                                    let file_tokens = result.original_text.len() / 4;
+                                    let file_tokens = result.file_tokens;
                                     let out = result.optimized_text;
                                     trace!("trace_flow: trace_logic_flow [{:?}ms] — {}B", t_trace.elapsed().as_millis(), out.len());
 
@@ -1853,6 +1925,7 @@ impl ServerHandler for ContextEngine {
                                 ts:             dashboard::now_ts(),
                                 original_text:  None,
                                 optimized_text: Some(out.clone()),
+                                has_cached_delta: false,
                             };
                             let http_client = self.http_client.clone();
                             tokio::spawn(async move {
@@ -2024,6 +2097,12 @@ impl ServerHandler for ContextEngine {
             }
             if let (Some(notice), Ok(ref mut tool_result)) = (&init_notice, &mut result) {
                 tool_result.content.insert(0, Content::text(notice.as_str()));
+            }
+            // M-13 FIX: Prepend auto-indexed system note when JIT ran
+            if jit_auto_indexed {
+                if let Ok(ref mut tool_result) = result {
+                    tool_result.content.insert(0, Content::text("[SYSTEM NOTE: Auto-Indexed]\n\n"));
+                }
             }
 
             result
@@ -2373,6 +2452,27 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("not found"), "expected not-found error: {msg}");
         assert!(msg.contains("ingest_repo"), "expected guidance to ingest: {msg}");
+    }
+
+    /// M-8: ensure_repo_ready auto-indexes when the repo has no symbols.
+    #[test]
+    fn ensure_repo_ready_auto_indexes_empty_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a parseable file so ingestion produces symbols
+        fs::write(dir.path().join("hello.py"), "def hello():\n    pass\n").unwrap();
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        // No explicit repo_id — should resolve to the dir name and auto-index
+        let repo_id = ensure_repo_ready(&conn, None, dir.path()).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
+                rusqlite::params![repo_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(count > 0, "auto-indexing should have produced symbols, got {count}");
     }
 
     // ── launch-spec helpers ────────────────────────────────────────────────────
@@ -4172,6 +4272,30 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(|s| s.as_str()) {
+        // M-19 FIX: Handle top-level help before default MCP launch.
+        Some("--help") | Some("-h") | Some("help") => {
+            println!("Usage: marrow [COMMAND]\n");
+            println!("Commands:");
+            println!("  (none)          Interactive TUI menu");
+            println!("  mcp             Start MCP stdio server");
+            println!("  index           Index current workspace");
+            println!("  watch           Watch workspace for changes");
+            println!("  init            Initialize workspace config");
+            println!("  integrate       Install agent instruction files");
+            println!("  validate        Check workspace setup");
+            println!("  benchmark       Run token benchmark");
+            println!("  query           Query a symbol");
+            println!("  maintenance     Checkpoint & vacuum database");
+            println!("  daemon          Start background daemon");
+            println!("  status          Show daemon status");
+            println!("  stop            Stop daemon");
+            println!("  ui              Open dashboard");
+            println!("  perf-harness    Run performance benchmarks");
+            println!("  service install Install as system service");
+            println!("\nOptions:");
+            println!("  --help, -h      Show this help");
+            return Ok(());
+        }
         // Human interactive mode: no arguments → launch the TUI menu.
         None => return cmd_interactive(),
         Some("ui")        => return cmd_ui(),
@@ -4194,18 +4318,30 @@ async fn main() -> Result<()> {
         Some("integrate") => return cmd_integrate(),
         Some("validate")  => return cmd_validate(),
 Some("benchmark") => {
-            let symbol = args.get(2).ok_or_else(|| {
-                anyhow::anyhow!("Usage: {} benchmark <symbol> <repo_id>", args[0])
+            let mut tail: Vec<String> = args.iter().skip(2).cloned().collect();
+            let precise = tail.iter().position(|a| a == "--precise-file-tokens").map(|i| {
+                tail.remove(i);
+                true
+            }).unwrap_or(false);
+
+            let symbol = tail.first().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Usage: {} benchmark [--precise-file-tokens] <symbol> <repo_id>",
+                    args[0]
+                )
             })?;
-            let repo_id = args.get(3).ok_or_else(|| {
-                anyhow::anyhow!("Usage: {} benchmark <symbol> <repo_id>", args[0])
+            let repo_id = tail.get(1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Usage: {} benchmark [--precise-file-tokens] <symbol> <repo_id>",
+                    args[0]
+                )
             })?;
 
             let db_path = std::env::var("MARROW_DB_PATH")
                 .unwrap_or_else(|_| ".marrow/graph.db".to_string());
 
             let conn = db::init_db_or_memory(&db_path)?;
-            run_benchmark(&conn, symbol, repo_id)?;
+            run_benchmark(&conn, symbol, repo_id, precise)?;
             return Ok(());
         }
         Some("query") => {

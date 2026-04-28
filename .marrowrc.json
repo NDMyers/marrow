@@ -1,6 +1,6 @@
 {
   "auto_open_ui": true,
-  "enforcement_mode": "strict",
+  "enforcement_mode": "default",
   "ignore": [
     "node_modules",
     "target",

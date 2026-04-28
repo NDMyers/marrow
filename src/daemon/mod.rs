@@ -38,11 +38,24 @@ pub async fn run() -> Result<()> {
     //   2. Call `spawn_watcher`, which is typed exactly as:
     //          fn spawn_watcher(db: Arc<std::sync::Mutex<Connection>>, ...) -> Result<JoinHandle>
     //      Pool::get_or_open returns the same Arc<std::sync::Mutex<Connection>> — no conversion.
+    // M-11 FIX: Track watched roots to prevent duplicate watcher spawns.
+    let watched_repos: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
     let pool_for_watcher = Arc::clone(&state.pool);
     let dash_tx_watcher = dash_tx.clone();
     tokio::spawn(async move {
         while let Some(new_path) = watcher_rx.recv().await {
-            match pool_for_watcher.get_or_open(&new_path).await {
+            // M-11 FIX: Canonicalize and deduplicate by canonical repo root.
+            let canonical = new_path.canonicalize().unwrap_or_else(|_| new_path.clone());
+            {
+                let mut watched = watched_repos.lock().unwrap_or_else(|e| e.into_inner());
+                if watched.contains(&canonical) {
+                    continue; // Already watching this repo root.
+                }
+                watched.insert(canonical.clone());
+            }
+            match pool_for_watcher.get_or_open(&canonical).await {
                 Ok(conn) => {
                     if let Err(e) = crate::watcher::spawn_watcher(
                         conn,
@@ -51,14 +64,14 @@ pub async fn run() -> Result<()> {
                     ) {
                         eprintln!(
                             "[marrow daemon] watcher error for {}: {e}",
-                            new_path.display()
+                            canonical.display()
                         );
                     }
                 }
                 Err(e) => {
                     eprintln!(
                         "[marrow daemon] could not open pool for {}: {e}",
-                        new_path.display()
+                        canonical.display()
                     );
                 }
             }

@@ -16,6 +16,18 @@ docs/plans/
 .claude/
 .marrow/
 .agents/
+.10x/
+10x-squad-artifacts/
+.cursor/agents/
+.cursor/plans/
+.github/agents/
+.github/skills/
+.vexp/
+.clinerules
+.cursorrules
+.roomrules
+.windsurfrules
+state-of-the-union.md
 
 # npm
 node_modules/

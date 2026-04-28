@@ -77,14 +77,20 @@ impl IpcClient {
     }
 
     /// Register a new repository path for background watching.
+    /// M-10 FIX: Check HTTP response status and return errors to callers.
     pub async fn register_watch(&self, path: &Path) -> Result<()> {
         let url = format!("{}/api/watch", self.base_url);
-        self.inner
+        let resp = self.inner
             .post(&url)
             .json(&serde_json::json!({ "path": path.to_string_lossy() }))
             .send()
             .await
             .context("registering watch path with daemon")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("watch registration failed (HTTP {status}): {body}");
+        }
         Ok(())
     }
 

@@ -1145,7 +1145,11 @@ pub fn get_project_skeleton(
                         OR symbol_type LIKE '%class%' \
                         OR symbol_type LIKE '%struct%' \
                         OR symbol_type LIKE '%trait%' \
-                        OR symbol_type LIKE '%interface%') \
+                        OR symbol_type LIKE '%interface%' \
+                        OR symbol_type LIKE '%method%' \
+                        OR symbol_type LIKE '%enum%' \
+                        OR symbol_type LIKE '%impl%' \
+                        OR symbol_type LIKE '%module%') \
                     ORDER BY file_path ASC, rowid ASC \
                     LIMIT ?2";
 
@@ -1156,7 +1160,11 @@ pub fn get_project_skeleton(
                        OR symbol_type LIKE '%class%' \
                        OR symbol_type LIKE '%struct%' \
                        OR symbol_type LIKE '%trait%' \
-                       OR symbol_type LIKE '%interface%') \
+                       OR symbol_type LIKE '%interface%' \
+                       OR symbol_type LIKE '%method%' \
+                       OR symbol_type LIKE '%enum%' \
+                       OR symbol_type LIKE '%impl%' \
+                       OR symbol_type LIKE '%module%') \
                      AND (file_path = ?3 OR file_path LIKE ?4) \
                    ORDER BY file_path ASC, rowid ASC \
                    LIMIT ?2";

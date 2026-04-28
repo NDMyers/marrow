@@ -180,6 +180,18 @@ async fn handle_file_change(
     let db_clone = Arc::clone(db);
 
     let symbols = tokio::task::spawn_blocking(move || -> Result<usize> {
+        // M-12 FIX: Parse OUTSIDE the DB mutex so tree-sitter CPU work
+        // does not block concurrent capsule/skeleton reads.
+        let parsed_symbols = if file_exists {
+            match ingestion::parse_file(&file_path_for_task) {
+                Ok((_lang, symbols)) => Some(symbols),
+                Err(_) => return Ok(0),
+            }
+        } else {
+            None
+        };
+
+        // Now acquire the DB lock for the brief write transaction.
         let conn = db_clone
             .lock()
             .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
@@ -193,15 +205,6 @@ async fn handle_file_change(
             .query_map(rusqlite::params![repo_id_clone, rel_path_clone], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
-
-        let parsed_symbols = if file_exists {
-            match ingestion::parse_file(&file_path_for_task) {
-                Ok((_lang, symbols)) => Some(symbols),
-                Err(_) => return Ok(0),
-            }
-        } else {
-            None
-        };
 
         let old_ids: HashSet<String> = tx_db
             .prepare("SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2")?
@@ -232,7 +235,7 @@ async fn handle_file_change(
         if let Some(symbols) = parsed_symbols {
             let new_ids: HashSet<String> = symbols
                 .iter()
-                .map(|s| format!("{}:{}:{}", repo_id_clone, rel_path_clone, s.name))
+                .map(|s| crate::ingestion::make_node_id(&repo_id_clone, &rel_path_clone, &s.symbol_type, &s.name, s.start_byte))
                 .collect();
             let removed: Vec<String> = old_ids.difference(&new_ids).cloned().collect();
             ingestion::delete_edges_touching_removed_ids(&tx_db, &removed)?;
@@ -248,7 +251,7 @@ async fn handle_file_change(
 
             let mut count = 0;
             for sym in &symbols {
-                let node_id = format!("{}:{}:{}", repo_id_clone, rel_path_clone, sym.name);
+                let node_id = crate::ingestion::make_node_id(&repo_id_clone, &rel_path_clone, &sym.symbol_type, &sym.name, sym.start_byte);
                 let new_hash = crate::db::hash_raw_text(&sym.raw_text);
                 if old_ids.contains(&node_id) {
                     tx_db.execute(
@@ -308,19 +311,35 @@ async fn handle_file_change(
 
             for sym in &symbols {
                 let callees = ingestion::extract_calls_from_symbol(&sym.raw_text, lang_ext);
-                let source_id = format!("{}:{}:{}", repo_id_clone, rel_path_clone, sym.name);
+                let source_id = crate::ingestion::make_node_id(&repo_id_clone, &rel_path_clone, &sym.symbol_type, &sym.name, sym.start_byte);
                 for callee_name in &callees {
                     if callee_name == &sym.name {
                         continue;
                     }
-                    if let Some(target_ids) = name_to_ids.get(callee_name.as_str()) {
-                        for target_id in target_ids {
+                    if let Some(targets) = name_to_ids.get(callee_name.as_str()) {
+                        // M-5 scoping: prefer same-file targets; else emit only
+                        // if the name resolves unambiguously (single target).
+                        let same_file: Vec<&str> = targets
+                            .iter()
+                            .filter(|(_, fp)| fp == &rel_path_clone)
+                            .map(|(id, _)| id.as_str())
+                            .collect();
+                        if !same_file.is_empty() {
+                            for id in same_file {
+                                tx_db.execute(
+                                    "INSERT OR IGNORE INTO edges (source_id, target_id, relationship_type) \
+                                     VALUES (?1, ?2, 'CALLS')",
+                                    rusqlite::params![source_id, id],
+                                )?;
+                            }
+                        } else if targets.len() == 1 {
                             tx_db.execute(
                                 "INSERT OR IGNORE INTO edges (source_id, target_id, relationship_type) \
                                  VALUES (?1, ?2, 'CALLS')",
-                                rusqlite::params![source_id, target_id],
+                                rusqlite::params![source_id, &targets[0].0],
                             )?;
                         }
+                        // else: ambiguous cross-file, skip
                     }
                 }
             }

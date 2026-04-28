@@ -16,24 +16,22 @@ function getTargetTriple() {
   const platform = process.platform;
   const arch = process.arch;
 
+  // M-16 FIX: Only map targets that actually have published release artifacts.
+  // Linux ARM64, Windows ARM64, and Windows x64 are not currently built in CI.
   const matrix = {
     darwin: {
       arm64: "aarch64-apple-darwin",
       x64: "x86_64-apple-darwin",
     },
     linux: {
-      arm64: "aarch64-unknown-linux-gnu",
       x64: "x86_64-unknown-linux-gnu",
-    },
-    win32: {
-      arm64: "aarch64-pc-windows-msvc",
-      x64: "x86_64-pc-windows-msvc",
     },
   };
 
   const platformTargets = matrix[platform];
   if (!platformTargets) {
     console.error(`[marrow] Unsupported platform: ${platform}`);
+    console.error("[marrow] Supported platforms: macOS (arm64, x64), Linux (x64)");
     console.error("[marrow] Please build from source: https://github.com/" + REPO);
     process.exit(1);
   }
