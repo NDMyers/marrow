@@ -18,6 +18,19 @@ pub struct Symbol {
     pub name: String,
     pub symbol_type: String,
     pub raw_text: String,
+    /// Callee names extracted from this symbol's body during the parallel parse phase.
+    /// Pre-computed here so the DB write phase never needs to re-run tree-sitter.
+    pub callees: Vec<String>,
+    /// Byte offset of the symbol's first character in the source file.
+    /// Used in `make_node_id` to disambiguate same-name same-kind symbols.
+    pub start_byte: usize,
+}
+
+/// Build a stable node ID that disambiguates same-name symbols in the same file
+/// (e.g. C++ `class Widget` vs constructor `Widget`, or two same-name nested functions).
+/// Format: `repo_id:file_path:symbol_type:symbol_name:start_byte`
+pub fn make_node_id(repo_id: &str, file_path: &str, symbol_type: &str, symbol_name: &str, start_byte: usize) -> String {
+    format!("{}:{}:{}:{}:{}", repo_id, file_path, symbol_type, symbol_name, start_byte)
 }
 
 /// One indexed file’s parse output: rel path, language tag, symbols, content hash, mtime (ns).
@@ -109,20 +122,20 @@ fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
         "rs" => Some(LangConfig {
             language: tree_sitter_rust::LANGUAGE.into(),
             query_src: concat!(
-                "(function_item) @capture.func\n",
-                "(struct_item) @capture.struct\n",
-                "(trait_item) @capture.trait\n",
-                "(impl_item) @capture.impl\n",
-                "(enum_item) @capture.enum"
+                "(function_item) @function\n",
+                "(struct_item) @struct\n",
+                "(trait_item) @trait\n",
+                "(impl_item) @impl\n",
+                "(enum_item) @enum"
             ),
         }),
         "rb" => Some(LangConfig {
             language: tree_sitter_ruby::LANGUAGE.into(),
             query_src: concat!(
-                "(method) @capture.method\n",
-                "(singleton_method) @capture.method\n",
-                "(class) @capture.class\n",
-                "(module) @capture.module"
+                "(method) @method\n",
+                "(singleton_method) @method\n",
+                "(class) @class\n",
+                "(module) @module"
             ),
         }),
         _ => None,
@@ -341,10 +354,14 @@ pub fn parse_file(path: &Path) -> Result<(String, Vec<Symbol>)> {
                 let capture_name = query.capture_names()[capture.index as usize];
                 let name = extract_symbol_name(&node, source_bytes);
                 let raw_text = cap_raw_text(node.utf8_text(source_bytes).unwrap_or("").to_string());
+                let callees = extract_calls_from_symbol(&raw_text, &ext);
+                let start_byte = node.start_byte();
                 syms.push(Symbol {
                     name,
                     symbol_type: capture_name.to_string(),
                     raw_text,
+                    callees,
+                    start_byte,
                 });
             }
         }
@@ -436,19 +453,32 @@ fn walk_builder_for_repo(root: &Path) -> Result<WalkBuilder> {
         .git_ignore(true)
         .git_global(false)
         .git_exclude(false);
-    let mut overrides = ignore::overrides::OverrideBuilder::new(root);
-    for pat in &ignore_patterns {
-        overrides
-            .add(&format!("!{pat}/"))
-            .map_err(|e| anyhow!("marrowrc ignore override `{pat}`: {e}"))?;
-    }
-    builder.overrides(overrides.build()?);
-    builder.filter_entry(|e| {
+    // M-7 FIX: Apply .marrowrc.json patterns as exclusions via filter_entry.
+    // The previous OverrideBuilder approach used `!{pat}` which, despite the
+    // ignore crate treating `!` as "ignore", did not correctly exclude
+    // directories in all edge cases. Using filter_entry is explicit and testable.
+    // Patterns with trailing slashes (e.g. "generated/") are stripped to match
+    // directory basenames correctly.
+    let normalized_patterns: Vec<String> = ignore_patterns
+        .into_iter()
+        .map(|p| p.trim_end_matches('/').to_string())
+        .collect();
+    builder.filter_entry(move |e| {
         let name = e.file_name().to_string_lossy();
-        !matches!(
+        // Hardcoded exclusions for common non-source directories
+        if matches!(
             name.as_ref(),
             "node_modules" | ".git" | "target" | "dist" | "build" | "vendor"
-        )
+        ) {
+            return false;
+        }
+        // .marrowrc.json custom exclusions — match entry name against each pattern
+        for pat in &normalized_patterns {
+            if name == pat.as_str() {
+                return false;
+            }
+        }
+        true
     });
     Ok(builder)
 }
@@ -568,6 +598,11 @@ fn write_spill_parsed_row(w: &mut impl Write, row: &ParsedFileBatchRow) -> std::
         write_utf8_blob(w, &sym.name)?;
         write_utf8_blob(w, &sym.symbol_type)?;
         write_utf8_blob(w, &sym.raw_text)?;
+        write_u64_be(w, sym.start_byte as u64)?;
+        write_u64_be(w, sym.callees.len() as u64)?;
+        for callee in &sym.callees {
+            write_utf8_blob(w, callee)?;
+        }
     }
     Ok(())
 }
@@ -595,11 +630,16 @@ fn read_spill_parsed_row(r: &mut impl Read) -> Result<Option<ParsedFileBatchRow>
     }
     let mut symbols = Vec::with_capacity(n);
     for _ in 0..n {
-        symbols.push(Symbol {
-            name: read_utf8_blob(r)?,
-            symbol_type: read_utf8_blob(r)?,
-            raw_text: read_utf8_blob(r)?,
-        });
+        let name = read_utf8_blob(r)?;
+        let symbol_type = read_utf8_blob(r)?;
+        let raw_text = read_utf8_blob(r)?;
+        let start_byte = read_u64_be(r)? as usize;
+        let callee_count = read_u64_be(r)? as usize;
+        let mut callees = Vec::with_capacity(callee_count);
+        for _ in 0..callee_count {
+            callees.push(read_utf8_blob(r)?);
+        }
+        symbols.push(Symbol { name, symbol_type, raw_text, callees, start_byte });
     }
     Ok(Some((path, lang, symbols, hash, mtime)))
 }
@@ -784,15 +824,11 @@ where
         })
         .collect();
 
-    // Determine which files need content-checking (mtime changed or new)
-    let candidates: Vec<(PathBuf, String, i64)> = disk_meta
-        .iter()
-        .filter(|(_, rel, mtime)| match known_files.get(rel) {
-            None => true,
-            Some((km, _)) => km != mtime,
-        })
-        .cloned()
-        .collect();
+    // M-11 FIX: Hash ALL known files, not just those with changed mtime.
+    // Mtime-preserving edits (e.g. git checkout, sed -i on some filesystems)
+    // would otherwise skip hash verification, leaving stale graph data and
+    // fresh-looking observations.
+    let candidates: Vec<(PathBuf, String, i64)> = disk_meta.to_vec();
 
     let ingest_threads = ingest_parse_thread_count();
     let queue_cap = ingest_parse_queue_capacity();
@@ -870,8 +906,8 @@ pub(crate) fn build_name_to_ids_for_symbol_names(
     conn: &Connection,
     repo_id: &str,
     names: &HashSet<String>,
-) -> Result<HashMap<String, Vec<String>>> {
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+) -> Result<HashMap<String, Vec<(String, String)>>> {
+    let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
     if names.is_empty() {
         return Ok(map);
     }
@@ -890,16 +926,16 @@ pub(crate) fn build_name_to_ids_for_symbol_names(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT n.symbol_name, n.id FROM nodes n
+        "SELECT n.symbol_name, n.id, n.file_path FROM nodes n
          INNER JOIN _marrow_callee_lookup c ON n.symbol_name = c.name
          WHERE n.repo_id = ?1",
     )?;
     let rows = stmt.query_map(rusqlite::params![repo_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
     })?;
     for r in rows {
-        let (name, id) = r?;
-        map.entry(name).or_default().push(id);
+        let (name, id, file_path) = r?;
+        map.entry(name).or_default().push((id, file_path));
     }
 
     Ok(map)
@@ -932,7 +968,7 @@ pub(crate) fn delete_edges_touching_removed_ids(conn: &Connection, removed_ids: 
 
 /// Batched `CALLS` inserts (MARROW-PERF-010).
 fn flush_calls_edge_batch(conn: &Connection, pairs: &[(String, String)]) -> Result<usize> {
-    const CHUNK: usize = 48;
+    const CHUNK: usize = 500;
     if pairs.is_empty() {
         return Ok(0);
     }
@@ -1070,6 +1106,10 @@ where
             "DELETE FROM files WHERE repo_id = ?1 AND file_path = ?2",
             rusqlite::params![repo_id, file_path],
         )?;
+        conn.execute(
+            "DELETE FROM file_imports WHERE repo_id = ?1 AND file_path = ?2",
+            rusqlite::params![repo_id, file_path],
+        )?;
     }
 
     // Apply each parsed file from the spill file (bounded channel + drainer limited parse-phase RSS).
@@ -1078,7 +1118,7 @@ where
     // a second time for the CALLS edge resolution pass (eliminates two redundant full-table scans).
     let mut changed_paths: HashSet<String> = HashSet::new();
     let mut all_callee_names: HashSet<String> = HashSet::new();
-    let mut pending_calls: Vec<(String, String)> = Vec::new();
+    let mut pending_calls: Vec<(String, String, String)> = Vec::new();
     let spill_file = fs::File::open(&parsed_spill)?;
     let mut spill_reader = BufReader::new(spill_file);
     while let Some((file_path, lang, symbols, hash, mtime)) =
@@ -1096,7 +1136,7 @@ where
 
         let new_ids: HashSet<String> = symbols
             .iter()
-            .map(|s| format!("{}:{}:{}", repo_id, file_path, s.name))
+            .map(|s| make_node_id(repo_id, &file_path, &s.symbol_type, &s.name, s.start_byte))
             .collect();
         let removed: Vec<String> = old_ids.difference(&new_ids).cloned().collect();
         delete_edges_touching_removed_ids(conn, &removed)?;
@@ -1106,7 +1146,7 @@ where
 
         // Upsert in-place so stable `id` rows survive (FK-safe inbound edges from other files).
         for sym in &symbols {
-            let node_id = format!("{}:{}:{}", repo_id, file_path, sym.name);
+            let node_id = make_node_id(repo_id, &file_path, &sym.symbol_type, &sym.name, sym.start_byte);
             let new_hash = crate::db::hash_raw_text(&sym.raw_text);
             if old_ids.contains(&node_id) {
                 conn.execute(
@@ -1138,13 +1178,12 @@ where
             }
             crate::db::mark_stale_observations(conn, repo_id, &sym.name, &file_path, &new_hash)?;
 
-            // Accumulate callees while raw_text is live in the spill buffer.
-            // This replaces the two separate post-write DB scans (callee_names_referenced_in_files
-            // + the second symbols loop), cutting two full raw_text column reads per ingest.
-            for callee_name in extract_calls_from_symbol(&sym.raw_text, &lang) {
-                if callee_name != sym.name {
+            // Callees were pre-computed during the parallel parse phase and stored in the
+            // spill file — no tree-sitter re-parse needed here.
+            for callee_name in &sym.callees {
+                if callee_name != &sym.name {
                     all_callee_names.insert(callee_name.clone());
-                    pending_calls.push((node_id.clone(), callee_name));
+                    pending_calls.push((node_id.clone(), callee_name.clone(), file_path.clone()));
                 }
             }
         }
@@ -1168,16 +1207,61 @@ where
     // Callee names were collected during the spill-read above — no DB re-scan needed.
     let name_to_ids = build_name_to_ids_for_symbol_names(conn, repo_id, &all_callee_names)?;
 
+    // M-5 FIX: Scope CALLS edges. Prefer same-file targets; if no same-file
+    // candidate, emit only when the callee name resolves unambiguously (one
+    // target in the repo). Ambiguous names produce no CALLS edge rather than
+    // false-positive global links.
     let mut calls_batch: Vec<(String, String)> = Vec::new();
-    for (source_id, callee_name) in &pending_calls {
-        if let Some(target_ids) = name_to_ids.get(callee_name.as_str()) {
-            for target_id in target_ids {
-                calls_batch.push((source_id.clone(), target_id.clone()));
+    for (source_id, callee_name, source_file) in &pending_calls {
+        if let Some(targets) = name_to_ids.get(callee_name.as_str()) {
+            let same_file: Vec<&str> = targets
+                .iter()
+                .filter(|(_, fp)| fp == source_file)
+                .map(|(id, _)| id.as_str())
+                .collect();
+            if !same_file.is_empty() {
+                for id in same_file {
+                    calls_batch.push((source_id.clone(), id.to_string()));
+                }
+            } else if targets.len() == 1 {
+                calls_batch.push((source_id.clone(), targets[0].0.clone()));
+            }
+            // else: ambiguous (multiple targets in different files), skip
+        }
+    }
+    // M-9 FIX: Report actual inserted rows, not submitted batch size.
+    let calls_edge_count = flush_calls_edge_batch(conn, &calls_batch)?;
+
+    // M-6 FIX: Extract file-level imports from full source text (not symbol
+    // raw_text) so top-level imports outside captured symbol bodies are visible
+    // for cross-repo IMPORTS resolution.
+    let repo_root: String = conn.query_row(
+        "SELECT root_path FROM repositories WHERE id = ?1",
+        rusqlite::params![repo_id],
+        |row| row.get(0),
+    )?;
+    for file_path in &changed_paths {
+        conn.execute(
+            "DELETE FROM file_imports WHERE repo_id = ?1 AND file_path = ?2",
+            rusqlite::params![repo_id, file_path],
+        )?;
+        let abs_path = PathBuf::from(&repo_root).join(file_path);
+        if let Ok(source) = fs::read_to_string(&abs_path) {
+            let lang_ext = abs_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let imports = extract_imports(&source, lang_ext);
+            if !imports.is_empty() {
+                let mut ins = conn.prepare_cached(
+                    "INSERT OR IGNORE INTO file_imports (repo_id, file_path, import_name) VALUES (?1, ?2, ?3)",
+                )?;
+                for name in &imports {
+                    ins.execute(rusqlite::params![repo_id, file_path, name])?;
+                }
             }
         }
     }
-    let calls_edge_count = calls_batch.len();
-    flush_calls_edge_batch(conn, &calls_batch)?;
 
     maybe_emit_progress(progress, progress_state, 95);
 
@@ -1336,40 +1420,57 @@ pub fn resolve_cross_repo_after_ingest(conn: &Connection, repo_id: &str) -> Resu
 
 /// Secondary pass: resolve cross-repo import edges.
 ///
-/// `source_repo_scope`: when `Some(rid)`, only nodes with `repo_id = rid` are scanned for
-/// import statements (typical after `run_ingestion`). When `None`, every node is scanned
-/// (tests / explicit full rebuild via `MARROW_CROSS_REPO_FULL_SCAN`).
+/// M-6 FIX: Uses the `file_imports` table (populated from whole-file text during
+/// ingestion) instead of scanning node `raw_text`. This captures top-level imports
+/// that appear outside any captured symbol body.
+///
+/// `source_repo_scope`: when `Some(rid)`, only files with `repo_id = rid` are scanned
+/// (typical after `run_ingestion`). When `None`, every file is scanned.
 pub fn resolve_cross_repo_edges(
     conn: &Connection,
     source_repo_scope: Option<&str>,
 ) -> Result<usize> {
-    // Stream rows — never collect all `raw_text` into a Vec. A full-graph ingest can
-    // have hundreds of thousands of nodes; holding every body at once duplicates
-    // SQLite's page cache in Rust allocations and routinely exceeds tens of GB RSS.
-    let sql = match source_repo_scope {
-        Some(_) => "SELECT id, repo_id, raw_text, language FROM nodes WHERE repo_id = ?1",
-        None => "SELECT id, repo_id, raw_text, language FROM nodes",
+    // Pass 1 — collect imports from file_imports table
+    // import_name -> Vec<(source_node_id, source_repo_id)>
+    let fi_sql = match source_repo_scope {
+        Some(_) => "SELECT import_name, repo_id, file_path FROM file_imports WHERE repo_id = ?1",
+        None => "SELECT import_name, repo_id, file_path FROM file_imports",
     };
-    let mut stmt = conn.prepare(sql)?;
-    let mut rows = match source_repo_scope {
-        Some(rid) => stmt.query(rusqlite::params![rid])?,
-        None => stmt.query([])?,
+    let mut fi_stmt = conn.prepare(fi_sql)?;
+    let mut fi_rows = match source_repo_scope {
+        Some(rid) => fi_stmt.query(rusqlite::params![rid])?,
+        None => fi_stmt.query([])?,
     };
 
-    // Pass 1 — collect imports keyed by imported symbol name
-    // import_name -> Vec<(source_id, source_repo_id)>
+    // Cache: (repo_id, file_path) -> first node id in that file
+    let mut file_node_cache: std::collections::HashMap<(String, String), Option<String>> =
+        std::collections::HashMap::new();
+
     let mut import_map: std::collections::HashMap<String, Vec<(String, String)>> =
         std::collections::HashMap::new();
-    while let Some(row) = rows.next()? {
-        let source_id: String = row.get(0)?;
+
+    while let Some(row) = fi_rows.next()? {
+        let import_name: String = row.get(0)?;
         let source_repo: String = row.get(1)?;
-        let raw_text: String = row.get(2)?;
-        let lang: String = row.get(3)?;
-        for name in extract_imports(&raw_text, &lang) {
+        let file_path: String = row.get(2)?;
+
+        let cache_key = (source_repo.clone(), file_path.clone());
+        let source_node = file_node_cache
+            .entry(cache_key)
+            .or_insert_with_key(|(repo, fp)| {
+                conn.query_row(
+                    "SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2 LIMIT 1",
+                    rusqlite::params![repo, fp],
+                    |row| row.get(0),
+                )
+                .ok()
+            });
+
+        if let Some(source_id) = source_node {
             import_map
-                .entry(name)
+                .entry(import_name)
                 .or_default()
-                .push((source_id.clone(), source_repo.clone()));
+                .push((source_id.clone(), source_repo));
         }
     }
 
@@ -1940,6 +2041,11 @@ function foo() {
             ],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO file_imports (repo_id, file_path, import_name) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["repo_a", "main.py", "UniqueWidget"],
+        )
+        .unwrap();
 
         let full = resolve_cross_repo_edges(&conn, None).unwrap();
         let scoped = resolve_cross_repo_edges(&conn, Some("repo_a")).unwrap();
@@ -2212,6 +2318,188 @@ function foo() {
             )
             .unwrap();
         assert_eq!(edge_exists, 1, "CALLS edge from 'caller' to 'callee' must exist");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rust symbol kinds are stored as canonical names (function, struct, trait, etc.)
+    /// and never as tree-sitter capture names (capture.func, capture.struct).
+    #[test]
+    fn rust_symbol_kinds_are_canonical() {
+        let dir = std::env::temp_dir().join("marrow_test_rust_symbol_kinds");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("lib.rs"),
+            "pub fn my_func() {}\npub struct MyStruct {}\npub trait MyTrait {}\npub enum MyEnum { A }\n",
+        ).unwrap();
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        ingest_repo(&conn, "test", &dir).unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT symbol_name, symbol_type FROM nodes WHERE repo_id = 'test' ORDER BY symbol_name")
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0).unwrap(), row.get(1).unwrap())))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Verify no capture-prefixed types
+        for (name, kind) in &rows {
+            assert!(
+                !kind.starts_with("capture."),
+                "symbol '{name}' has non-canonical kind '{kind}'"
+            );
+        }
+
+        // Verify expected canonical kinds exist
+        let kinds: Vec<&str> = rows.iter().map(|(_, k)| k.as_str()).collect();
+        assert!(kinds.contains(&"function"), "expected 'function' kind in: {kinds:?}");
+        assert!(kinds.contains(&"struct"), "expected 'struct' kind in: {kinds:?}");
+        assert!(kinds.contains(&"trait"), "expected 'trait' kind in: {kinds:?}");
+        assert!(kinds.contains(&"enum"), "expected 'enum' kind in: {kinds:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same-name symbols in the same file get distinct node IDs via start_byte.
+    /// Tests the C++ case: `class Widget` and constructor `Widget()`.
+    #[test]
+    fn same_name_symbols_get_distinct_node_ids() {
+        let dir = std::env::temp_dir().join("marrow_test_same_name_distinct");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // C++ file with class Widget and constructor Widget (different symbol_type)
+        std::fs::write(
+            dir.join("widget.cpp"),
+            r#"
+class Widget {
+public:
+    Widget() {}
+    void update() {}
+};
+
+void processWidget() {}
+"#,
+        ).unwrap();
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        ingest_repo(&conn, "test", &dir).unwrap();
+
+        // Check that all node IDs are unique
+        let mut stmt = conn
+            .prepare("SELECT id FROM nodes WHERE repo_id = 'test'")
+            .unwrap();
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let id_set: HashSet<String> = ids.iter().cloned().collect();
+        assert_eq!(
+            ids.len(),
+            id_set.len(),
+            "all node IDs must be unique — found duplicates in: {ids:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// make_node_id includes start_byte so two symbols with identical
+    /// repo/file/type/name but different positions produce different IDs.
+    #[test]
+    fn make_node_id_includes_start_byte() {
+        let id_a = make_node_id("r", "f.py", "function", "foo", 0);
+        let id_b = make_node_id("r", "f.py", "function", "foo", 100);
+        assert_ne!(id_a, id_b, "same-name same-kind at different positions must differ");
+    }
+
+    /// .marrowrc.json ignore patterns exclude matching directories from ingestion.
+    #[test]
+    fn marrowrc_ignore_excludes_dirs() {
+        let dir = std::env::temp_dir().join("marrow_test_marrowrc_ignore");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create a .marrowrc.json that ignores "generated"
+        std::fs::write(
+            dir.join(".marrowrc.json"),
+            r#"{"ignore": ["generated"]}"#,
+        ).unwrap();
+
+        // Create files in the ignored directory and a normal directory
+        std::fs::create_dir_all(dir.join("generated")).unwrap();
+        std::fs::write(dir.join("generated").join("auto.py"), "def auto():\n    pass\n").unwrap();
+        std::fs::write(dir.join("real.py"), "def real():\n    pass\n").unwrap();
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        ingest_repo(&conn, "test", &dir).unwrap();
+
+        // generated/auto.py should be excluded
+        let auto_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test' AND symbol_name = 'auto'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(auto_count, 0, "files under ignored 'generated/' dir should be excluded");
+
+        // real.py should be included
+        let real_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test' AND symbol_name = 'real'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(real_count, 1, "real.py outside ignored dir should be indexed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// .marrowrc.json patterns with trailing slashes are normalized and still exclude.
+    #[test]
+    fn marrowrc_trailing_slash_patterns_exclude_dirs() {
+        let dir = std::env::temp_dir().join("marrow_test_marrowrc_trailing_slash");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Pattern uses trailing slash: "output/"
+        std::fs::write(
+            dir.join(".marrowrc.json"),
+            r#"{"ignore": ["output/"]}"#,
+        ).unwrap();
+
+        std::fs::create_dir_all(dir.join("output")).unwrap();
+        std::fs::write(dir.join("output").join("gen.py"), "def gen():\n    pass\n").unwrap();
+        std::fs::write(dir.join("keep.py"), "def keep():\n    pass\n").unwrap();
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        ingest_repo(&conn, "test", &dir).unwrap();
+
+        let gen_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test' AND symbol_name = 'gen'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(gen_count, 0, "'output/' with trailing slash should still exclude");
+
+        let keep_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test' AND symbol_name = 'keep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(keep_count, 1, "keep.py should be indexed");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
