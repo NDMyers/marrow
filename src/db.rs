@@ -4,18 +4,18 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedRepoSnapshot {
-    pub repo_id:      String,
-    pub root_path:    String,
+    pub repo_id: String,
+    pub root_path: String,
     pub symbol_count: i64,
-    pub file_count:   i64,
+    pub file_count: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseScopeSnapshot {
-    pub repo_count:   i64,
+    pub repo_count: i64,
     pub symbol_count: i64,
-    pub file_count:   i64,
-    pub repos:        Vec<IndexedRepoSnapshot>,
+    pub file_count: i64,
+    pub repos: Vec<IndexedRepoSnapshot>,
 }
 
 /// Opens (or creates) the database at `db_path`.
@@ -107,6 +107,20 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
             PRIMARY KEY (source_id, target_id, relationship_type)
         );
 
+        CREATE TABLE IF NOT EXISTS graph_node_degrees (
+            repo_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            degree  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (repo_id, node_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS graph_degree_cache_meta (
+            repo_id      TEXT PRIMARY KEY,
+            node_count   INTEGER NOT NULL DEFAULT 0,
+            dirty        INTEGER NOT NULL DEFAULT 1,
+            refreshed_at INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_nodes_repo ON nodes(repo_id);
         CREATE INDEX IF NOT EXISTS idx_nodes_symbol ON nodes(symbol_name);
         -- MARROW-PERF-010: composite covers repo+file and repo+symbol hot paths (ingest + callee join).
@@ -114,6 +128,8 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_nodes_repo_symbol ON nodes(repo_id, symbol_name);
         CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
         CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
+        CREATE INDEX IF NOT EXISTS idx_graph_node_degrees_repo_rank
+            ON graph_node_degrees(repo_id, degree DESC, node_id);
 
         CREATE TABLE IF NOT EXISTS stats (
             key   TEXT PRIMARY KEY,
@@ -160,9 +176,137 @@ pub fn init_db(db_path: &str) -> Result<Connection> {
 fn ensure_performance_indexes(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_nodes_repo_file ON nodes(repo_id, file_path);
-         CREATE INDEX IF NOT EXISTS idx_nodes_repo_symbol ON nodes(repo_id, symbol_name);",
+         CREATE INDEX IF NOT EXISTS idx_nodes_repo_symbol ON nodes(repo_id, symbol_name);
+         CREATE TABLE IF NOT EXISTS graph_node_degrees (
+            repo_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+            degree  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (repo_id, node_id)
+         );
+         CREATE TABLE IF NOT EXISTS graph_degree_cache_meta (
+            repo_id      TEXT PRIMARY KEY,
+            node_count   INTEGER NOT NULL DEFAULT 0,
+            dirty        INTEGER NOT NULL DEFAULT 1,
+            refreshed_at INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS idx_graph_node_degrees_repo_rank
+            ON graph_node_degrees(repo_id, degree DESC, node_id);",
     )?;
     Ok(())
+}
+
+pub fn mark_graph_degrees_dirty(conn: &Connection, repo_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO graph_degree_cache_meta (repo_id, node_count, dirty, refreshed_at)
+         VALUES (?1, 0, 1, CAST(strftime('%s', 'now') AS INTEGER))
+         ON CONFLICT(repo_id) DO UPDATE SET
+            dirty = 1,
+            refreshed_at = CAST(strftime('%s', 'now') AS INTEGER)",
+        rusqlite::params![repo_id],
+    )?;
+    Ok(())
+}
+
+pub fn graph_degrees_are_fresh(conn: &Connection, repo_id: &str) -> Result<bool> {
+    let meta = conn
+        .query_row(
+            "SELECT node_count, dirty FROM graph_degree_cache_meta WHERE repo_id = ?1",
+            rusqlite::params![repo_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+
+    let Some((cached_node_count, dirty)) = meta else {
+        return Ok(false);
+    };
+    if dirty != 0 {
+        return Ok(false);
+    }
+
+    let current_node_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
+        rusqlite::params![repo_id],
+        |row| row.get(0),
+    )?;
+    if cached_node_count != current_node_count {
+        return Ok(false);
+    }
+
+    let cached_degree_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM graph_node_degrees WHERE repo_id = ?1",
+        rusqlite::params![repo_id],
+        |row| row.get(0),
+    )?;
+    Ok(cached_degree_count == current_node_count)
+}
+
+pub fn ensure_graph_degrees(conn: &Connection, repo_id: &str) -> Result<bool> {
+    if graph_degrees_are_fresh(conn, repo_id)? {
+        return Ok(false);
+    }
+    refresh_graph_degrees(conn, repo_id)?;
+    Ok(true)
+}
+
+pub fn refresh_graph_degrees(conn: &Connection, repo_id: &str) -> Result<()> {
+    conn.execute_batch("SAVEPOINT graph_degree_refresh")?;
+    let result = (|| -> Result<()> {
+        conn.execute(
+            "DELETE FROM graph_node_degrees WHERE repo_id = ?1",
+            rusqlite::params![repo_id],
+        )?;
+        conn.execute(
+            "INSERT INTO graph_node_degrees (repo_id, node_id, degree)
+                 WITH valid_edges AS (
+                     SELECT e.source_id, e.target_id, src.repo_id AS source_repo, tgt.repo_id AS target_repo
+                     FROM edges e
+                     JOIN nodes src ON src.id = e.source_id
+                     JOIN nodes tgt ON tgt.id = e.target_id
+                     WHERE src.repo_id = ?1 OR tgt.repo_id = ?1
+             ),
+             degree_counts AS (
+                SELECT id, COUNT(*) AS degree
+                FROM (
+                          SELECT source_id AS id FROM valid_edges WHERE source_repo = ?1
+                    UNION ALL
+                          SELECT target_id AS id FROM valid_edges WHERE target_repo = ?1
+                )
+                GROUP BY id
+             )
+             SELECT n.repo_id, n.id, COALESCE(dc.degree, 0)
+             FROM nodes n
+             LEFT JOIN degree_counts dc ON dc.id = n.id
+             WHERE n.repo_id = ?1",
+            rusqlite::params![repo_id],
+        )?;
+        let node_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
+            rusqlite::params![repo_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO graph_degree_cache_meta (repo_id, node_count, dirty, refreshed_at)
+             VALUES (?1, ?2, 0, CAST(strftime('%s', 'now') AS INTEGER))
+             ON CONFLICT(repo_id) DO UPDATE SET
+                node_count = excluded.node_count,
+                dirty = 0,
+                refreshed_at = excluded.refreshed_at",
+            rusqlite::params![repo_id, node_count],
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE graph_degree_refresh")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn
+                .execute_batch("ROLLBACK TO graph_degree_refresh; RELEASE graph_degree_refresh");
+            Err(e)
+        }
+    }
 }
 
 /// Runs a WAL checkpoint (truncating the WAL file) and an incremental
@@ -653,9 +797,17 @@ mod tests {
         save_observation(&conn, "repo_a", "helper", "src/shared.rs", "repo a memory").unwrap();
         save_observation(&conn, "repo_b", "helper", "src/shared.rs", "repo b memory").unwrap();
 
-        let repo_a_ctx = get_session_context(&conn, Some("repo_a"), Some("helper"), Some("src/shared.rs")).unwrap();
-        assert!(repo_a_ctx.contains("repo a memory"), "repo_a memory missing: {repo_a_ctx}");
-        assert!(!repo_a_ctx.contains("repo b memory"), "repo_b memory leaked: {repo_a_ctx}");
+        let repo_a_ctx =
+            get_session_context(&conn, Some("repo_a"), Some("helper"), Some("src/shared.rs"))
+                .unwrap();
+        assert!(
+            repo_a_ctx.contains("repo a memory"),
+            "repo_a memory missing: {repo_a_ctx}"
+        );
+        assert!(
+            !repo_a_ctx.contains("repo b memory"),
+            "repo_b memory leaked: {repo_a_ctx}"
+        );
     }
 
     #[test]
@@ -693,7 +845,8 @@ mod tests {
         conn.execute(
             "INSERT INTO repositories (id, root_path) VALUES ('r', '/tmp/r')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO files (repo_id, file_path, mtime_secs, content_hash) VALUES ('r', 'a.rb', 1, 'abc')",
             [],
@@ -703,7 +856,10 @@ mod tests {
             "INSERT INTO files (repo_id, file_path, mtime_secs, content_hash) VALUES ('r', 'a.rb', 2, 'xyz')",
             [],
         );
-        assert!(result.is_err(), "duplicate (repo_id, file_path) should violate PK");
+        assert!(
+            result.is_err(),
+            "duplicate (repo_id, file_path) should violate PK"
+        );
     }
 
     #[test]
@@ -711,12 +867,7 @@ mod tests {
         let conn = init_db(":memory:").unwrap();
         conn.execute(
             "INSERT INTO repositories (id, root_path) VALUES (?1, ?2), (?3, ?4)",
-            rusqlite::params![
-                "frontend",
-                "/tmp/frontend",
-                "backend",
-                "/tmp/backend"
-            ],
+            rusqlite::params!["frontend", "/tmp/frontend", "backend", "/tmp/backend"],
         )
         .unwrap();
         conn.execute(
@@ -818,5 +969,92 @@ mod tests {
     fn connected_database_path_reports_memory_for_in_memory_db() {
         let conn = init_db(":memory:").unwrap();
         assert_eq!(connected_database_path(&conn).unwrap(), ":memory:");
+    }
+
+    #[test]
+    fn refresh_graph_degrees_rebuilds_rank_data_and_ignores_invalid_edges() {
+        let conn = init_db(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES ('repo', '/tmp/repo'), ('other', '/tmp/other')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+             VALUES
+                ('repo:n1', 'repo', 'src/a.rs', 'rs', 'a', 'function', 'fn a() {}'),
+                ('repo:n2', 'repo', 'src/b.rs', 'rs', 'b', 'function', 'fn b() {}'),
+                ('repo:n3', 'repo', 'src/c.rs', 'rs', 'c', 'function', 'fn c() {}'),
+                ('other:n1', 'other', 'src/a.rs', 'rs', 'a', 'function', 'fn a() {}')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relationship_type)
+             VALUES
+                ('repo:n1', 'repo:n2', 'CALLS'),
+                ('repo:n1', 'repo:n3', 'CALLS'),
+                ('repo:n1', 'missing:n4', 'CALLS'),
+                ('repo:n1', 'other:n1', 'IMPORTS')",
+            [],
+        )
+        .unwrap();
+
+        mark_graph_degrees_dirty(&conn, "repo").unwrap();
+        assert!(!graph_degrees_are_fresh(&conn, "repo").unwrap());
+        refresh_graph_degrees(&conn, "repo").unwrap();
+        assert!(graph_degrees_are_fresh(&conn, "repo").unwrap());
+
+        let ranked: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT node_id, degree
+                 FROM graph_node_degrees
+                 WHERE repo_id = 'repo'
+                 ORDER BY degree DESC, node_id ASC",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            ranked,
+            vec![
+                ("repo:n1".to_string(), 3),
+                ("repo:n2".to_string(), 1),
+                ("repo:n3".to_string(), 1),
+            ]
+        );
+
+        refresh_graph_degrees(&conn, "other").unwrap();
+        let other_degree: i64 = conn
+            .query_row(
+                "SELECT degree FROM graph_node_degrees WHERE repo_id = 'other' AND node_id = 'other:n1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            other_degree, 1,
+            "cross-repo IMPORTS must count for the target repo"
+        );
+
+        conn.execute(
+            "DELETE FROM edges WHERE source_id = 'repo:n1' AND target_id = 'repo:n3'",
+            [],
+        )
+        .unwrap();
+        mark_graph_degrees_dirty(&conn, "repo").unwrap();
+        refresh_graph_degrees(&conn, "repo").unwrap();
+
+        let degree: i64 = conn
+            .query_row(
+                "SELECT degree FROM graph_node_degrees WHERE repo_id = 'repo' AND node_id = 'repo:n1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(degree, 2, "degree cache must refresh after edge mutation");
     }
 }
