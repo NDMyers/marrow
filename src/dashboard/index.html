@@ -9,19 +9,19 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg:          #0a0d0a;
-      --surface:     #0e120e;
-      --border:      #1c2e1c;
-      --border-hi:   #2a4a2a;
-      --green:       #00e676;
-      --green-glow:  #00e67640;
-      --cyan:        #00e5ff;
-      --cyan-glow:   #00e5ff40;
-      --amber:       #ffb300;
-      --indigo:      #7c83fd;
-      --dim:         #5a745a;
-      --text:        #c8d8c8;
-      --font:        'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Courier New', monospace;
+      --bg:          #2c3438;
+      --surface:     #f7f0e7;
+      --border:      #6a7678;
+      --border-hi:   #a2acab;
+      --green:       #329f7d;
+      --green-glow:  rgba(50, 159, 125, 0.22);
+      --cyan:        #7468bf;
+      --cyan-glow:   rgba(116, 104, 191, 0.22);
+      --amber:       #bf7d2d;
+      --indigo:      #7468bf;
+      --dim:         #69787a;
+      --text:        #1d2326;
+      --font:        "Avenir Next", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
     }
 
     html, body {
@@ -34,7 +34,7 @@
       line-height: 1.5;
     }
 
-    /* Scanline overlay */
+    /* Specimen field overlay */
     body::after {
       content: '';
       position: fixed;
@@ -45,8 +45,8 @@
         to bottom,
         transparent,
         transparent 2px,
-        rgba(0, 0, 0, 0.06) 2px,
-        rgba(0, 0, 0, 0.06) 4px
+        rgba(104, 114, 115, 0.06) 2px,
+        rgba(104, 114, 115, 0.06) 4px
       );
     }
 
@@ -80,13 +80,13 @@
       font-weight: 700;
       color: var(--green);
       text-shadow: 0 0 8px var(--green-glow);
-      letter-spacing: 0.08em;
+      letter-spacing: 0;
     }
 
     #tagline {
       color: var(--dim);
       font-size: 11px;
-      letter-spacing: 0.04em;
+      letter-spacing: 0;
     }
 
     #status-area {
@@ -101,7 +101,7 @@
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: #ffb300;
+      background: var(--specimen-amber);
       flex-shrink: 0;
     }
 
@@ -112,8 +112,8 @@
     }
 
     #status-dot.error {
-      background: #f44336;
-      box-shadow: 0 0 6px #f4433640;
+      background: var(--specimen-danger);
+      box-shadow: 0 0 0 4px rgba(173, 85, 75, 0.12);
     }
 
     @keyframes pulse-dot {
@@ -138,7 +138,7 @@
       color: var(--dim);
       font-family: var(--font);
       font-size: 11px;
-      letter-spacing: 0.1em;
+      letter-spacing: 0;
       text-transform: uppercase;
       padding: 8px 16px 6px;
       cursor: pointer;
@@ -194,7 +194,7 @@
 
     .card-label {
       font-size: 10px;
-      letter-spacing: 0.12em;
+      letter-spacing: 0;
       text-transform: uppercase;
       color: var(--dim);
       margin-bottom: 4px;
@@ -215,7 +215,7 @@
 
     .card-value.amber {
       color: var(--amber);
-      text-shadow: 0 0 8px #ffb30040;
+      text-shadow: none;
     }
 
     .card-sub {
@@ -247,13 +247,13 @@
       position: sticky;
       top: 0;
       z-index: 10;
-      background: #0c100c;
+      background: var(--specimen-surface-subtle);
     }
 
     th {
       padding: 8px 14px;
       font-size: 10px;
-      letter-spacing: 0.12em;
+      letter-spacing: 0;
       text-transform: uppercase;
       color: var(--dim);
       text-align: left;
@@ -267,7 +267,7 @@
 
     td {
       padding: 7px 14px;
-      border-bottom: 1px solid #111a11;
+      border-bottom: 1px solid rgba(213, 202, 185, 0.72);
       vertical-align: middle;
     }
 
@@ -281,7 +281,7 @@
       from {
         opacity: 0;
         transform: translateY(-10px);
-        background: #00e67612;
+        background: rgba(47, 155, 120, 0.12);
       }
       to {
         opacity: 1;
@@ -294,7 +294,7 @@
     .badge {
       display: inline-block;
       font-size: 9px;
-      letter-spacing: 0.1em;
+      letter-spacing: 0;
       text-transform: uppercase;
       padding: 1px 6px;
       border-radius: 3px;
@@ -304,33 +304,33 @@
     }
 
     .badge-capsule {
-      background: #00391a;
+      background: var(--specimen-mint-soft);
       color: var(--green);
-      border: 1px solid #00532a;
+      border: 1px solid rgba(47, 155, 120, 0.34);
     }
 
     .badge-index {
-      background: #003040;
+      background: var(--specimen-violet-soft);
       color: var(--cyan);
-      border: 1px solid #005060;
+      border: 1px solid rgba(112, 99, 189, 0.34);
     }
 
     .badge-impact {
-      background: #3a2600;
+      background: var(--specimen-amber-soft);
       color: var(--amber);
-      border: 1px solid #5a3a00;
+      border: 1px solid rgba(181, 116, 25, 0.34);
     }
 
     .badge-server {
-      background: #1a1a40;
+      background: var(--specimen-steel-soft);
       color: var(--indigo);
-      border: 1px solid #2a2a6a;
+      border: 1px solid rgba(104, 114, 115, 0.32);
     }
 
     .badge-skeleton {
-      background: #1a0a40;
-      color: #b39ddb;
-      border: 1px solid #4a2a8a;
+      background: var(--specimen-violet-soft);
+      color: var(--specimen-violet);
+      border: 1px solid rgba(112, 99, 189, 0.34);
     }
 
     /* ── Tool label cell ────────────────────────────────────────────────────── */
@@ -379,7 +379,7 @@
     .pct-bar-track {
       width: 72px;
       height: 7px;
-      background: #1a2a1a;
+      background: var(--specimen-steel-soft);
       border-radius: 3px;
       overflow: hidden;
       display: inline-block;
@@ -465,8 +465,8 @@
       flex-shrink: 0;
       text-align: center;
       font-size: 10px;
-      color: #3a5a3a;
-      letter-spacing: 0.04em;
+      color: var(--specimen-muted);
+      letter-spacing: 0;
       border-top: 1px solid var(--border);
       padding: 8px 0;
       background: var(--bg);
@@ -475,11 +475,11 @@
     /* ── View Delta button ──────────────────────────────────────────────────── */
     .view-delta-btn {
       background: none;
-      border: 1px solid #1c3a1c;
+      border: 1px solid var(--specimen-border-strong);
       color: var(--dim);
       font-family: var(--font);
       font-size: 9px;
-      letter-spacing: 0.1em;
+      letter-spacing: 0;
       text-transform: uppercase;
       padding: 1px 5px;
       border-radius: 3px;
@@ -499,7 +499,7 @@
       display: none;
       position: fixed;
       inset: 0;
-      background: rgba(0, 0, 0, 0.75);
+      background: rgba(40, 38, 34, 0.45);
       z-index: 1000;
       align-items: center;
       justify-content: center;
@@ -518,12 +518,12 @@
       display: flex;
       flex-direction: column;
       overflow: hidden;
-      box-shadow: 0 0 40px rgba(0, 230, 118, 0.08);
+      box-shadow: 0 24px 70px rgba(55, 46, 35, 0.22);
     }
 
     #compare-header {
       flex-shrink: 0;
-      background: #0c100c;
+      background: var(--specimen-surface-subtle);
       border-bottom: 1px solid var(--border);
       padding: 10px 16px;
       display: flex;
@@ -534,7 +534,7 @@
 
     #compare-title {
       font-size: 11px;
-      letter-spacing: 0.12em;
+      letter-spacing: 0;
       text-transform: uppercase;
       color: var(--green);
       text-shadow: 0 0 8px var(--green-glow);
@@ -549,18 +549,18 @@
       padding: 2px 8px;
       border-radius: 3px;
       cursor: pointer;
-      letter-spacing: 0.08em;
+      letter-spacing: 0;
     }
     #compare-close:hover { color: var(--text); border-color: var(--border-hi); }
 
     #compare-banner {
       flex-shrink: 0;
-      background: #00391a;
-      border-bottom: 1px solid #00532a;
+      background: var(--specimen-mint-soft);
+      border-bottom: 1px solid rgba(47, 155, 120, 0.28);
       padding: 6px 16px;
       font-size: 11px;
       color: var(--green);
-      letter-spacing: 0.06em;
+      letter-spacing: 0;
       text-align: center;
       min-height: 30px;
     }
@@ -583,11 +583,11 @@
 
     .compare-pane-header {
       flex-shrink: 0;
-      background: #0c100c;
+      background: var(--specimen-surface-subtle);
       border-bottom: 1px solid var(--border);
       padding: 6px 14px;
       font-size: 10px;
-      letter-spacing: 0.12em;
+      letter-spacing: 0;
       text-transform: uppercase;
       display: flex;
       align-items: center;
@@ -620,7 +620,7 @@
     #compare-loading {
       color: var(--dim);
       font-size: 11px;
-      letter-spacing: 0.08em;
+      letter-spacing: 0;
       padding: 20px 16px;
       text-align: center;
     }
@@ -640,7 +640,7 @@
 
     .tree-label {
       font-size: 10px;
-      letter-spacing: 0.12em;
+      letter-spacing: 0;
       text-transform: uppercase;
       color: var(--dim);
       flex-shrink: 0;
@@ -664,7 +664,7 @@
       flex: 1;
       font-size: 10px;
       color: var(--dim);
-      letter-spacing: 0.04em;
+      letter-spacing: 0;
     }
 
     #tree-reset-btn {
@@ -673,7 +673,7 @@
       color: var(--dim);
       font-family: var(--font);
       font-size: 9px;
-      letter-spacing: 0.1em;
+      letter-spacing: 0;
       text-transform: uppercase;
       padding: 3px 8px;
       border-radius: 3px;
@@ -739,7 +739,7 @@
       white-space: nowrap;
       overflow: hidden;
     }
-    .dir-item:hover { background: #0e180e; }
+    .dir-item:hover { background: rgba(190, 95, 123, 0.1); }
     .dir-item.dir-active { color: var(--green); }
     .dir-item.dir-dir { color: var(--dim); }
     .dir-item-indent { flex-shrink: 0; display: inline-block; }
@@ -760,7 +760,7 @@
       gap: 4px;
       font-size: 9px;
       color: var(--dim);
-      letter-spacing: 0.06em;
+      letter-spacing: 0;
       text-transform: uppercase;
     }
     .legend-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
@@ -797,10 +797,10 @@
       pointer-events: none;
       z-index: 100;
       max-width: 300px;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+      box-shadow: 0 14px 36px rgba(55, 46, 35, 0.2);
     }
     .tt-sym  { color: var(--green); font-weight: 700; display: block; margin-bottom: 3px; }
-    .tt-type { color: var(--dim); font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em; display: block; margin-bottom: 2px; }
+    .tt-type { color: var(--dim); font-size: 9px; text-transform: uppercase; letter-spacing: 0; display: block; margin-bottom: 2px; }
     .tt-file { color: var(--dim); font-size: 10px; display: block; word-break: break-all; }
     .tt-deg  { color: var(--amber); font-size: 9px; display: block; margin-top: 3px; }
 
@@ -817,16 +817,16 @@
     }
     #tree-empty-title {
       font-size: 10px;
-      letter-spacing: 0.1em;
+      letter-spacing: 0;
       text-transform: uppercase;
       color: var(--dim);
       margin-bottom: 8px;
     }
-    #tree-empty-sub { color: #3a5a3a; font-size: 12px; }
+    #tree-empty-sub { color: var(--specimen-muted); font-size: 12px; }
     #tree-loading {
       color: var(--dim);
       font-size: 11px;
-      letter-spacing: 0.08em;
+      letter-spacing: 0;
       flex-direction: column;
       gap: 10px;
       text-align: center;
@@ -846,7 +846,7 @@
     #tree-loading-track {
       width: min(320px, 70vw);
       height: 3px;
-      background: #142214;
+      background: var(--specimen-steel-soft);
       border: 1px solid var(--border);
       border-radius: 3px;
       overflow: hidden;
@@ -864,12 +864,12 @@
       position: absolute;
       top: 8px;
       right: 8px;
-      background: #3a2600;
-      border: 1px solid #5a3a00;
+      background: var(--specimen-amber-soft);
+      border: 1px solid rgba(181, 116, 25, 0.35);
       border-radius: 3px;
       padding: 4px 10px;
       font-size: 9px;
-      letter-spacing: 0.08em;
+      letter-spacing: 0;
       color: var(--amber);
       pointer-events: none;
       display: none;
@@ -879,11 +879,658 @@
       flex-shrink: 0;
       text-align: center;
       font-size: 10px;
-      color: #3a5a3a;
-      letter-spacing: 0.04em;
+      color: var(--specimen-muted);
+      letter-spacing: 0;
       border-top: 1px solid var(--border);
       padding: 8px 0;
       background: var(--bg);
+    }
+
+    /* Sectioned Specimen / Context Capsule presentation system */
+    :root {
+      --specimen-bg: #2c3438;
+      --specimen-field: #384246;
+      --specimen-surface: #f7f0e7;
+      --specimen-surface-raised: #fffaf4;
+      --specimen-surface-subtle: #e4ebe9;
+      --specimen-graph: #20272b;
+      --specimen-ink: #1d2326;
+      --specimen-ink-soft: #343d40;
+      --specimen-muted: #657274;
+      --specimen-faint: #8c9998;
+      --specimen-border: #c5cfcc;
+      --specimen-border-strong: #6a7678;
+      --specimen-graphite: #242b2f;
+      --specimen-graphite-2: #30393e;
+      --specimen-steel: #69787a;
+      --specimen-steel-soft: #d9e3e0;
+      --specimen-tissue: #c16a86;
+      --specimen-tissue-ink: #8d3e5b;
+      --specimen-tissue-soft: #f2d7df;
+      --specimen-amber: #bf7d2d;
+      --specimen-amber-soft: #efd39d;
+      --specimen-mint: #329f7d;
+      --specimen-mint-soft: #d2ece3;
+      --specimen-violet: #7468bf;
+      --specimen-violet-soft: #e1dcf3;
+      --specimen-danger: #ad554b;
+      --specimen-danger-soft: #f1d5d1;
+      --specimen-shadow: 0 18px 42px rgba(18, 25, 27, 0.24);
+      --specimen-shadow-tight: 0 8px 22px rgba(18, 25, 27, 0.18);
+      --specimen-radius: 7px;
+      --specimen-radius-sm: 5px;
+      --font-ui: "Avenir Next", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-data: "SFMono-Regular", "Cascadia Mono", "Liberation Mono", Menlo, Consolas, monospace;
+      --focus-ring: 0 0 0 3px rgba(193, 106, 134, 0.24), 0 0 0 1px var(--specimen-tissue);
+      --graph-function: var(--specimen-mint);
+      --graph-method: var(--specimen-amber);
+      --graph-class: var(--specimen-tissue);
+      --graph-module: var(--specimen-violet);
+      --graph-default: var(--specimen-steel);
+      --graph-edge-base: #9aacaa;
+      --graph-node-fill: #f7f0e7;
+      --graph-label-font: 600 10px "SFMono-Regular", "Cascadia Mono", Menlo, monospace;
+      --graph-cluster-font: 700 10px "Avenir Next", "Segoe UI", system-ui, sans-serif;
+      --graph-hull-steel: #69787a;
+      --graph-hull-tissue-deep: #8d3e5b;
+      --graph-hull-blue-steel: #3b8299;
+      --graph-hull-bronze: #806236;
+      --graph-hull-sage: #58786a;
+      --graph-hull-danger: #ad554b;
+      --graph-hull-slate: #566b72;
+
+      --bg: var(--specimen-bg);
+      --surface: var(--specimen-surface);
+      --border: var(--specimen-border);
+      --border-hi: var(--specimen-border-strong);
+      --green: var(--specimen-mint);
+      --green-glow: rgba(50, 159, 125, 0.22);
+      --cyan: var(--specimen-violet);
+      --cyan-glow: rgba(116, 104, 191, 0.22);
+      --amber: var(--specimen-amber);
+      --indigo: var(--specimen-violet);
+      --dim: var(--specimen-muted);
+      --text: var(--specimen-ink);
+      --font: var(--font-ui);
+    }
+
+    html, body {
+      background: var(--specimen-bg);
+      color: var(--specimen-ink);
+      font-family: var(--font-ui);
+      font-size: 14px;
+    }
+
+    body::after { display: none; }
+
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(90deg, rgba(228, 235, 233, 0.05) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(228, 235, 233, 0.04) 1px, transparent 1px),
+        linear-gradient(135deg, #22292d 0%, var(--specimen-bg) 48%, #3b464a 100%);
+      background-size: 42px 42px, 42px 42px, auto;
+      z-index: 0;
+    }
+
+    #app {
+      position: relative;
+      z-index: 1;
+      background: rgba(44, 52, 56, 0.9);
+    }
+
+    #header {
+      background: linear-gradient(135deg, var(--specimen-graphite), var(--specimen-graphite-2));
+      border-bottom: 1px solid rgba(197, 207, 204, 0.22);
+      padding: 14px 24px;
+      gap: 16px;
+      box-shadow: var(--specimen-shadow-tight);
+    }
+
+    #header-left {
+      gap: 14px;
+      min-width: 0;
+    }
+
+    #logo {
+      color: var(--specimen-surface-raised);
+      font-family: var(--font-ui);
+      font-size: 20px;
+      font-weight: 800;
+      letter-spacing: 0;
+      text-shadow: none;
+      white-space: nowrap;
+    }
+
+    #tagline {
+      color: #c5cfcc;
+      font-size: 12px;
+      letter-spacing: 0;
+      overflow-wrap: anywhere;
+    }
+
+    #status-area {
+      background: rgba(228, 235, 233, 0.08);
+      border: 1px solid rgba(197, 207, 204, 0.24);
+      border-radius: 999px;
+      color: #d9e3e0;
+      font-size: 12px;
+      min-height: 32px;
+      padding: 4px 11px;
+    }
+
+    #status-dot {
+      background: var(--specimen-amber);
+      border: 1px solid rgba(255, 255, 255, 0.75);
+      box-shadow: none;
+    }
+
+    #status-dot.live {
+      background: var(--specimen-mint);
+      box-shadow: 0 0 0 4px rgba(47, 155, 120, 0.12);
+      animation: pulse-dot 2.2s ease-in-out infinite;
+    }
+
+    #status-dot.error {
+      background: var(--specimen-danger);
+      box-shadow: 0 0 0 4px rgba(173, 85, 75, 0.12);
+    }
+
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.64; transform: scale(0.86); }
+    }
+
+    #tabs {
+      background: rgba(48, 57, 62, 0.98);
+      border-bottom: 1px solid rgba(197, 207, 204, 0.18);
+      padding: 0 24px;
+      gap: 4px;
+    }
+
+    .tab-btn {
+      color: #b6c2c0;
+      font-family: var(--font-ui);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0;
+      min-height: 44px;
+      padding: 12px 18px 10px;
+      transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+    }
+
+    .tab-btn:hover {
+      background: rgba(228, 235, 233, 0.08);
+      color: var(--specimen-surface-raised);
+    }
+
+    .tab-btn.active {
+      color: #f2d7df;
+      text-shadow: none;
+      border-bottom-color: var(--specimen-tissue);
+      background: rgba(193, 106, 134, 0.16);
+    }
+
+    button:focus-visible,
+    select:focus-visible,
+    input:focus-visible,
+    .tab-btn:focus-visible {
+      outline: none;
+      box-shadow: var(--focus-ring);
+    }
+
+    .panel {
+      padding: 18px 24px 0;
+      overflow: auto;
+      gap: 14px;
+      background: transparent;
+    }
+
+    #panel-tree {
+      background: rgba(36, 43, 47, 0.92);
+      overflow: hidden;
+    }
+
+    .cards-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 12px;
+      margin-bottom: 0;
+    }
+
+    .card {
+      background: linear-gradient(180deg, var(--specimen-surface-raised), var(--specimen-surface));
+      border: 1px solid var(--specimen-border);
+      border-top: 3px solid var(--specimen-steel);
+      border-radius: var(--specimen-radius);
+      box-shadow: var(--specimen-shadow-tight);
+      min-height: 86px;
+      padding: 13px 15px;
+    }
+
+    .card-label,
+    th,
+    .tree-label,
+    .compare-pane-header,
+    #compare-title,
+    #tree-empty-title,
+    #tree-loading-phase,
+    .legend-item,
+    .badge {
+      font-family: var(--font-ui);
+      letter-spacing: 0;
+    }
+
+    .card-label {
+      color: var(--specimen-muted);
+      font-size: 10px;
+      font-weight: 800;
+    }
+
+    .card-value {
+      color: var(--specimen-tissue-ink);
+      font-family: var(--font-data);
+      font-size: clamp(20px, 2vw, 26px);
+      font-weight: 800;
+      letter-spacing: 0;
+      text-shadow: none;
+    }
+
+    .card-value.cyan {
+      color: var(--specimen-violet);
+      text-shadow: none;
+    }
+
+    .card-value.amber {
+      color: var(--specimen-amber);
+      text-shadow: none;
+    }
+
+    .card-sub,
+    #lifetime-sub,
+    #scope-path,
+    .origin-cell,
+    .ts-cell,
+    .repo-path-cell,
+    .pct-dash {
+      color: var(--specimen-muted);
+    }
+
+    .table-wrap {
+      background: var(--specimen-graphite);
+      border: 1px solid rgba(197, 207, 204, 0.24);
+      border-radius: var(--specimen-radius);
+      box-shadow: var(--specimen-shadow-tight);
+      overflow: auto;
+    }
+
+    .table-wrap::-webkit-scrollbar,
+    .compare-pane-body::-webkit-scrollbar,
+    #tree-dir-tree::-webkit-scrollbar { width: 8px; height: 8px; }
+    .table-wrap::-webkit-scrollbar-track,
+    .compare-pane-body::-webkit-scrollbar-track,
+    #tree-dir-tree::-webkit-scrollbar-track { background: var(--specimen-surface-subtle); }
+    .table-wrap::-webkit-scrollbar-thumb,
+    .compare-pane-body::-webkit-scrollbar-thumb,
+    #tree-dir-tree::-webkit-scrollbar-thumb { background: var(--specimen-border-strong); border-radius: 999px; }
+
+    table {
+      min-width: 720px;
+    }
+
+    thead,
+    #compare-header,
+    .compare-pane-header {
+      background: var(--specimen-graphite-2);
+    }
+
+    th {
+      color: #d9e3e0;
+      font-size: 10px;
+      font-weight: 800;
+      border-bottom: 1px solid rgba(197, 207, 204, 0.22);
+    }
+
+    td {
+      border-bottom: 1px solid rgba(106, 118, 120, 0.22);
+      color: var(--specimen-ink-soft);
+    }
+
+    tbody tr { background: var(--specimen-surface-raised); }
+
+    tr.row-new { animation: slide-in 0.3s ease-out forwards; }
+
+    @keyframes slide-in {
+      from { opacity: 0; transform: translateY(-8px); background: var(--specimen-mint-soft); }
+      to { opacity: 1; transform: translateY(0); background: transparent; }
+    }
+
+    .badge {
+      border-radius: 999px;
+      font-size: 9px;
+      font-weight: 800;
+      padding: 2px 7px;
+    }
+
+    .badge-capsule { background: var(--specimen-tissue-soft); color: var(--specimen-tissue-ink); border: 1px solid rgba(190, 95, 123, 0.34); }
+    .badge-index { background: var(--specimen-mint-soft); color: #1d6f56; border: 1px solid rgba(47, 155, 120, 0.34); }
+    .badge-impact { background: var(--specimen-amber-soft); color: #7a4b0d; border: 1px solid rgba(181, 116, 25, 0.34); }
+    .badge-server { background: var(--specimen-steel-soft); color: var(--specimen-steel); border: 1px solid rgba(104, 114, 115, 0.32); }
+    .badge-skeleton { background: var(--specimen-violet-soft); color: #51449c; border: 1px solid rgba(112, 99, 189, 0.34); }
+
+    .tool-label {
+      color: var(--specimen-ink-soft);
+      font-size: 12px;
+    }
+
+    .tool-label .sym,
+    .tt-sym {
+      color: var(--specimen-tissue-ink);
+      text-shadow: none;
+    }
+
+    .tool-label .repo,
+    .tool-label .sep,
+    .tt-file,
+    .tt-type { color: var(--specimen-muted); }
+
+    .pct-bar-track {
+      background: var(--specimen-steel-soft);
+      border: 1px solid rgba(104, 114, 115, 0.18);
+    }
+
+    .pct-bar-fill.high { background: var(--specimen-mint); box-shadow: none; }
+    .pct-bar-fill.medium { background: var(--specimen-amber); }
+    .pct-bar-fill.low { background: var(--specimen-border-strong); }
+    .pct-text.high { color: var(--specimen-mint); text-shadow: none; }
+    .pct-text.medium { color: var(--specimen-amber); }
+    .pct-text.low { color: var(--specimen-muted); }
+
+    #empty-row td,
+    #repo-empty-row td {
+      background: var(--specimen-graphite);
+      color: #c5cfcc;
+      font-size: 12px;
+      padding: 28px;
+    }
+
+    #privacy,
+    #privacy-lt,
+    #tree-footer {
+      background: rgba(36, 43, 47, 0.95);
+      border-top: 1px solid rgba(197, 207, 204, 0.18);
+      color: #b6c2c0;
+      font-size: 11px;
+      letter-spacing: 0;
+      padding: 10px 14px;
+    }
+
+    .view-delta-btn,
+    #tree-reset-btn,
+    #compare-close {
+      background: var(--specimen-surface-raised);
+      border: 1px solid var(--specimen-border-strong);
+      border-radius: var(--specimen-radius-sm);
+      color: var(--specimen-ink-soft);
+      font-family: var(--font-ui);
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0;
+      min-height: 28px;
+      text-shadow: none;
+      transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+    }
+
+    .view-delta-btn:hover,
+    #tree-reset-btn:hover,
+    #compare-close:hover {
+      background: var(--specimen-tissue-soft);
+      border-color: var(--specimen-tissue);
+      color: var(--specimen-tissue-ink);
+      text-shadow: none;
+    }
+
+    #compare-overlay {
+      background: rgba(18, 25, 27, 0.58);
+      backdrop-filter: blur(6px);
+    }
+
+    #compare-modal {
+      background: var(--specimen-graphite);
+      border: 1px solid rgba(197, 207, 204, 0.28);
+      border-radius: var(--specimen-radius);
+      box-shadow: 0 24px 70px rgba(18, 25, 27, 0.42);
+    }
+
+    #compare-header {
+      border-bottom: 1px solid rgba(197, 207, 204, 0.2);
+      padding: 12px 16px;
+    }
+
+    #compare-title {
+      color: #f2d7df;
+      font-weight: 800;
+      text-shadow: none;
+    }
+
+    #compare-banner {
+      background: var(--specimen-mint-soft);
+      border-bottom: 1px solid rgba(47, 155, 120, 0.28);
+      color: #1d6f56;
+      font-weight: 700;
+    }
+
+    .compare-pane { border-right: 1px solid rgba(197, 207, 204, 0.2); }
+    .compare-pane-header { border-bottom: 1px solid rgba(197, 207, 204, 0.2); }
+    .compare-pane-header .pane-label { color: #d9e3e0; font-weight: 800; }
+    .compare-pane-header .pane-chars { color: var(--specimen-amber); }
+    .compare-pane-body { background: var(--specimen-surface-raised); }
+    .compare-pane-body pre {
+      color: var(--specimen-ink-soft);
+      font-family: var(--font-data);
+      font-size: 12px;
+    }
+    #compare-loading,
+    #compare-loading-2 { color: var(--specimen-muted); }
+
+    #tree-toolbar {
+      background: var(--specimen-graphite-2);
+      border-bottom: 1px solid rgba(197, 207, 204, 0.2);
+      gap: 12px;
+      padding: 10px 16px;
+    }
+
+    .tree-label,
+    #tree-info {
+      color: #c5cfcc;
+      font-weight: 800;
+    }
+
+    #tree-repo-select,
+    #tree-search {
+      background: var(--specimen-surface-raised);
+      border: 1px solid var(--specimen-border-strong);
+      border-radius: var(--specimen-radius-sm);
+      color: var(--specimen-ink-soft);
+      font-family: var(--font-ui);
+      font-size: 12px;
+      min-height: 36px;
+    }
+
+    #tree-repo-select:focus,
+    #tree-search:focus { border-color: var(--specimen-tissue); }
+    #tree-search::placeholder { color: var(--specimen-faint); }
+
+    #tree-body { background: var(--specimen-graphite); }
+    #tree-sidebar {
+      background: var(--specimen-graphite);
+      border-right: 1px solid rgba(197, 207, 204, 0.18);
+    }
+    #tree-search-wrap { border-bottom: 1px solid rgba(197, 207, 204, 0.18); }
+
+    .dir-item {
+      color: #e4ebe9;
+      font-size: 12px;
+      min-height: 25px;
+    }
+    .dir-item:hover { background: rgba(190, 95, 123, 0.1); }
+    .dir-item.dir-active {
+      background: var(--specimen-tissue-soft);
+      color: var(--specimen-tissue-ink);
+    }
+    .dir-item.dir-dir,
+    .dir-item-icon { color: #aebbb8; }
+
+    #tree-legend {
+      border-top: 1px solid rgba(197, 207, 204, 0.18);
+      background: rgba(48, 57, 62, 0.9);
+    }
+    .legend-item { color: #c5cfcc; font-weight: 800; }
+    .legend-dot.legend-function { background: var(--graph-function); }
+    .legend-dot.legend-method { background: var(--graph-method); }
+    .legend-dot.legend-class { background: var(--graph-class); }
+    .legend-dot.legend-module { background: var(--graph-module); }
+
+    #tree-canvas-wrap {
+      background:
+        linear-gradient(90deg, rgba(154, 172, 170, 0.12) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(154, 172, 170, 0.09) 1px, transparent 1px),
+        var(--specimen-graph);
+      background-size: 36px 36px;
+    }
+
+    #tree-tooltip {
+      background: var(--specimen-surface-raised);
+      border: 1px solid var(--specimen-border-strong);
+      border-radius: var(--specimen-radius-sm);
+      box-shadow: 0 14px 36px rgba(55, 46, 35, 0.2);
+      color: var(--specimen-ink-soft);
+      font-family: var(--font-ui);
+    }
+    .tt-deg { color: var(--specimen-amber); }
+
+    #tree-empty,
+    #tree-loading {
+      color: var(--specimen-muted);
+      padding: 18px;
+    }
+    #tree-empty-inner,
+    #tree-loading {
+      background: rgba(247, 240, 231, 0.92);
+      border: 1px solid rgba(197, 207, 204, 0.72);
+      border-radius: var(--specimen-radius);
+      box-shadow: var(--specimen-shadow-tight);
+      max-width: min(480px, 86vw);
+      padding: 18px 20px;
+    }
+    #tree-empty-title { color: var(--specimen-ink-soft); font-weight: 800; }
+    #tree-empty-sub { color: var(--specimen-muted); }
+    #tree-loading-phase {
+      color: var(--specimen-tissue-ink);
+      font-weight: 800;
+      text-shadow: none;
+    }
+    #tree-loading-detail { color: var(--specimen-muted); }
+    #tree-loading-track {
+      background: var(--specimen-steel-soft);
+      border: 1px solid var(--specimen-border);
+      height: 5px;
+    }
+    #tree-loading-bar {
+      background: var(--specimen-tissue);
+      box-shadow: none;
+    }
+    #tree-loading[data-phase="error"] #tree-loading-bar { background: var(--specimen-danger); }
+
+    #tree-truncation-banner {
+      background: var(--specimen-amber-soft);
+      border: 1px solid rgba(181, 116, 25, 0.35);
+      border-radius: var(--specimen-radius-sm);
+      color: #7a4b0d;
+      font-weight: 800;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+        transition-duration: 0.001ms !important;
+      }
+      tr.row-new { animation: none; }
+      #status-dot.live { animation: none; }
+    }
+
+    @media (max-width: 860px) {
+      #header {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 12px 16px;
+      }
+      #header-left {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 4px;
+      }
+      #tabs {
+        flex-wrap: wrap;
+        padding: 0 12px;
+      }
+      .tab-btn {
+        flex: 1 1 120px;
+      }
+      .panel {
+        padding: 12px 12px 0;
+      }
+      .cards-row {
+        grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+      }
+      #tree-toolbar {
+        align-items: stretch;
+        flex-wrap: wrap;
+      }
+      #tree-repo-select {
+        min-width: min(100%, 240px);
+      }
+      #tree-info {
+        flex-basis: 100%;
+      }
+      #tree-body {
+        flex-direction: column;
+      }
+      #tree-sidebar {
+        border-bottom: 1px solid rgba(197, 207, 204, 0.18);
+        border-right: 0;
+        max-height: 230px;
+        width: 100%;
+      }
+      #compare-modal {
+        height: calc(100dvh - 24px);
+        width: calc(100vw - 24px);
+      }
+      #compare-panes {
+        grid-template-columns: 1fr;
+      }
+      .compare-pane {
+        border-bottom: 1px solid rgba(197, 207, 204, 0.2);
+        border-right: none;
+        min-height: 0;
+      }
+      .compare-pane:last-child { border-bottom: none; }
+    }
+
+    @media (max-width: 520px) {
+      #logo { font-size: 18px; }
+      #tagline { font-size: 11px; }
+      .cards-row { grid-template-columns: 1fr; }
+      .card { min-height: 76px; }
+      #privacy,
+      #privacy-lt,
+      #tree-footer { font-size: 10px; }
+      table { min-width: 680px; }
     }
   </style>
 </head>
@@ -893,8 +1540,8 @@
   <!-- Header -->
   <header id="header">
     <div id="header-left">
-      <span id="logo">▸ MARROW</span>
-      <span id="tagline">local · deterministic · offline context engine</span>
+      <span id="logo">MARROW</span>
+      <span id="tagline">local offline codebase cross-section engine</span>
     </div>
     <div id="status-area">
       <div id="status-dot"></div>
@@ -954,7 +1601,7 @@
           </thead>
           <tbody id="event-tbody">
             <tr id="empty-row">
-              <td colspan="4">waiting for tool calls…</td>
+              <td colspan="4">Awaiting local tool calls</td>
             </tr>
           </tbody>
         </table>
@@ -1060,7 +1707,7 @@
       <div id="tree-toolbar">
         <span class="tree-label">Repo</span>
         <select id="tree-repo-select" onchange="treeSelectRepo(this.value)">
-          <option value="">— select workspace —</option>
+            <option value="">Select workspace</option>
         </select>
         <span id="tree-info"></span>
         <button id="tree-reset-btn" onclick="treeResetView()">Reset</button>
@@ -1072,10 +1719,10 @@
           </div>
           <div id="tree-dir-tree"></div>
           <div id="tree-legend">
-            <span class="legend-item"><span class="legend-dot" style="background:#00e676"></span>Function</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#ffb300"></span>Method</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#00e5ff"></span>Class</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#7c83fd"></span>Module</span>
+            <span class="legend-item"><span class="legend-dot legend-function"></span>Function</span>
+            <span class="legend-item"><span class="legend-dot legend-method"></span>Method</span>
+            <span class="legend-item"><span class="legend-dot legend-class"></span>Class</span>
+            <span class="legend-item"><span class="legend-dot legend-module"></span>Module</span>
           </div>
         </div>
         <div id="tree-canvas-wrap">
@@ -1096,7 +1743,7 @@
         </div>
       </div>
       <footer id="tree-footer">
-        Graph visualization powered by D3.js — all data stays local.
+        Local D3 canvas. Graph data stays on 127.0.0.1.
       </footer>
     </section>
 
@@ -1105,11 +1752,11 @@
 </div><!-- /app -->
 
 <!-- Token Delta Modal -->
-<div id="compare-overlay" role="dialog" aria-modal="true" aria-label="Token Delta Viewer">
+<div id="compare-overlay" role="dialog" aria-modal="true" aria-label="Context Capsule Delta">
   <div id="compare-modal">
     <div id="compare-header">
-      <span id="compare-title">▸ Token Delta Viewer</span>
-      <button id="compare-close" onclick="closeCompareModal()" title="Close">✕ close</button>
+      <span id="compare-title">Context Capsule Delta</span>
+      <button id="compare-close" onclick="closeCompareModal()" title="Close">Close</button>
     </div>
     <div id="compare-banner">
       <span id="compare-banner-text">loading…</span>
@@ -1117,7 +1764,7 @@
     <div id="compare-panes">
       <div class="compare-pane" id="pane-original">
         <div class="compare-pane-header">
-          <span class="pane-label">Original Grep</span>
+          <span class="pane-label">Original Context</span>
           <span class="pane-chars" id="pane-original-chars">— tokens</span>
         </div>
         <div class="compare-pane-body" id="pane-original-body">
@@ -1143,11 +1790,11 @@
     flex-shrink: 0;
     text-align: center;
     font-size: 10px;
-    color: #3a5a3a;
-    letter-spacing: 0.04em;
-    border-top: 1px solid var(--border);
+    color: var(--specimen-muted);
+    letter-spacing: 0;
+    border-top: 1px solid rgba(197, 207, 204, 0.18);
     padding: 8px 0;
-    background: var(--bg);
+    background: rgba(36, 43, 47, 0.95);
     margin-top: auto;
   }
 </style>
@@ -1333,7 +1980,7 @@
            data-symbol="${escHtml(deltaInfo.symbol || '')}"
            data-repo="${escHtml(deltaInfo.repo || '')}"
            data-ts="${escHtml(String(deltaInfo.ts || ''))}"
-           onclick="openCompareModal(this)">[delta]</button>`
+           onclick="openCompareModal(this)">Compare</button>`
       : '';
 
     const tr = document.createElement('tr');
@@ -1444,7 +2091,7 @@
           ? (data.tokens_saved / data.file_tokens) * 100
           : null;
         const deltaBtn = (data.file && data.has_cached_delta)
-          ? `<button class="view-delta-btn" data-filepath="${escHtml(data.file)}" data-tool="get_context_capsule" data-symbol="${escHtml(data.symbol || '')}" data-repo="${escHtml(data.repo || '')}" data-ts="${escHtml(String(data.ts || ''))}" onclick="openCompareModal(this)">[delta]</button>`
+          ? `<button class="view-delta-btn" data-filepath="${escHtml(data.file)}" data-tool="get_context_capsule" data-symbol="${escHtml(data.symbol || '')}" data-repo="${escHtml(data.repo || '')}" data-ts="${escHtml(String(data.ts || ''))}" onclick="openCompareModal(this)">Compare</button>`
           : '';
 
         removeEmptyRow();
@@ -1708,6 +2355,38 @@
   // ── Tree Visualization ─────────────────────────────────────────────────
   const treeD3Available = typeof d3 !== 'undefined';
 
+  function cssVar(name, fallback) {
+    const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return value || fallback;
+  }
+
+  function hexToRgb(hex, fallback) {
+    const clean = String(hex || '').replace('#', '').trim();
+    const expanded = clean.length === 3
+      ? clean.split('').map(ch => ch + ch).join('')
+      : clean;
+    if (expanded.length !== 6) return fallback;
+    const n = Number.parseInt(expanded, 16);
+    if (Number.isNaN(n)) return fallback;
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+
+  function cssRgb(name, fallbackHex) {
+    return hexToRgb(cssVar(name, fallbackHex), hexToRgb(fallbackHex, [140, 150, 150]));
+  }
+
+  const TREE_EDGE_RGB = cssRgb('--graph-edge-base', '#8c9696').join(',');
+
+  const TREE_CANVAS = {
+    edgeRgb: TREE_EDGE_RGB,
+    edge: `rgba(${TREE_EDGE_RGB},0.38)`,
+    edgeFocus: `rgba(${TREE_EDGE_RGB},0.72)`,
+    edgeMuted: `rgba(${TREE_EDGE_RGB},0.08)`,
+    nodeFill: cssVar('--graph-node-fill', '#f7f0e7'),
+    labelFont: cssVar('--graph-label-font', '600 10px "SFMono-Regular", Menlo, monospace'),
+    clusterFont: cssVar('--graph-cluster-font', '700 10px "Avenir Next", system-ui, sans-serif'),
+  };
+
   // State
   let treeCanvas     = null;
   let treeCtx        = null;
@@ -1750,9 +2429,12 @@
   };
 
   const FILE_HULL_PALETTE = [
-    [0,150,70], [0,100,160], [160,120,0], [100,0,160],
-    [0,80,160],  [160,50,0],  [0,160,160], [80,160,0],
-    [160,0,80],  [0,130,100], [130,100,0], [40,0,160],
+    cssRgb('--graph-function', '#2f9b78'), cssRgb('--graph-class', '#be5f7b'),
+    cssRgb('--graph-module', '#7063bd'), cssRgb('--graph-method', '#b57419'),
+    cssRgb('--graph-hull-steel', '#687273'), cssRgb('--graph-hull-tissue-deep', '#903658'),
+    cssRgb('--graph-hull-blue-steel', '#2f7a9b'), cssRgb('--graph-hull-bronze', '#7a5c2a'),
+    cssRgb('--graph-hull-sage', '#577666'), cssRgb('--graph-module', '#7063bd'),
+    cssRgb('--graph-hull-danger', '#ad554b'), cssRgb('--graph-hull-slate', '#566970'),
   ];
 
   function makeClusterForce(strength) {
@@ -1778,13 +2460,13 @@
   }
 
   const TREE_COLORS = {
-    function:  '#00e676',
-    method:    '#ffb300',
-    class:     '#00e5ff',
-    module:    '#7c83fd',
-    struct:    '#7c83fd',
-    interface: '#00e5ff',
-    default:   '#5a745a',
+    function:  cssVar('--graph-function', '#2f9b78'),
+    method:    cssVar('--graph-method', '#b57419'),
+    class:     cssVar('--graph-class', '#be5f7b'),
+    module:    cssVar('--graph-module', '#7063bd'),
+    struct:    cssVar('--graph-module', '#7063bd'),
+    interface: cssVar('--graph-class', '#be5f7b'),
+    default:   cssVar('--graph-default', '#687273'),
   };
 
   function treeColor(type) {
@@ -1936,7 +2618,7 @@
 
     if (!hasFilter) {
       treeCtx.beginPath();
-      treeCtx.strokeStyle = 'rgba(42,74,42,0.35)';
+      treeCtx.strokeStyle = TREE_CANVAS.edge;
       for (const e of treeAllEdges) {
         if (!e.source.x || !e.target.x) continue;
         treeCtx.moveTo(e.source.x, e.source.y);
@@ -1946,7 +2628,7 @@
     } else if (treeFocusId !== null) {
       // Two batches: connected edges (high) and background (low)
       treeCtx.beginPath();
-      treeCtx.strokeStyle = 'rgba(42,74,42,0.7)';
+      treeCtx.strokeStyle = TREE_CANVAS.edgeFocus;
       for (const e of treeAllEdges) {
         if (!e.source.x || !e.target.x) continue;
         const sid = e.source.id || e.source;
@@ -1958,7 +2640,7 @@
       }
       treeCtx.stroke();
       treeCtx.beginPath();
-      treeCtx.strokeStyle = 'rgba(42,74,42,0.04)';
+      treeCtx.strokeStyle = TREE_CANVAS.edgeMuted;
       for (const e of treeAllEdges) {
         if (!e.source.x || !e.target.x) continue;
         const sid = e.source.id || e.source;
@@ -1974,7 +2656,7 @@
       for (const e of treeAllEdges) {
         if (!e.source.x || !e.target.x) continue;
         treeCtx.beginPath();
-        treeCtx.strokeStyle = `rgba(42,74,42,${treeEdgeOpacity(e)})`;
+        treeCtx.strokeStyle = `rgba(${TREE_CANVAS.edgeRgb},${treeEdgeOpacity(e)})`;
         treeCtx.moveTo(e.source.x, e.source.y);
         treeCtx.lineTo(e.target.x, e.target.y);
         treeCtx.stroke();
@@ -1982,7 +2664,7 @@
     }
 
     // Nodes — fill pass (uniform fill color)
-    treeCtx.fillStyle = '#0e120e';
+    treeCtx.fillStyle = TREE_CANVAS.nodeFill;
     for (const n of treeAllNodes) {
       if (n.x == null) continue;
       treeCtx.globalAlpha = hasFilter ? treeNodeOpacity(n) : 1;
@@ -2007,7 +2689,7 @@
 
     // ── Cluster file labels (screen space, fade as you zoom in) ──
     if (!hasFilter) {
-      treeCtx.font = '10px "JetBrains Mono", monospace';
+      treeCtx.font = TREE_CANVAS.clusterFont;
       treeCtx.textAlign = 'center';
       for (const label of treeCachedClusterLabels) {
         const sx  = treeTransform.applyX(label.x);
@@ -2026,7 +2708,7 @@
 
     // ── Screen-space labels (constant pixel size regardless of zoom) ──
     if (showLabels) {
-      treeCtx.font = '9px "JetBrains Mono", monospace';
+      treeCtx.font = TREE_CANVAS.labelFont;
       treeCtx.textAlign = 'left';
       for (const n of treeAllNodes) {
         if (n.x == null) continue;
@@ -2061,7 +2743,7 @@
           const hcy = hull.reduce((s, p) => s + p[1], 0) / hull.length;
           const pad = 18;
           treeCachedHulls.push({
-            color: treeFileColors[fp] || [0, 100, 40],
+            color: treeFileColors[fp] || cssRgb('--graph-default', '#687273'),
             points: hull.map(([x, y]) => {
               const dx = x - hcx, dy = y - hcy;
               const d  = Math.sqrt(dx * dx + dy * dy) || 1;
@@ -2075,7 +2757,7 @@
           x: valid.reduce((s, n) => s + n.x, 0) / valid.length,
           y: valid.reduce((s, n) => s + n.y, 0) / valid.length,
           text: fp.split('/').pop() || fp,
-          color: treeFileColors[fp] || [0, 150, 70],
+          color: treeFileColors[fp] || cssRgb('--graph-function', '#2f9b78'),
         });
       }
     }
@@ -2613,7 +3295,7 @@
         const sel   = document.getElementById('tree-repo-select');
         const repos = (data.database && data.database.repos) ? data.database.repos : [];
         const cur   = sel.value;
-        sel.innerHTML = '<option value="">— select workspace —</option>';
+        sel.innerHTML = '<option value="">Select workspace</option>';
         repos.forEach(repo => {
           const opt = document.createElement('option');
           opt.value = repo.repo_id;
