@@ -701,19 +701,115 @@
       flex-shrink: 0;
     }
 
+    /* Custom Workspace Selector */
     #tree-repo-select {
+      display: none;
+    }
+
+    .workspace-selector {
+      position: relative;
+      min-width: 220px;
+    }
+
+    .workspace-selector-btn {
       background: var(--bg);
       border: 1px solid var(--border-hi);
       color: var(--text);
       font-family: var(--font);
       font-size: 11px;
-      padding: 4px 8px;
+      padding: 6px 10px;
       border-radius: 3px;
       cursor: pointer;
-      min-width: 220px;
       outline: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      width: 100%;
+      text-align: left;
+      transition: border-color 0.15s ease;
     }
-    #tree-repo-select:focus { border-color: var(--green); }
+    .workspace-selector-btn:hover { border-color: var(--border-hi); background: rgba(106, 118, 120, 0.05); }
+    .workspace-selector-btn:focus { border-color: var(--green); }
+    .workspace-selector-btn[aria-expanded="true"] { border-color: var(--green); }
+
+    .workspace-selector-label {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .workspace-selector-label.empty { color: var(--dim); }
+
+    .workspace-selector-count {
+      color: var(--dim);
+      font-size: 10px;
+      flex-shrink: 0;
+    }
+
+    .workspace-selector-arrow {
+      color: var(--dim);
+      font-size: 9px;
+      flex-shrink: 0;
+      transition: transform 0.15s ease;
+    }
+    .workspace-selector-btn[aria-expanded="true"] .workspace-selector-arrow { transform: rotate(180deg); }
+
+    .workspace-selector-dropdown {
+      position: absolute;
+      top: calc(100% + 4px);
+      left: 0;
+      right: 0;
+      background: var(--surface);
+      border: 1px solid var(--border-hi);
+      border-radius: 3px;
+      box-shadow: 0 4px 12px rgba(29, 35, 38, 0.15);
+      max-height: 280px;
+      overflow-y: auto;
+      z-index: 100;
+      display: none;
+    }
+    .workspace-selector-dropdown.open { display: block; }
+    .workspace-selector-dropdown::-webkit-scrollbar { width: 6px; }
+    .workspace-selector-dropdown::-webkit-scrollbar-track { background: var(--bg); }
+    .workspace-selector-dropdown::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+    .workspace-selector-option {
+      padding: 7px 10px;
+      cursor: pointer;
+      font-size: 11px;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      border-bottom: 1px solid rgba(106, 118, 120, 0.12);
+    }
+    .workspace-selector-option:last-child { border-bottom: none; }
+    .workspace-selector-option:hover { background: rgba(50, 159, 125, 0.08); }
+    .workspace-selector-option.focused { background: rgba(50, 159, 125, 0.12); }
+    .workspace-selector-option.selected { color: var(--green); font-weight: 600; }
+
+    .workspace-selector-option-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .workspace-selector-option-count {
+      color: var(--dim);
+      font-size: 10px;
+      flex-shrink: 0;
+    }
+
+    .workspace-selector-empty {
+      padding: 16px 10px;
+      text-align: center;
+      color: var(--dim);
+      font-size: 10px;
+      letter-spacing: 0;
+    }
 
     #tree-info {
       flex: 1;
@@ -1784,10 +1880,32 @@
     <!-- TREE VISUALIZATION panel -->
     <section id="panel-tree" class="panel">
       <div id="tree-toolbar">
-        <label class="tree-label" for="tree-repo-select">Repo</label>
-        <select id="tree-repo-select" onchange="treeSelectRepo(this.value)" aria-label="Repository">
+        <label class="tree-label" for="workspace-selector-btn">Repo</label>
+        <div class="workspace-selector">
+          <button
+            id="workspace-selector-btn"
+            class="workspace-selector-btn"
+            type="button"
+            aria-expanded="false"
+            aria-haspopup="listbox"
+            aria-controls="workspace-selector-dropdown"
+            aria-label="Select workspace"
+          >
+            <span id="workspace-selector-label" class="workspace-selector-label empty">Select workspace</span>
+            <span id="workspace-selector-count" class="workspace-selector-count"></span>
+            <span class="workspace-selector-arrow">▼</span>
+          </button>
+          <div
+            id="workspace-selector-dropdown"
+            class="workspace-selector-dropdown"
+            role="listbox"
+            aria-label="Available workspaces"
+          >
+          </div>
+          <select id="tree-repo-select" hidden aria-hidden="true">
             <option value="">Select workspace</option>
-        </select>
+          </select>
+        </div>
         <span id="tree-info"></span>
         <button id="tree-reset-btn" onclick="treeResetView()">Reset</button>
       </div>
@@ -3357,22 +3475,8 @@
     fetch('/stats')
       .then(r => r.json())
       .then(data => {
-        const sel   = document.getElementById('tree-repo-select');
         const repos = (data.database && data.database.repos) ? data.database.repos : [];
-        const cur   = sel.value;
-        sel.innerHTML = '<option value="">Select workspace</option>';
-        repos.forEach(repo => {
-          const opt = document.createElement('option');
-          opt.value = repo.repo_id;
-          opt.textContent = repo.repo_id + ' (' + (repo.symbol_count || 0).toLocaleString() + ' symbols)';
-          sel.appendChild(opt);
-        });
-        if (cur) {
-          sel.value = cur;
-        } else if (repos.length === 1) {
-          sel.value = repos[0].repo_id;
-          treeSelectRepo(repos[0].repo_id);
-        }
+        workspaceSelectorPopulate(repos);
       })
       .catch(() => {});
 
@@ -3381,6 +3485,217 @@
       setTimeout(() => treeZoomFit(0), 50);
     }
   }
+
+  // ── Workspace Selector Component ───────────────────────────────────────────
+
+  let workspaceSelectorRepos = [];
+  let workspaceSelectorCurrent = '';
+  let workspaceSelectorFocusedIndex = -1;
+
+  function workspaceSelectorPopulate(repos) {
+    workspaceSelectorRepos = repos;
+    const dropdown = document.getElementById('workspace-selector-dropdown');
+    const sel = document.getElementById('tree-repo-select');
+
+    // Sync hidden native select
+    sel.innerHTML = '<option value="">Select workspace</option>';
+    repos.forEach(repo => {
+      const opt = document.createElement('option');
+      opt.value = repo.repo_id;
+      opt.textContent = repo.repo_id + ' (' + (repo.symbol_count || 0).toLocaleString() + ' symbols)';
+      sel.appendChild(opt);
+    });
+
+    // Populate custom dropdown
+    if (repos.length === 0) {
+      dropdown.innerHTML = '<div class="workspace-selector-empty">No indexed workspaces found</div>';
+    } else {
+      dropdown.innerHTML = '';
+      repos.forEach((repo, idx) => {
+        const option = document.createElement('div');
+        option.className = 'workspace-selector-option';
+        option.setAttribute('role', 'option');
+        option.setAttribute('data-repo-id', repo.repo_id);
+        option.setAttribute('data-index', idx);
+        option.innerHTML = `
+          <span class="workspace-selector-option-name">${escHtml(repo.repo_id)}</span>
+          <span class="workspace-selector-option-count">${(repo.symbol_count || 0).toLocaleString()} symbols</span>
+        `;
+        option.addEventListener('click', () => workspaceSelectorSelect(repo.repo_id));
+        dropdown.appendChild(option);
+      });
+    }
+
+    // Restore or auto-select
+    if (workspaceSelectorCurrent) {
+      workspaceSelectorUpdateDisplay(workspaceSelectorCurrent);
+      sel.value = workspaceSelectorCurrent;
+    } else if (repos.length === 1) {
+      workspaceSelectorSelect(repos[0].repo_id);
+    }
+  }
+
+  function workspaceSelectorSelect(repoId) {
+    workspaceSelectorCurrent = repoId;
+    workspaceSelectorUpdateDisplay(repoId);
+    workspaceSelectorClose();
+    document.getElementById('tree-repo-select').value = repoId;
+    treeSelectRepo(repoId);
+    // Return focus to button for consistent focus state
+    document.getElementById('workspace-selector-btn').focus();
+  }
+
+  function workspaceSelectorUpdateDisplay(repoId) {
+    const label = document.getElementById('workspace-selector-label');
+    const count = document.getElementById('workspace-selector-count');
+    const repo = workspaceSelectorRepos.find(r => r.repo_id === repoId);
+
+    if (repo) {
+      label.textContent = repo.repo_id;
+      label.classList.remove('empty');
+      count.textContent = (repo.symbol_count || 0).toLocaleString() + ' symbols';
+    } else {
+      label.textContent = 'Select workspace';
+      label.classList.add('empty');
+      count.textContent = '';
+    }
+
+    // Update selected state
+    document.querySelectorAll('.workspace-selector-option').forEach(opt => {
+      if (opt.getAttribute('data-repo-id') === repoId) {
+        opt.classList.add('selected');
+        opt.setAttribute('aria-selected', 'true');
+      } else {
+        opt.classList.remove('selected');
+        opt.setAttribute('aria-selected', 'false');
+      }
+    });
+  }
+
+  function workspaceSelectorToggle() {
+    const btn = document.getElementById('workspace-selector-btn');
+    const isOpen = btn.getAttribute('aria-expanded') === 'true';
+    if (isOpen) {
+      workspaceSelectorClose();
+    } else {
+      workspaceSelectorOpen();
+    }
+  }
+
+  function workspaceSelectorOpen() {
+    const btn = document.getElementById('workspace-selector-btn');
+    const dropdown = document.getElementById('workspace-selector-dropdown');
+    btn.setAttribute('aria-expanded', 'true');
+    dropdown.classList.add('open');
+    workspaceSelectorFocusedIndex = -1;
+    
+    // Scroll to selected option
+    const selected = dropdown.querySelector('.workspace-selector-option.selected');
+    if (selected) {
+      selected.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function workspaceSelectorClose() {
+    const btn = document.getElementById('workspace-selector-btn');
+    const dropdown = document.getElementById('workspace-selector-dropdown');
+    btn.setAttribute('aria-expanded', 'false');
+    dropdown.classList.remove('open');
+    workspaceSelectorFocusedIndex = -1;
+    document.querySelectorAll('.workspace-selector-option').forEach(opt => {
+      opt.classList.remove('focused');
+    });
+  }
+
+  function workspaceSelectorNavigate(direction) {
+    const options = Array.from(document.querySelectorAll('.workspace-selector-option'));
+    if (options.length === 0) return;
+
+    // Remove previous focus
+    if (workspaceSelectorFocusedIndex >= 0 && workspaceSelectorFocusedIndex < options.length) {
+      options[workspaceSelectorFocusedIndex].classList.remove('focused');
+    }
+
+    // Calculate new index
+    if (direction === 'down') {
+      workspaceSelectorFocusedIndex = Math.min(workspaceSelectorFocusedIndex + 1, options.length - 1);
+    } else if (direction === 'up') {
+      workspaceSelectorFocusedIndex = Math.max(workspaceSelectorFocusedIndex - 1, 0);
+    }
+
+    // Apply focus
+    const focused = options[workspaceSelectorFocusedIndex];
+    if (focused) {
+      focused.classList.add('focused');
+      focused.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function workspaceSelectorSelectFocused() {
+    const options = Array.from(document.querySelectorAll('.workspace-selector-option'));
+    if (workspaceSelectorFocusedIndex >= 0 && workspaceSelectorFocusedIndex < options.length) {
+      const repoId = options[workspaceSelectorFocusedIndex].getAttribute('data-repo-id');
+      workspaceSelectorSelect(repoId);
+    }
+  }
+
+  // Event listeners
+  document.addEventListener('DOMContentLoaded', () => {
+    const btn = document.getElementById('workspace-selector-btn');
+    const dropdown = document.getElementById('workspace-selector-dropdown');
+
+    btn.addEventListener('click', () => workspaceSelectorToggle());
+
+    btn.addEventListener('keydown', (e) => {
+      const isOpen = btn.getAttribute('aria-expanded') === 'true';
+      
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        if (isOpen && workspaceSelectorFocusedIndex >= 0) {
+          workspaceSelectorSelectFocused();
+        } else {
+          workspaceSelectorToggle();
+        }
+      } else if (e.key === 'Escape' && isOpen) {
+        e.preventDefault();
+        workspaceSelectorClose();
+        btn.focus();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (!isOpen) {
+          workspaceSelectorOpen();
+          const options = Array.from(document.querySelectorAll('.workspace-selector-option'));
+          if (options.length > 0) {
+            workspaceSelectorFocusedIndex = 0;
+            options[0].classList.add('focused');
+            options[0].scrollIntoView({ block: 'nearest' });
+          }
+        } else {
+          workspaceSelectorNavigate('down');
+        }
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (!isOpen) {
+          workspaceSelectorOpen();
+          const options = Array.from(document.querySelectorAll('.workspace-selector-option'));
+          if (options.length > 0) {
+            workspaceSelectorFocusedIndex = options.length - 1;
+            options[workspaceSelectorFocusedIndex].classList.add('focused');
+            options[workspaceSelectorFocusedIndex].scrollIntoView({ block: 'nearest' });
+          }
+        } else {
+          workspaceSelectorNavigate('up');
+        }
+      }
+    });
+
+    // Close on outside click
+    document.addEventListener('click', (e) => {
+      if (!btn.contains(e.target) && !dropdown.contains(e.target)) {
+        workspaceSelectorClose();
+      }
+    });
+  });
 </script>
 </body>
 </html>
