@@ -455,21 +455,64 @@
       margin-bottom: 14px;
     }
 
-    .repo-path-cell {
-      color: var(--dim);
-      font-size: 11px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      max-width: 520px;
+    #lifetime-advanced-controls {
+      display: flex;
+      justify-content: flex-start;
+      margin: -2px 0 14px;
     }
 
-    #repo-empty-row td {
-      text-align: center;
-      color: var(--dim);
+    #lifetime-advanced-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: rgba(22, 30, 37, 0.92);
+      color: var(--surface);
       font-size: 11px;
-      padding: 20px 14px;
-      border: none;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+    }
+
+    #lifetime-advanced-toggle:hover,
+    #lifetime-advanced-toggle[aria-expanded="true"] {
+      color: var(--surface);
+      border-color: var(--border-hi);
+      background: rgba(32, 44, 54, 0.96);
+    }
+
+    #lifetime-advanced-toggle:focus-visible {
+      outline: 1px solid var(--green);
+      outline-offset: 2px;
+    }
+
+    .icon-gear {
+      width: 13px;
+      height: 13px;
+      flex: 0 0 auto;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.7;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    #lifetime-advanced {
+      margin-bottom: 14px;
+    }
+
+    #lifetime-advanced[hidden] {
+      display: none;
+    }
+
+    #lifetime-advanced-copy {
+      font-size: 11px;
+      color: var(--dim);
+      margin: 0 0 12px;
     }
 
     /* ── Privacy footer ─────────────────────────────────────────────────────── */
@@ -1669,34 +1712,27 @@
           <div class="card-label">Lifetime Reduction %</div>
           <div class="card-value amber" id="l-reduction">—</div>
         </div>
-        <div class="card">
-          <div class="card-label">run_pipeline Requests</div>
-          <div class="card-value" id="l-pipeline-requests">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Auto-Routed Bypasses</div>
-          <div class="card-value" id="l-autorouted">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Rejected Bypasses</div>
-          <div class="card-value" id="l-rejected">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Pipeline Compliance %</div>
-          <div class="card-value amber" id="l-pipeline-compliance">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Ambiguous Symbol Guards</div>
-          <div class="card-value" id="l-ambiguous">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Stale Capsule Guards</div>
-          <div class="card-value" id="l-stale">—</div>
-        </div>
       </div>
 
-      <p id="lifetime-sub">Persisted in the attached database. A workspace database can contain multiple indexed repos.</p>
+      <p id="lifetime-sub">Persisted summary of core usage impact and the attached database footprint.</p>
       <p id="scope-path">Attached database: <span id="scope-db-path">—</span></p>
+
+      <div id="lifetime-advanced-controls">
+        <button
+          id="lifetime-advanced-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="lifetime-advanced"
+          aria-label="Show advanced settings"
+          onclick="toggleLifetimeAdvanced()"
+        >
+          <svg class="icon-gear" viewBox="0 0 16 16" aria-hidden="true">
+            <circle cx="8" cy="8" r="2.5"></circle>
+            <path d="M8 1.75v1.5M8 12.75v1.5M12.42 3.58l-1.06 1.06M4.64 11.36l-1.06 1.06M14.25 8h-1.5M3.25 8h-1.5M12.42 12.42l-1.06-1.06M4.64 4.64L3.58 3.58"></path>
+          </svg>
+          <span id="lifetime-advanced-toggle-label">Show advanced metrics</span>
+        </button>
+      </div>
 
       <div class="cards-row">
         <div class="card">
@@ -1708,31 +1744,35 @@
           <div class="card-value cyan" id="db-repos">—</div>
         </div>
         <div class="card">
-          <div class="card-label">Indexed Files</div>
-          <div class="card-value" id="db-files">—</div>
-        </div>
-        <div class="card">
           <div class="card-label">Indexed Symbols</div>
           <div class="card-value amber" id="db-symbols">—</div>
         </div>
       </div>
 
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Repo</th>
-              <th>Files</th>
-              <th>Symbols</th>
-              <th>Root Path</th>
-            </tr>
-          </thead>
-          <tbody id="repo-tbody">
-            <tr id="repo-empty-row">
-              <td colspan="4">no repos indexed in the attached database yet</td>
-            </tr>
-          </tbody>
-        </table>
+      <div id="lifetime-advanced" hidden>
+        <p id="lifetime-advanced-copy">Operational diagnostics for pipeline enforcement and safety guards.</p>
+        <div class="cards-row">
+          <div class="card">
+            <div class="card-label">Pipeline Compliance %</div>
+            <div class="card-value amber" id="l-pipeline-compliance">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">Auto-Routed Bypasses</div>
+            <div class="card-value" id="l-autorouted">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">Rejected Bypasses</div>
+            <div class="card-value" id="l-rejected">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">Ambiguous Symbol Guards</div>
+            <div class="card-value" id="l-ambiguous">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">Stale Capsule Guards</div>
+            <div class="card-value" id="l-stale">—</div>
+          </div>
+        </div>
       </div>
 
       <footer id="privacy-lt">
@@ -1935,10 +1975,9 @@
     document.getElementById('l-requests').textContent    = fmtNum(lt.total_requests);
     document.getElementById('l-tokens-saved').textContent = fmtNum(lt.total_tokens_saved);
     document.getElementById('l-reduction').textContent   = fmtPct(lt.reduction_pct);
-    document.getElementById('l-pipeline-requests').textContent = fmtNum(lt.pipeline_requests || 0);
+    document.getElementById('l-pipeline-compliance').textContent = fmtPct(lt.pipeline_compliance_pct || 0);
     document.getElementById('l-autorouted').textContent = fmtNum(lt.direct_low_level_autorouted || 0);
     document.getElementById('l-rejected').textContent = fmtNum(lt.direct_low_level_rejected || 0);
-    document.getElementById('l-pipeline-compliance').textContent = fmtPct(lt.pipeline_compliance_pct || 0);
     document.getElementById('l-ambiguous').textContent = fmtNum(lt.ambiguous_symbol_requests || 0);
     document.getElementById('l-stale').textContent = fmtNum(lt.stale_capsule_prevented || 0);
   }
@@ -1949,34 +1988,8 @@
     document.getElementById('s-db-size').textContent = fmtMb(database.size_mb);
     document.getElementById('db-size').textContent = fmtMb(database.size_mb);
     document.getElementById('db-repos').textContent = fmtNum(database.repo_count || 0);
-    document.getElementById('db-files').textContent = fmtNum(database.file_count || 0);
     document.getElementById('db-symbols').textContent = fmtNum(database.symbol_count || 0);
     document.getElementById('scope-db-path').textContent = database.path || '—';
-    renderRepoTable(database.repos || []);
-  }
-
-  function renderRepoTable(repos) {
-    const tbody = document.getElementById('repo-tbody');
-    tbody.innerHTML = '';
-
-    if (!Array.isArray(repos) || repos.length === 0) {
-      const tr = document.createElement('tr');
-      tr.id = 'repo-empty-row';
-      tr.innerHTML = '<td colspan="4">no repos indexed in the attached database yet</td>';
-      tbody.appendChild(tr);
-      return;
-    }
-
-    for (const repo of repos) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td class="tool-label"><span class="sym">${escHtml(repo.repo_id || '—')}</span></td>
-        <td>${fmtNum(repo.file_count || 0)}</td>
-        <td>${fmtNum(repo.symbol_count || 0)}</td>
-        <td class="repo-path-cell">${escHtml(repo.root_path || '—')}</td>
-      `;
-      tbody.appendChild(tr);
-    }
   }
 
   function setStatus(state) {
@@ -2294,6 +2307,18 @@
     if (name === 'tree') {
       treeOnTabActivate();
     }
+  }
+
+  function toggleLifetimeAdvanced() {
+    const panel = document.getElementById('lifetime-advanced');
+    const button = document.getElementById('lifetime-advanced-toggle');
+    const label = document.getElementById('lifetime-advanced-toggle-label');
+    const willExpand = panel.hasAttribute('hidden');
+
+    panel.toggleAttribute('hidden', !willExpand);
+    button.setAttribute('aria-expanded', String(willExpand));
+    button.setAttribute('aria-label', willExpand ? 'Hide advanced settings' : 'Show advanced settings');
+    label.textContent = willExpand ? 'Hide advanced metrics' : 'Show advanced metrics';
   }
 
   // ── Boot ───────────────────────────────────────────────────────────────────

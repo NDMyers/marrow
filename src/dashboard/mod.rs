@@ -1449,4 +1449,32 @@ mod tests {
         assert!(cache_refresh.contains("treeFrameCounter - treeLastHullFrame < cadence"));
         assert!(cache_refresh.contains("treeLastHullFrame = treeFrameCounter"));
     }
+
+    #[test]
+    fn dashboard_html_lifetime_panel_hides_advanced_metrics_until_toggle() {
+        let lifetime_panel = html_between("<section id=\"panel-lifetime\"", "<!-- TREE VISUALIZATION panel -->");
+        assert!(lifetime_panel.contains("All-Time Requests"));
+        assert!(lifetime_panel.contains("All-Time Tokens Saved"));
+        assert!(lifetime_panel.contains("Lifetime Reduction %"));
+        assert!(lifetime_panel.contains("Attached DB Size"));
+        assert!(lifetime_panel.contains("Indexed Repos"));
+        assert!(lifetime_panel.contains("Indexed Symbols"));
+        assert!(lifetime_panel.contains("id=\"lifetime-advanced-toggle\""));
+        assert!(lifetime_panel.contains("aria-expanded=\"false\""));
+        assert!(lifetime_panel.contains("id=\"lifetime-advanced\" hidden"));
+        assert!(lifetime_panel.contains("Pipeline Compliance %"));
+        assert!(lifetime_panel.contains("Auto-Routed Bypasses"));
+        assert!(lifetime_panel.contains("Rejected Bypasses"));
+        assert!(lifetime_panel.contains("Ambiguous Symbol Guards"));
+        assert!(lifetime_panel.contains("Stale Capsule Guards"));
+        assert!(!lifetime_panel.contains("Indexed Files"));
+        assert!(!lifetime_panel.contains("Root Path"));
+    }
+
+    #[test]
+    fn dashboard_html_lifetime_advanced_toggle_uses_high_contrast_default_styling() {
+        let toggle_style = html_between("#lifetime-advanced-toggle {", "#lifetime-advanced-toggle:hover,");
+        assert!(toggle_style.contains("color: var(--surface);"));
+        assert!(toggle_style.contains("font-weight: 600;"));
+    }
 }
