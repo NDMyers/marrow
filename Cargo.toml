@@ -66,8 +66,10 @@ notify-debouncer-mini = "0.5"
 # `getrusage` for perf-harness RSS hint (MARROW-PERF-002)
 libc = "0.2"
 
-[dev-dependencies]
+# Secure tempfile creation for spill files
 tempfile = "3"
+
+[dev-dependencies]
 hyper            = { version = "1", features = ["client", "http1"] }
 hyper-util       = { version = "0.1", features = ["tokio"] }
 http-body-util   = "0.1"

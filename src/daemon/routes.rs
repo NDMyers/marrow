@@ -26,6 +26,8 @@ pub struct DaemonState {
     pub dash_tx: broadcast::Sender<crate::dashboard::DashboardEvent>,
     /// One-shot sender for graceful shutdown. Consumed on first `/api/shutdown` call.
     pub shutdown_tx: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
+    /// Approved workspace roots for watch registration. Paths outside these are rejected.
+    pub approved_roots: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
 }
 
 impl DaemonState {
@@ -46,6 +48,7 @@ impl DaemonState {
             watcher_tx,
             dash_tx,
             shutdown_tx,
+            approved_roots: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -62,6 +65,84 @@ impl DaemonState {
             watcher_tx,
             dash_tx,
             shutdown_tx: Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),
+            approved_roots: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
+    /// Register a workspace root as approved for watch registration.
+    /// Called when `ingest_repo` runs successfully.
+    #[allow(dead_code)]
+    pub fn add_approved_root(&self, path: std::path::PathBuf) {
+        if let Ok(mut roots) = self.approved_roots.lock() {
+            // Canonicalize to handle symlinks consistently.
+            let canonical = path.canonicalize().unwrap_or(path);
+            roots.insert(canonical);
+        }
+    }
+
+    /// Check if a path is within an approved workspace root.
+    /// Canonicalizes the path to handle symlinks resolving outside workspace.
+    /// Falls back to checking the database for indexed repositories if no
+    /// in-memory roots are registered.
+    pub fn is_path_approved(&self, path: &std::path::Path) -> bool {
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false, // Path doesn't exist or can't be resolved
+        };
+
+        // Check in-memory approved roots first
+        if let Ok(roots) = self.approved_roots.lock() {
+            for root in roots.iter() {
+                if canonical.starts_with(root) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Check if a path has been indexed (exists in the repositories table).
+    /// This provides implicit approval - if a repo was indexed, watching is allowed.
+    pub async fn is_path_indexed(&self, path: &std::path::Path) -> bool {
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        // Get the database connection for this path
+        let conn = match self.pool.get_or_open(&canonical).await {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        // Check if any repository root matches or contains this path
+        let conn_guard = match conn.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+
+        let result: Result<Vec<String>, _> = conn_guard
+            .prepare("SELECT root_path FROM repositories")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            });
+
+        match result {
+            Ok(roots) => {
+                for root in roots {
+                    let root_path = std::path::Path::new(&root);
+                    let root_canonical = root_path
+                        .canonicalize()
+                        .unwrap_or_else(|_| root_path.to_path_buf());
+                    if canonical.starts_with(&root_canonical) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Err(_) => false,
         }
     }
 }
@@ -106,6 +187,21 @@ async fn handle_watch(
             Json(serde_json::json!({ "error": "path does not exist" })),
         );
     }
+
+    // Security: validate path is within an approved workspace root.
+    // Canonicalize first to catch symlinks resolving outside workspace.
+    // Check both in-memory approved roots and database-indexed repos.
+    let is_approved = state.is_path_approved(&path) || state.is_path_indexed(&path).await;
+    if !is_approved {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "path is not within an approved workspace root",
+                "hint": "run ingest_repo on the workspace first"
+            })),
+        );
+    }
+
     // M-10 FIX: Propagate DB/pool errors through HTTP response.
     if let Err(e) = state.pool.get_or_open(&path).await {
         return (

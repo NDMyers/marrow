@@ -307,7 +307,17 @@ fn cap_raw_text(text: String) -> String {
     )
 }
 
+/// Per-file parse timeout in milliseconds. Configurable via MARROW_PARSE_TIMEOUT_MS.
+/// Default: 5000 ms. Set to 0 to disable timeout.
+fn parse_timeout_ms() -> u64 {
+    std::env::var("MARROW_PARSE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000)
+}
+
 /// Parse a single file and return its language tag plus extracted symbols.
+/// Skips files that exceed the configurable parse timeout (MARROW_PARSE_TIMEOUT_MS).
 pub fn parse_file(path: &Path) -> Result<(String, Vec<Symbol>)> {
     let ext = path
         .extension()
@@ -337,22 +347,75 @@ pub fn parse_file(path: &Path) -> Result<(String, Vec<Symbol>)> {
     }
 
     let source = std::fs::read_to_string(path)?;
+
+    // Get configurable parse timeout
+    let timeout_ms = parse_timeout_ms();
+    let path_display = path.display().to_string();
+
+    let symbols = if timeout_ms == 0 {
+        // Timeout disabled — parse synchronously
+        parse_file_inner(&source, &ext, &config, &path_display)?
+    } else {
+        // Parse with timeout using a channel + rayon spawn
+        let (tx, rx) = std::sync::mpsc::channel();
+        let source_clone = source.clone();
+        let ext_clone = ext.clone();
+        let path_clone = path_display.clone();
+        let parse_start = std::time::Instant::now();
+
+        // Spawn parse work on rayon thread pool
+        rayon::spawn(move || {
+            let result = parse_file_inner(&source_clone, &ext_clone, &config, &path_clone);
+            let _ = tx.send(result);
+        });
+
+        // Wait with timeout
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let elapsed_ms = parse_start.elapsed().as_millis();
+                eprintln!(
+                    "[marrow] parse timeout (budget={}ms, elapsed={}ms), skipping file: {}",
+                    timeout_ms, elapsed_ms, path_display
+                );
+                return Ok((ext, Vec::new())); // skip file, log warning
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!(
+                    "parse thread disconnected unexpectedly: {}",
+                    path_display
+                ));
+            }
+        }
+    };
+
+    Ok((ext, symbols))
+}
+
+/// Inner parse logic extracted for timeout wrapping.
+fn parse_file_inner(
+    source: &str,
+    ext: &str,
+    config: &LangConfig,
+    path_display: &str,
+) -> Result<Vec<Symbol>> {
     let source_bytes = source.as_bytes();
 
-    let symbols = SYMBOL_PARSERS.with(|cache| -> Result<Vec<Symbol>> {
+    SYMBOL_PARSERS.with(|cache| -> Result<Vec<Symbol>> {
         let mut map = cache.borrow_mut();
-        if !map.contains_key(&ext) {
+        if !map.contains_key(ext) {
             let mut parser = Parser::new();
             parser.set_language(&config.language)?;
             let query = Query::new(&config.language, config.query_src)?;
-            map.insert(ext.clone(), (parser, query));
+            map.insert(ext.to_string(), (parser, query));
         }
-        let (parser, query) = map.get_mut(&ext).unwrap();
+        let (parser, query) = map.get_mut(ext).unwrap();
         parser.reset();
 
         let tree = parser
-            .parse(&source, None)
-            .ok_or_else(|| anyhow!("tree-sitter parse failed: {}", path.display()))?;
+            .parse(source, None)
+            .ok_or_else(|| anyhow!("tree-sitter parse failed: {}", path_display))?;
 
         let mut cursor = QueryCursor::new();
         let mut syms = Vec::new();
@@ -363,7 +426,7 @@ pub fn parse_file(path: &Path) -> Result<(String, Vec<Symbol>)> {
                 let capture_name = query.capture_names()[capture.index as usize];
                 let name = extract_symbol_name(&node, source_bytes);
                 let raw_text = cap_raw_text(node.utf8_text(source_bytes).unwrap_or("").to_string());
-                let callees = extract_calls_from_symbol(&raw_text, &ext);
+                let callees = extract_calls_from_symbol(&raw_text, ext);
                 let start_byte = node.start_byte();
                 syms.push(Symbol {
                     name,
@@ -375,9 +438,7 @@ pub fn parse_file(path: &Path) -> Result<(String, Vec<Symbol>)> {
             }
         }
         Ok(syms)
-    })?;
-
-    Ok((ext, symbols))
+    })
 }
 
 /// Returns `false` for files that should never be parsed:
@@ -549,8 +610,8 @@ where
 /// or tree-sitter work.
 struct ComputedChangeset {
     /// Serialized parsed rows (workers → bounded channel → drainer thread wrote here).
-    /// Removed after `write_changeset` finishes.
-    parsed_spill: PathBuf,
+    /// Tempfile is auto-cleaned when dropped.
+    parsed_spill: tempfile::NamedTempFile,
     /// Files whose mtime changed but content hash was identical (mtime-drift only).
     mtime_only: Vec<(String, i64)>,
     /// Relative paths of files that disappeared from disk since last index.
@@ -762,45 +823,15 @@ where
     Ok(mtime_only)
 }
 
-fn ingest_spill_path() -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "marrow_ingest_spill_{}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-        seq
-    ))
-}
-
-fn spill_file_create_private(path: &Path) -> Result<fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(Into::into)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::File::create(path).map_err(Into::into)
-    }
+fn ingest_spill_path() -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new().prefix("marrow-spill-").tempfile()
 }
 
 fn spill_drainer_loop(
     parsed_rx: mpsc::Receiver<ParsedFileBatchRow>,
-    spill_path: PathBuf,
-) -> Result<()> {
-    let f = spill_file_create_private(&spill_path)?;
-    let mut w = BufWriter::new(f);
+    spill_file: tempfile::NamedTempFile,
+) -> Result<(tempfile::NamedTempFile, Option<anyhow::Error>)> {
+    let mut w = BufWriter::new(spill_file);
     let mut first_write_err: Option<anyhow::Error> = None;
     while let Ok(row) = parsed_rx.recv() {
         if first_write_err.is_none() {
@@ -810,10 +841,8 @@ fn spill_drainer_loop(
         }
     }
     w.flush()?;
-    if let Some(e) = first_write_err {
-        return Err(e);
-    }
-    Ok(())
+    let file = w.into_inner()?;
+    Ok((file, first_write_err))
 }
 
 /// Walk the filesystem, hash changed files, and run tree-sitter in parallel.
@@ -863,9 +892,9 @@ where
     let ingest_threads = ingest_parse_thread_count();
     let queue_cap = ingest_parse_queue_capacity();
     let (parsed_tx, parsed_rx) = mpsc::sync_channel::<ParsedFileBatchRow>(queue_cap);
-    let spill_path = ingest_spill_path();
-    let spill_path_for_drainer = spill_path.clone();
-    let drainer = std::thread::spawn(move || spill_drainer_loop(parsed_rx, spill_path_for_drainer));
+    let spill_file =
+        ingest_spill_path().map_err(|e| anyhow!("failed to create spill tempfile: {e}"))?;
+    let drainer = std::thread::spawn(move || spill_drainer_loop(parsed_rx, spill_file));
 
     // Ensure `parsed_tx` is always dropped (closing the channel) even if Rayon panics,
     // so `spill_drainer_loop` cannot block forever in `recv`.
@@ -904,10 +933,17 @@ where
     let drain_res = drainer
         .join()
         .map_err(|_| anyhow!("ingest spill drainer panicked"))?;
-    if parse_res.is_err() || drain_res.is_err() {
-        let _ = fs::remove_file(&spill_path);
+
+    // Extract spill file and check for write errors.
+    // On error, tempfile cleans up automatically when dropped.
+    let (spill_tempfile, write_err) = drain_res?;
+    if let Some(e) = write_err {
+        return Err(e);
     }
-    drain_res?;
+    if parse_res.is_err() {
+        // Tempfile auto-cleanup on drop
+        return parse_res.map(|_| unreachable!());
+    }
     let mtime_only = parse_res?;
 
     // Detect files removed from disk
@@ -920,7 +956,7 @@ where
         .collect();
 
     Ok(ComputedChangeset {
-        parsed_spill: spill_path,
+        parsed_spill: spill_tempfile,
         mtime_only,
         removed_rels,
     })
@@ -1080,9 +1116,9 @@ where
         }
     }
 
-    let spill_path = changeset.parsed_spill.clone();
+    // Tempfile will auto-cleanup when dropped; no manual remove_file needed.
     let result = write_changeset_body(conn, repo_id, changeset, progress, progress_state);
-    let out = match result {
+    match result {
         Ok(counts) => {
             conn.execute_batch("COMMIT")?;
             Ok(counts)
@@ -1091,9 +1127,7 @@ where
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)
         }
-    };
-    let _ = fs::remove_file(&spill_path);
-    out
+    }
 }
 
 fn write_changeset_body<F>(
@@ -1154,7 +1188,7 @@ where
     let mut changed_paths: HashSet<String> = HashSet::new();
     let mut all_callee_names: HashSet<String> = HashSet::new();
     let mut pending_calls: Vec<(String, String, String)> = Vec::new();
-    let spill_file = fs::File::open(&parsed_spill)?;
+    let spill_file = fs::File::open(parsed_spill.path())?;
     let mut spill_reader = BufReader::new(spill_file);
     while let Some((file_path, lang, symbols, hash, mtime)) =
         read_spill_parsed_row(&mut spill_reader)?
