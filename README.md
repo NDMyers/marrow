@@ -1,6 +1,6 @@
 # Marrow (AST Context Engine)
 
-**Marrow** is a high-performance, local, and language-agnostic Model Context Protocol (MCP) server written in Rust. It is designed to drastically reduce LLM token bloat by dynamically parsing codebases into Abstract Syntax Trees (AST) and serving condensed "Context Capsules."
+**Marrow** is a high-performance, local, and language-agnostic Model Context Protocol (MCP) server written in Rust. It is designed to reduce LLM token bloat on measured code-navigation workloads by dynamically parsing codebases into Abstract Syntax Trees (AST) and serving condensed "Context Capsules."
 
 ## Overview
 
@@ -64,10 +64,14 @@ cargo clippy -- -D warnings
 | `MARROW_CAPSULE_ORIGINAL_MODE` | `none` | `none` (default): do not load touched files into MCP `original_text` (saves RAM). `full`: legacy concatenation of full files (see `MARROW_CAPSULE_ORIGINAL_MAX_BYTES`). |
 | `MARROW_CAPSULE_ORIGINAL_LEGACY` | *(unset)* | If `1`/`true`/`yes`, alias for `MARROW_CAPSULE_ORIGINAL_MODE=full` (one-release shim). |
 | `MARROW_CAPSULE_ORIGINAL_MAX_BYTES` | *(unset)* | **Only when mode is `full`.** Cap total bytes for `original_text`. Uses file `metadata().len()` before reading; skips files that would exceed the budget. Unset = unlimited concat (can spike RAM). |
+| `MARROW_CAPSULE_PROOF_MAX_BYTES` | `16384` | Default-mode dashboard proof snapshot cap. This bounded evidence is cached for compare; it is not returned as MCP `original_text`. |
+| `MARROW_CAPSULE_PROOF_MAX_FILES` | `8` | Max touched files included in the default-mode proof snapshot. More touched files are deterministically sampled and labeled as partial. |
 | `MARROW_CAPSULE_MAX_INBOUND_LOAD` | `64` | Max inbound rows loaded from DB (display still capped at 10). |
 | `MARROW_IMPACT_MAX_ROWS` | `5000` | Max rows returned by `analyze_impact`. |
 
-**Capsule benchmark:** `marrow benchmark <symbol> <repo_id>` uses the same `file_tokens` heuristic as the MCP tools (metadata `len/4` when `MARROW_CAPSULE_ORIGINAL_MODE` is `none`). Add `--precise-file-tokens` for cl100k_base counts summed per touched file (streams one file at a time; no full concat).
+**Capsule benchmark:** `marrow benchmark <symbol> <repo_id>` keeps the scriptable benchmark path and uses the same labeled `file_tokens` baseline as the MCP tools (metadata `len/4` estimate when `MARROW_CAPSULE_ORIGINAL_MODE` is `none`). Add `--precise-file-tokens` for evidence-grade cl100k_base counts summed per touched file (streams one file at a time; no full concat). In an interactive terminal, `marrow benchmark` opens a guided wizard for repository selection, symbol search/filtering, and benchmark mode selection. Choose estimated mode for the default provenance labels, or exact proof mode for the same behavior as `--precise-file-tokens`. Benchmark output includes the symbol, repo ID, tokenizer mode, original/proof modes, precise-token setting, and active caps so reported reductions can be reproduced for the same graph and environment.
+
+Dashboard reduction cards are operational estimates unless the provenance label says otherwise. Use `marrow benchmark --precise-file-tokens <symbol> <repo_id>` or `marrow perf-harness --precise-file-tokens --json` for exact, reproducible token claims.
 
 **Post-ingest DB maintenance:** After a large ingest, or if you used `MARROW_SKIP_POST_INGEST_MAINTENANCE`, run:
 

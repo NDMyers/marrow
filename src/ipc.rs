@@ -80,7 +80,8 @@ impl IpcClient {
     /// M-10 FIX: Check HTTP response status and return errors to callers.
     pub async fn register_watch(&self, path: &Path) -> Result<()> {
         let url = format!("{}/api/watch", self.base_url);
-        let resp = self.inner
+        let resp = self
+            .inner
             .post(&url)
             .json(&serde_json::json!({ "path": path.to_string_lossy() }))
             .send()
@@ -176,7 +177,11 @@ mod tests {
     #[test]
     fn default_sock_path_ends_with_daemon_sock() {
         let p = default_sock_path();
-        assert!(p.ends_with("daemon.sock"), "unexpected path: {}", p.display());
+        assert!(
+            p.ends_with("daemon.sock"),
+            "unexpected path: {}",
+            p.display()
+        );
     }
 
     #[cfg(unix)]

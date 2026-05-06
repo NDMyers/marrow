@@ -1,37 +1,37 @@
 //! Axum route handlers for the daemon HTTP server.
 
+use crate::daemon::pool::{spawn_eviction_loop, RepoPool};
 use axum::{
-    Json, Router,
     extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Json, Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use crate::daemon::pool::{RepoPool, spawn_eviction_loop};
-use tokio::sync::{broadcast, mpsc, oneshot};
 use std::time::Duration;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
 /// Shared state threaded through all Axum route handlers.
 #[derive(Clone)]
 pub struct DaemonState {
-    pub pool:        Arc<RepoPool>,
+    pub pool: Arc<RepoPool>,
     /// Sender used to register new repo paths with the background watcher.
-    pub watcher_tx:  mpsc::Sender<std::path::PathBuf>,
+    pub watcher_tx: mpsc::Sender<std::path::PathBuf>,
     /// Dashboard broadcast channel for file-change events.
     #[allow(dead_code)]
-    pub dash_tx:     broadcast::Sender<crate::dashboard::DashboardEvent>,
+    pub dash_tx: broadcast::Sender<crate::dashboard::DashboardEvent>,
     /// One-shot sender for graceful shutdown. Consumed on first `/api/shutdown` call.
     pub shutdown_tx: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 impl DaemonState {
     pub fn new(
-        watcher_tx:  mpsc::Sender<std::path::PathBuf>,
-        dash_tx:     broadcast::Sender<crate::dashboard::DashboardEvent>,
+        watcher_tx: mpsc::Sender<std::path::PathBuf>,
+        dash_tx: broadcast::Sender<crate::dashboard::DashboardEvent>,
         shutdown_tx: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
     ) -> Self {
         let pool = Arc::new(RepoPool::new());
@@ -41,7 +41,12 @@ impl DaemonState {
             Duration::from_secs(60 * 60),
             Duration::from_secs(5 * 60),
         );
-        Self { pool, watcher_tx, dash_tx, shutdown_tx }
+        Self {
+            pool,
+            watcher_tx,
+            dash_tx,
+            shutdown_tx,
+        }
     }
 
     /// Test constructor — channels are throwaway (receivers dropped immediately).
@@ -49,8 +54,8 @@ impl DaemonState {
     /// receivers do not panic.
     #[cfg(test)]
     pub fn new_test() -> Self {
-        let (watcher_tx, _rx)   = mpsc::channel(1);
-        let (dash_tx, _)        = broadcast::channel(4);
+        let (watcher_tx, _rx) = mpsc::channel(1);
+        let (dash_tx, _) = broadcast::channel(4);
         let (shutdown_tx, _rx2) = oneshot::channel();
         Self {
             pool: Arc::new(RepoPool::new()),
@@ -65,8 +70,8 @@ impl DaemonState {
 
 pub fn build_router(state: DaemonState) -> Router {
     Router::new()
-        .route("/api/health",   get(handle_health))
-        .route("/api/watch",    post(handle_watch))
+        .route("/api/health", get(handle_health))
+        .route("/api/watch", post(handle_watch))
         .route("/api/shutdown", post(handle_shutdown))
         .with_state(state)
 }
@@ -96,17 +101,29 @@ async fn handle_watch(
 ) -> impl IntoResponse {
     let path = std::path::PathBuf::from(&req.path);
     if !path.exists() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "path does not exist" })));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "path does not exist" })),
+        );
     }
     // M-10 FIX: Propagate DB/pool errors through HTTP response.
     if let Err(e) = state.pool.get_or_open(&path).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("DB pool error: {e}") })));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("DB pool error: {e}") })),
+        );
     }
     // M-10 FIX: Propagate watcher channel send errors.
     if let Err(e) = state.watcher_tx.send(path).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Watcher channel error: {e}") })));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Watcher channel error: {e}") })),
+        );
     }
-    (StatusCode::OK, Json(serde_json::json!({ "watching": req.path })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "watching": req.path })),
+    )
 }
 
 /// Signal the daemon to shut down gracefully.
@@ -119,7 +136,10 @@ async fn handle_shutdown(State(state): State<DaemonState>) -> impl IntoResponse 
             let _ = tx.send(());
         }
     }
-    (StatusCode::OK, Json(serde_json::json!({ "status": "shutting down" })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "shutting down" })),
+    )
 }
 
 #[cfg(test)]
@@ -133,7 +153,12 @@ mod tests {
     async fn health_returns_200() {
         let app = build_router(DaemonState::new_test());
         let response = app
-            .oneshot(Request::builder().uri("/api/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);

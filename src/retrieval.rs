@@ -1,6 +1,12 @@
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
-use std::{collections::{BTreeMap, HashSet}, fmt::Write as FmtWrite, fs, path::{Path, PathBuf}};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt::Write as FmtWrite,
+    fs,
+    path::{Path, PathBuf},
+};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser, Query, QueryCursor};
 
@@ -52,6 +58,72 @@ pub struct CapsuleResult {
     pub original_text: String,
     /// MCP / dashboard `file_tokens` heuristic (`len/4`), mode-aware (metadata sum when not full).
     pub file_tokens: usize,
+    /// Bounded inspectable proof for dashboard compare. This is separate from
+    /// `original_text` so normal MCP responses can stay low-cost.
+    pub proof_snapshot: Option<CapsuleProofSnapshot>,
+    /// Provenance labels for token baselines and proof material.
+    pub provenance: CapsuleProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapsuleProofSnapshot {
+    pub proof_text: String,
+    pub proof_label: String,
+    pub token_source: String,
+    pub truncated: bool,
+    pub sampled: bool,
+    pub max_bytes: usize,
+    pub max_files: usize,
+    pub touched_file_count: usize,
+    pub included_file_count: usize,
+    pub omitted_file_count: usize,
+    pub omitted_paths_preview: Vec<String>,
+}
+
+impl CapsuleProofSnapshot {
+    pub fn without_text(&self) -> Self {
+        let mut slim = self.clone();
+        slim.proof_text.clear();
+        slim
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapsuleProvenance {
+    pub baseline_token_source: String,
+    pub tokenizer_mode: String,
+    pub original_mode: String,
+    pub proof_label: String,
+    pub precise_file_tokens: bool,
+    pub original_max_bytes: Option<usize>,
+    pub proof_max_bytes: usize,
+    pub proof_max_files: usize,
+    pub touched_file_count: usize,
+}
+
+impl Default for CapsuleProvenance {
+    fn default() -> Self {
+        Self {
+            baseline_token_source: "unavailable".to_string(),
+            tokenizer_mode: "unknown".to_string(),
+            original_mode: "none".to_string(),
+            proof_label: "unavailable".to_string(),
+            precise_file_tokens: false,
+            original_max_bytes: None,
+            proof_max_bytes: capsule_proof_max_bytes(),
+            proof_max_files: capsule_proof_max_files(),
+            touched_file_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreciseTokenMeasurement {
+    pub tokens: usize,
+    pub touched_file_count: usize,
+    pub measured_file_count: usize,
+    pub failed_paths: Vec<String>,
+    pub tokenizer_mode: String,
 }
 
 #[derive(Debug)]
@@ -164,6 +236,156 @@ fn capsule_original_text_max_bytes() -> Option<usize> {
     }
 }
 
+pub fn capsule_proof_max_bytes() -> usize {
+    env_usize_positive("MARROW_CAPSULE_PROOF_MAX_BYTES", 16 * 1024)
+}
+
+pub fn capsule_proof_max_files() -> usize {
+    env_usize_positive("MARROW_CAPSULE_PROOF_MAX_FILES", 8)
+}
+
+fn original_mode_label(mode: CapsuleOriginalMode) -> &'static str {
+    match mode {
+        CapsuleOriginalMode::None => "none",
+        CapsuleOriginalMode::Full => "full",
+    }
+}
+
+fn proof_label(sampled: bool, truncated: bool) -> &'static str {
+    match (sampled, truncated) {
+        (true, true) => "sampled_truncated_proof",
+        (true, false) => "sampled_proof",
+        (false, true) => "truncated_proof",
+        (false, false) => "cached_proof",
+    }
+}
+
+fn baseline_token_source(mode: CapsuleOriginalMode, truncated_full: bool) -> &'static str {
+    match mode {
+        CapsuleOriginalMode::None => "estimated",
+        CapsuleOriginalMode::Full if truncated_full => "truncated_full",
+        CapsuleOriginalMode::Full => "full",
+    }
+}
+
+fn touched_paths_for_capsule(capsule: &ContextCapsule) -> HashSet<String> {
+    let mut touched: HashSet<String> = HashSet::new();
+    touched.insert(capsule.pivot.file_path.clone());
+    for n in &capsule.neighbors {
+        touched.insert(n.node.file_path.clone());
+    }
+    touched
+}
+
+fn prefix_by_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn sampled_paths<'a>(paths: &'a [&'a String], max_files: usize) -> Vec<&'a String> {
+    if paths.len() <= max_files {
+        return paths.to_vec();
+    }
+    if max_files <= 1 {
+        return vec![paths[0]];
+    }
+    let last = paths.len() - 1;
+    (0..max_files)
+        .map(|i| {
+            let idx = (i * last) / (max_files - 1);
+            paths[idx]
+        })
+        .collect()
+}
+
+fn build_bounded_proof_snapshot(
+    root: Option<&Path>,
+    touched: &HashSet<String>,
+    baseline_source: &str,
+) -> Option<CapsuleProofSnapshot> {
+    let root = root?;
+    let max_bytes = capsule_proof_max_bytes();
+    let max_files = capsule_proof_max_files();
+    let mut paths: Vec<&String> = touched.iter().collect();
+    paths.sort();
+    if paths.is_empty() || max_bytes == 0 || max_files == 0 {
+        return None;
+    }
+
+    let selected = sampled_paths(&paths, max_files);
+    let sampled = paths.len() > selected.len();
+    let mut used = 0usize;
+    let mut text = String::new();
+    let mut included = 0usize;
+    let mut truncated = false;
+    let mut omitted_paths_preview: Vec<String> = paths
+        .iter()
+        .filter(|p| !selected.iter().any(|s| *s == **p))
+        .take(5)
+        .map(|p| (*p).clone())
+        .collect();
+
+    for rel_path in selected {
+        let header = format!("── MARROW PROOF: {rel_path} ──\n");
+        if used.saturating_add(header.len()) >= max_bytes {
+            truncated = true;
+            if omitted_paths_preview.len() < 5 {
+                omitted_paths_preview.push(rel_path.clone());
+            }
+            break;
+        }
+        let abs_path = match resolve_repo_file_path(root, rel_path) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        let file_text = match fs::read_to_string(&abs_path) {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+        let remaining = max_bytes - used - header.len();
+        let body = prefix_by_bytes(&file_text, remaining);
+        if body.len() < file_text.len() {
+            truncated = true;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+            used = used.saturating_add(1);
+        }
+        text.push_str(&header);
+        text.push_str(body);
+        used = used.saturating_add(header.len()).saturating_add(body.len());
+        included += 1;
+        if truncated {
+            break;
+        }
+    }
+
+    if text.is_empty() {
+        return None;
+    }
+
+    let omitted = touched.len().saturating_sub(included);
+    Some(CapsuleProofSnapshot {
+        proof_text: text,
+        proof_label: proof_label(sampled, truncated).to_string(),
+        token_source: baseline_source.to_string(),
+        truncated,
+        sampled,
+        max_bytes,
+        max_files,
+        touched_file_count: touched.len(),
+        included_file_count: included,
+        omitted_file_count: omitted,
+        omitted_paths_preview,
+    })
+}
+
 /// Sum `metadata().len() / 4` over unique touched relative paths (skip missing / unreadable).
 fn file_tokens_metadata_estimate(root: Option<&Path>, touched: &HashSet<String>) -> usize {
     let mut total: usize = 0;
@@ -249,34 +471,32 @@ pub(crate) fn concat_full_original_text_sorted(
     (parts.join("\n"), truncated_original, omitted_paths)
 }
 
-/// Tiktoken (cl100k_base) token count summed per touched file, streaming one file at a time.
-pub fn sum_precise_tokens_touched_by_capsule(
+/// Tiktoken (cl100k_base) token count summed per touched file, with failure provenance.
+pub fn measure_precise_tokens_touched_by_capsule(
     conn: &Connection,
     symbol_name: &str,
     repo_id: &str,
     filepath: Option<&str>,
-) -> Result<usize> {
+) -> Result<PreciseTokenMeasurement> {
     let (pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw) =
         match resolve_symbol_or_disambiguate(conn, symbol_name, repo_id, filepath)? {
             SymbolResolution::Unique(row) => row,
-            SymbolResolution::Ambiguous(_) => return Ok(0),
+            SymbolResolution::Ambiguous(_) => {
+                return Ok(PreciseTokenMeasurement {
+                    tokens: 0,
+                    touched_file_count: 0,
+                    measured_file_count: 0,
+                    failed_paths: Vec::new(),
+                    tokenizer_mode: "cl100k_base".to_string(),
+                })
+            }
         };
 
     let capsule = build_context_capsule_from_resolved(
-        conn,
-        pivot_id,
-        pivot_name,
-        pivot_type,
-        pivot_path,
-        pivot_lang,
-        pivot_raw,
+        conn, pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw,
     )?;
 
-    let mut touched: HashSet<String> = HashSet::new();
-    touched.insert(capsule.pivot.file_path.clone());
-    for n in &capsule.neighbors {
-        touched.insert(n.node.file_path.clone());
-    }
+    let touched = touched_paths_for_capsule(&capsule);
 
     let root_path: String = conn
         .query_row(
@@ -296,21 +516,37 @@ pub fn sum_precise_tokens_touched_by_capsule(
     let mut paths: Vec<&String> = touched.iter().collect();
     paths.sort();
     let mut total = 0usize;
+    let mut measured_file_count = 0usize;
+    let mut failed_paths = Vec::new();
     for rel_path in paths {
         let Some(root) = root.as_ref() else {
+            failed_paths.push(rel_path.clone());
             continue;
         };
         let abs_path = match resolve_repo_file_path(root, rel_path) {
             Ok(p) => p,
-            Err(_) => continue,
+            Err(_) => {
+                failed_paths.push(rel_path.clone());
+                continue;
+            }
         };
         let contents = match fs::read_to_string(&abs_path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(_) => {
+                failed_paths.push(rel_path.clone());
+                continue;
+            }
         };
         total = total.saturating_add(bpe.encode_with_special_tokens(&contents).len());
+        measured_file_count += 1;
     }
-    Ok(total)
+    Ok(PreciseTokenMeasurement {
+        tokens: total,
+        touched_file_count: touched.len(),
+        measured_file_count,
+        failed_paths,
+        tokenizer_mode: "cl100k_base".to_string(),
+    })
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -339,8 +575,20 @@ pub fn get_context_capsule(
                 let file_tokens = payload.len() / 4;
                 return Ok(CapsuleResult {
                     optimized_text: payload.clone(),
-                    original_text: payload,
+                    original_text: String::new(),
                     file_tokens,
+                    proof_snapshot: None,
+                    provenance: CapsuleProvenance {
+                        baseline_token_source: "unavailable".to_string(),
+                        tokenizer_mode: "chars/4".to_string(),
+                        original_mode: original_mode_label(capsule_original_mode()).to_string(),
+                        proof_label: "unavailable".to_string(),
+                        precise_file_tokens: false,
+                        original_max_bytes: capsule_original_text_max_bytes(),
+                        proof_max_bytes: capsule_proof_max_bytes(),
+                        proof_max_files: capsule_proof_max_files(),
+                        touched_file_count: 0,
+                    },
                 });
             }
         };
@@ -351,11 +599,7 @@ pub fn get_context_capsule(
     let optimized_text = format_capsule(&capsule);
 
     // Collect all unique file paths touched by this capsule.
-    let mut touched: HashSet<String> = HashSet::new();
-    touched.insert(capsule.pivot.file_path.clone());
-    for n in &capsule.neighbors {
-        touched.insert(n.node.file_path.clone());
-    }
+    let touched = touched_paths_for_capsule(&capsule);
 
     // Read raw file contents from disk, sorted for deterministic output.
     let root_path: String = conn
@@ -409,6 +653,31 @@ pub fn get_context_capsule(
     } else {
         file_tokens_metadata_estimate(root.as_deref(), &touched)
     };
+    let baseline_source = baseline_token_source(mode, truncated_original);
+    let proof_snapshot = if mode == CapsuleOriginalMode::None {
+        build_bounded_proof_snapshot(root.as_deref(), &touched, baseline_source)
+    } else {
+        None
+    };
+    let proof_label = proof_snapshot
+        .as_ref()
+        .map(|p| p.proof_label.clone())
+        .unwrap_or_else(|| baseline_source.to_string());
+    let provenance = CapsuleProvenance {
+        baseline_token_source: baseline_source.to_string(),
+        tokenizer_mode: if mode == CapsuleOriginalMode::None {
+            "metadata_len/4".to_string()
+        } else {
+            "text_len/4".to_string()
+        },
+        original_mode: original_mode_label(mode).to_string(),
+        proof_label,
+        precise_file_tokens: false,
+        original_max_bytes: budget,
+        proof_max_bytes: capsule_proof_max_bytes(),
+        proof_max_files: capsule_proof_max_files(),
+        touched_file_count: touched.len(),
+    };
 
     // Append any stored observations for the pivot symbol.
     let observations = query_observations_for_capsule(
@@ -439,10 +708,10 @@ pub fn get_context_capsule(
         optimized_text,
         original_text,
         file_tokens,
+        proof_snapshot,
+        provenance,
     })
 }
-
-
 
 /// Core builder: builds a `ContextCapsule` from a pre-resolved pivot row.
 /// Shared by `get_context_capsule` and `trace_logic_flow`.
@@ -477,12 +746,21 @@ fn build_context_capsule_from_resolved(
          ORDER BY n.symbol_name, n.file_path
          LIMIT ?2",
     )?;
-    let outbound_rows: Vec<(String, String, String, String, String, String, String)> = outbound_stmt
-        .query_map(rusqlite::params![pivot_id, out_lim], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    let outbound_rows: Vec<(String, String, String, String, String, String, String)> =
+        outbound_stmt
+            .query_map(rusqlite::params![pivot_id, out_lim], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
     // ── Inbound edges: sources → pivot (things that call this symbol) ──
     let mut inbound_stmt = conn.prepare(
@@ -496,7 +774,15 @@ fn build_context_capsule_from_resolved(
     )?;
     let inbound_rows: Vec<(String, String, String, String, String, String, String)> = inbound_stmt
         .query_map(rusqlite::params![pivot_id, in_lim], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -546,7 +832,8 @@ fn format_capsule(capsule: &ContextCapsule) -> String {
         out,
         "CONTEXT CAPSULE — pivot: {} ({})",
         capsule.pivot.symbol_name, capsule.pivot.language
-    ).ok();
+    )
+    .ok();
     writeln!(out, "File : {}", capsule.pivot.file_path).ok();
     writeln!(out, "Type : {}", capsule.pivot.symbol_type).ok();
 
@@ -554,7 +841,11 @@ fn format_capsule(capsule: &ContextCapsule) -> String {
     if capsule.pivot.text.len() > max_pivot {
         // Auto-condense oversized pivots (e.g. large classes with hundreds of scopes/methods).
         let condensed = condense(&capsule.pivot.text, &capsule.pivot.language);
-        writeln!(out, "\n── CONDENSED SOURCE (pivot exceeded {max_pivot}B cap) ─────────────").ok();
+        writeln!(
+            out,
+            "\n── CONDENSED SOURCE (pivot exceeded {max_pivot}B cap) ─────────────"
+        )
+        .ok();
         writeln!(out, "{}", condensed).ok();
         writeln!(
             out,
@@ -562,44 +853,64 @@ fn format_capsule(capsule: &ContextCapsule) -> String {
              Use read_node or native file read for the complete body. \
              Set MARROW_CAPSULE_MAX_PIVOT_BYTES to adjust threshold.]",
             orig = capsule.pivot.text.len()
-        ).ok();
+        )
+        .ok();
     } else {
-        writeln!(out, "\n── FULL SOURCE ──────────────────────────────────────────────").ok();
+        writeln!(
+            out,
+            "\n── FULL SOURCE ──────────────────────────────────────────────"
+        )
+        .ok();
         writeln!(out, "{}", capsule.pivot.text).ok();
     }
 
-    let outbound: Vec<&NeighborInfo> = capsule.neighbors.iter()
+    let outbound: Vec<&NeighborInfo> = capsule
+        .neighbors
+        .iter()
         .filter(|n| n.direction == EdgeDirection::Outbound)
         .collect();
-    let inbound: Vec<&NeighborInfo> = capsule.neighbors.iter()
+    let inbound: Vec<&NeighborInfo> = capsule
+        .neighbors
+        .iter()
         .filter(|n| n.direction == EdgeDirection::Inbound)
         .collect();
 
     if outbound.is_empty() && inbound.is_empty() {
-        writeln!(out, "── NEIGHBORS ────────────────────────────────────────────────").ok();
+        writeln!(
+            out,
+            "── NEIGHBORS ────────────────────────────────────────────────"
+        )
+        .ok();
         writeln!(out, "  (none — isolated symbol)").ok();
         return out;
     }
 
     // ── Outbound: things this symbol calls/imports (signatures only) ─────────
     if !outbound.is_empty() {
-        writeln!(out, "\n── OUTBOUND DEPENDENCIES (signatures only — use read_node to expand) ──").ok();
+        writeln!(
+            out,
+            "\n── OUTBOUND DEPENDENCIES (signatures only — use read_node to expand) ──"
+        )
+        .ok();
         for n in &outbound {
             // Progressive disclosure: show only the first non-empty line (signature).
             // Full bodies are available via `run_pipeline` with `intent: "read_node"`.
-            let signature = n.node.text
+            let signature = n
+                .node
+                .text
                 .lines()
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or(&n.node.symbol_name);
             writeln!(
                 out,
                 "\n  [{rel}]  {name}  ({lang})  {path}\n  {sig}",
-                rel  = n.relationship,
+                rel = n.relationship,
                 name = n.node.symbol_name,
                 lang = n.node.language,
                 path = n.node.file_path,
-                sig  = signature,
-            ).ok();
+                sig = signature,
+            )
+            .ok();
         }
     }
 
@@ -614,31 +925,64 @@ fn format_capsule(capsule: &ContextCapsule) -> String {
 
     // ── Inbound: things that call this symbol (capped) ───────────────────────
     if !inbound.is_empty() {
-        writeln!(out, "\n── INBOUND CALLERS (who calls this) ─────────────────────────").ok();
+        writeln!(
+            out,
+            "\n── INBOUND CALLERS (who calls this) ─────────────────────────"
+        )
+        .ok();
         let shown = inbound.len().min(MAX_INBOUND_CALLERS);
         let omitted = inbound.len().saturating_sub(MAX_INBOUND_CALLERS);
         for n in &inbound[..shown] {
             writeln!(
                 out,
                 "  [{rel}]  {name}  ({lang})  {path}",
-                rel  = n.relationship,
+                rel = n.relationship,
                 name = n.node.symbol_name,
                 lang = n.node.language,
                 path = n.node.file_path,
-            ).ok();
+            )
+            .ok();
         }
         if omitted > 0 {
-            writeln!(out, "  [... and {omitted} more callers omitted for brevity]").ok();
+            writeln!(
+                out,
+                "  [... and {omitted} more callers omitted for brevity]"
+            )
+            .ok();
         }
     }
 
     // ── Progressive Disclosure CTA ────────────────────────────────────────────
-    writeln!(out, "\n─────────────────────────────────────────────────────────────────").ok();
-    writeln!(out, "MARROW PROGRESSIVE DISCLOSURE: The neighbor code bodies above are").ok();
-    writeln!(out, "intentionally condensed to signatures. To read the full source of").ok();
-    writeln!(out, "any neighbor, do NOT use native file-reading tools. Instead, call:").ok();
-    writeln!(out, "  run_pipeline(intent: \"read_node\", target: \"<SymbolName>\")").ok();
-    writeln!(out, "─────────────────────────────────────────────────────────────────").ok();
+    writeln!(
+        out,
+        "\n─────────────────────────────────────────────────────────────────"
+    )
+    .ok();
+    writeln!(
+        out,
+        "MARROW PROGRESSIVE DISCLOSURE: The neighbor code bodies above are"
+    )
+    .ok();
+    writeln!(
+        out,
+        "intentionally condensed to signatures. To read the full source of"
+    )
+    .ok();
+    writeln!(
+        out,
+        "any neighbor, do NOT use native file-reading tools. Instead, call:"
+    )
+    .ok();
+    writeln!(
+        out,
+        "  run_pipeline(intent: \"read_node\", target: \"<SymbolName>\")"
+    )
+    .ok();
+    writeln!(
+        out,
+        "─────────────────────────────────────────────────────────────────"
+    )
+    .ok();
 
     out
 }
@@ -744,8 +1088,20 @@ pub fn trace_logic_flow(
                 let file_tokens = payload.len() / 4;
                 return Ok(CapsuleResult {
                     optimized_text: payload.clone(),
-                    original_text: payload,
+                    original_text: String::new(),
                     file_tokens,
+                    proof_snapshot: None,
+                    provenance: CapsuleProvenance {
+                        baseline_token_source: "unavailable".to_string(),
+                        tokenizer_mode: "chars/4".to_string(),
+                        original_mode: "none".to_string(),
+                        proof_label: "unavailable".to_string(),
+                        precise_file_tokens: false,
+                        original_max_bytes: None,
+                        proof_max_bytes: capsule_proof_max_bytes(),
+                        proof_max_files: capsule_proof_max_files(),
+                        touched_file_count: 0,
+                    },
                 });
             }
         };
@@ -783,18 +1139,20 @@ pub fn trace_logic_flow(
             ))
         })?
         .filter_map(|r| r.ok())
-        .map(|(id, sym_name, sym_type, file_path, lang, raw_text, rel_type)| NeighborInfo {
-            node: NodeInfo {
-                id,
-                symbol_name: sym_name,
-                symbol_type: sym_type,
-                file_path,
-                language: lang.clone(),
-                text: condense(&raw_text, &lang),
+        .map(
+            |(id, sym_name, sym_type, file_path, lang, raw_text, rel_type)| NeighborInfo {
+                node: NodeInfo {
+                    id,
+                    symbol_name: sym_name,
+                    symbol_type: sym_type,
+                    file_path,
+                    language: lang.clone(),
+                    text: condense(&raw_text, &lang),
+                },
+                relationship: rel_type,
+                direction: EdgeDirection::Outbound,
             },
-            relationship: rel_type,
-            direction: EdgeDirection::Outbound,
-        })
+        )
         .collect();
 
     // Format the trace output: full pivot source + outbound-only signatures.
@@ -803,17 +1161,30 @@ pub fn trace_logic_flow(
         out,
         "TRACE FLOW — pivot: {} ({})",
         pivot.symbol_name, pivot.language
-    ).ok();
+    )
+    .ok();
     writeln!(out, "File : {}", pivot.file_path).ok();
     writeln!(out, "Type : {}", pivot.symbol_type).ok();
-    writeln!(out, "\n── FULL SOURCE ──────────────────────────────────────────────").ok();
+    writeln!(
+        out,
+        "\n── FULL SOURCE ──────────────────────────────────────────────"
+    )
+    .ok();
     writeln!(out, "{}", pivot.text).ok();
 
     if outbound.is_empty() {
-        writeln!(out, "── DIRECT CALLEES ─────────────────────────────────────────────").ok();
+        writeln!(
+            out,
+            "── DIRECT CALLEES ─────────────────────────────────────────────"
+        )
+        .ok();
         writeln!(out, "  (leaf node — no direct outbound calls)").ok();
     } else {
-        writeln!(out, "\n── DIRECT CALLEES (immediate outbound dependencies) ─────────────").ok();
+        writeln!(
+            out,
+            "\n── DIRECT CALLEES (immediate outbound dependencies) ─────────────"
+        )
+        .ok();
         if outbound.len() >= capsule_max_outbound_neighbors() {
             writeln!(
                 out,
@@ -826,11 +1197,12 @@ pub fn trace_logic_flow(
             writeln!(
                 out,
                 "  [{rel}]  {name}  ({lang})  {path}",
-                rel  = n.relationship,
+                rel = n.relationship,
                 name = n.node.symbol_name,
                 lang = n.node.language,
                 path = n.node.file_path,
-            ).ok();
+            )
+            .ok();
             writeln!(out, "{}", n.node.text).ok();
         }
     }
@@ -838,8 +1210,20 @@ pub fn trace_logic_flow(
     let file_tokens = out.len() / 4;
     Ok(CapsuleResult {
         optimized_text: out.clone(),
-        original_text: out,
+        original_text: String::new(),
         file_tokens,
+        proof_snapshot: None,
+        provenance: CapsuleProvenance {
+            baseline_token_source: "trace_output".to_string(),
+            tokenizer_mode: "chars/4".to_string(),
+            original_mode: "none".to_string(),
+            proof_label: "unavailable".to_string(),
+            precise_file_tokens: false,
+            original_max_bytes: None,
+            proof_max_bytes: capsule_proof_max_bytes(),
+            proof_max_files: capsule_proof_max_files(),
+            touched_file_count: 0,
+        },
     })
 }
 
@@ -937,9 +1321,16 @@ fn resolve_symbol_or_disambiguate(
     };
 
     match candidates.len() {
-        0 => Err(anyhow!("Symbol '{}' not found in repo '{}'", symbol_name, repo_id)),
+        0 => Err(anyhow!(
+            "Symbol '{}' not found in repo '{}'",
+            symbol_name,
+            repo_id
+        )),
         1 => Ok(SymbolResolution::Unique(
-            candidates.into_iter().next().expect("single candidate must exist"),
+            candidates
+                .into_iter()
+                .next()
+                .expect("single candidate must exist"),
         )),
         n => {
             let _ = crate::db::increment_stat(conn, "ambiguous_symbol_requests", 1);
@@ -966,8 +1357,6 @@ fn resolve_symbol_or_disambiguate(
     }
 }
 
-
-
 fn resolve_repo_file_path(root_path: &Path, rel_path: &str) -> Result<PathBuf> {
     let rel = PathBuf::from(rel_path);
     if rel.is_absolute() {
@@ -977,11 +1366,13 @@ fn resolve_repo_file_path(root_path: &Path, rel_path: &str) -> Result<PathBuf> {
         ));
     }
 
-    let root = root_path.canonicalize().unwrap_or_else(|_| root_path.to_path_buf());
+    let root = root_path
+        .canonicalize()
+        .unwrap_or_else(|_| root_path.to_path_buf());
     let candidate = root.join(&rel);
-    let canonical = candidate.canonicalize().map_err(|e| {
-        anyhow!("Indexed file '{}' is missing on disk: {}", rel_path, e)
-    })?;
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|e| anyhow!("Indexed file '{}' is missing on disk: {}", rel_path, e))?;
     if !canonical.starts_with(&root) {
         return Err(anyhow!(
             "Indexed file '{}' resolves outside the repository root and cannot be trusted.",
@@ -1079,11 +1470,7 @@ fn condense_ruby(raw_text: &str) -> String {
 /// Collecting byte ranges into a Vec before any string ops sidesteps the
 /// borrow-checker conflict between the streaming iterator (which borrows
 /// `cursor` and `tree`) and the subsequent `&raw_text[..]` slices.
-fn find_outermost_body(
-    raw_text: &str,
-    lang: Language,
-    query_src: &str,
-) -> Option<(usize, usize)> {
+fn find_outermost_body(raw_text: &str, lang: Language, query_src: &str) -> Option<(usize, usize)> {
     let mut parser = Parser::new();
     parser.set_language(&lang).ok()?;
     let tree = parser.parse(raw_text, None)?;
@@ -1129,13 +1516,11 @@ pub fn get_project_skeleton(
         |row| row.get(0),
     )?;
     if total == 0 {
-        return Ok(
-            format!(
-                "No symbols found for repo '{}'. The repository has not been indexed yet.\n\
+        return Ok(format!(
+            "No symbols found for repo '{}'. The repository has not been indexed yet.\n\
                  Run the `ingest_repo` tool to build the AST graph before using `get_skeleton`.",
-                repo_id
-            ),
-        );
+            repo_id
+        ));
     }
 
     let base_sql = "SELECT file_path, symbol_type, symbol_name \
@@ -1181,7 +1566,11 @@ pub fn get_project_skeleton(
         let prefix = format!("{}/%", exact);
         let mut stmt = conn.prepare(dir_sql)?;
         let rows = stmt.query_map(rusqlite::params![repo_id, limit, exact, prefix], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         for row in rows.filter_map(|r| r.ok()) {
             map.entry(row.0).or_default().push((row.1, row.2));
@@ -1190,7 +1579,11 @@ pub fn get_project_skeleton(
     } else {
         let mut stmt = conn.prepare(base_sql)?;
         let rows = stmt.query_map(rusqlite::params![repo_id, limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
         for row in rows.filter_map(|r| r.ok()) {
             map.entry(row.0).or_default().push((row.1, row.2));
@@ -1199,11 +1592,9 @@ pub fn get_project_skeleton(
     }
 
     if map.is_empty() {
-        return Ok(
-            "No matching symbols found for the given filter.\n\
+        return Ok("No matching symbols found for the given filter.\n\
              Try a different `target_dir` or check that the repo is indexed."
-                .to_string(),
-        );
+            .to_string());
     }
 
     let mut out = String::new();
@@ -1310,8 +1701,17 @@ mod tests {
             "def foo():\n    return 42\n",
         );
         let result = get_context_capsule(&conn, "foo", "r", None).unwrap();
-        assert!(result.optimized_text.contains("foo"), "symbol name missing: {}", result.optimized_text);
-        assert!(result.optimized_text.contains("def foo():\n    return 42\n"), "pivot text missing");
+        assert!(
+            result.optimized_text.contains("foo"),
+            "symbol name missing: {}",
+            result.optimized_text
+        );
+        assert!(
+            result
+                .optimized_text
+                .contains("def foo():\n    return 42\n"),
+            "pivot text missing"
+        );
     }
 
     #[test]
@@ -1330,7 +1730,8 @@ mod tests {
         let result = get_context_capsule(&conn, "solo", "r", None).unwrap();
         assert!(
             result.optimized_text.contains("none — isolated symbol"),
-            "isolated marker missing: {}", result.optimized_text
+            "isolated marker missing: {}",
+            result.optimized_text
         );
     }
 
@@ -1362,10 +1763,22 @@ mod tests {
         let result = get_context_capsule(&conn, "caller", "r", None).unwrap();
         let text = &result.optimized_text;
         // Progressive disclosure: neighbor bodies are not emitted — only the first line (signature).
-        assert!(!text.contains("return x"), "neighbor body must not appear in progressive output, got: {text}");
-        assert!(text.contains("def bar"), "neighbor signature must be preserved, got: {text}");
-        assert!(text.contains("CALLS"), "relationship type must appear, got: {text}");
-        assert!(text.contains("read_node"), "CTA for read_node must be present, got: {text}");
+        assert!(
+            !text.contains("return x"),
+            "neighbor body must not appear in progressive output, got: {text}"
+        );
+        assert!(
+            text.contains("def bar"),
+            "neighbor signature must be preserved, got: {text}"
+        );
+        assert!(
+            text.contains("CALLS"),
+            "relationship type must appear, got: {text}"
+        );
+        assert!(
+            text.contains("read_node"),
+            "CTA for read_node must be present, got: {text}"
+        );
     }
 
     #[test]
@@ -1396,17 +1809,35 @@ mod tests {
         let result = get_context_capsule(&conn, "main_fn", "r", None).unwrap();
         let text = &result.optimized_text;
         // Progressive disclosure: neighbor shows only first line (signature), no body stubs.
-        assert!(!text.contains("x += 1"), "neighbor body must not appear in progressive output, got: {text}");
+        assert!(
+            !text.contains("x += 1"),
+            "neighbor body must not appear in progressive output, got: {text}"
+        );
         assert!(text.contains("helper"), "neighbor name missing: {text}");
-        assert!(text.contains("void helper"), "C++ neighbor signature must appear, got: {text}");
-        assert!(text.contains("read_node"), "CTA for read_node must be present, got: {text}");
+        assert!(
+            text.contains("void helper"),
+            "C++ neighbor signature must appear, got: {text}"
+        );
+        assert!(
+            text.contains("read_node"),
+            "CTA for read_node must be present, got: {text}"
+        );
     }
 
     #[test]
     fn capsule_cpp_forward_decl_returns_full_text() {
         let conn = make_db();
         let fwd = "class Widget;";
-        insert_node(&conn, "r:w.h:Widget", "r", "w.h", "cpp", "Widget", "class", fwd);
+        insert_node(
+            &conn,
+            "r:w.h:Widget",
+            "r",
+            "w.h",
+            "cpp",
+            "Widget",
+            "class",
+            fwd,
+        );
         insert_node(
             &conn,
             "r:w.cpp:processWidget",
@@ -1422,7 +1853,8 @@ mod tests {
         let result = get_context_capsule(&conn, "processWidget", "r", None).unwrap();
         assert!(
             result.optimized_text.contains(fwd),
-            "forward declaration should appear verbatim in output: {}", result.optimized_text
+            "forward declaration should appear verbatim in output: {}",
+            result.optimized_text
         );
     }
 
@@ -1453,7 +1885,10 @@ mod tests {
 
         let result = get_context_capsule(&conn, "entrypoint", "r", None).unwrap();
         let text = &result.optimized_text;
-        assert!(text.contains("{ /* ... */ }"), "TS body should be replaced, got: {text}");
+        assert!(
+            text.contains("{ /* ... */ }"),
+            "TS body should be replaced, got: {text}"
+        );
         assert!(!text.contains("toISOString"), "body leaked: {text}");
         assert!(text.contains("formatDate"), "neighbor name missing: {text}");
     }
@@ -1491,10 +1926,22 @@ mod tests {
         // Disambiguation is now returned as Ok(CapsuleResult) so agents can parse and retry.
         let result = get_context_capsule(&conn, "bulk_update", "r", None).unwrap();
         let msg = &result.optimized_text;
-        assert!(msg.contains("Found 2 matches"), "expected disambiguation payload: {msg}");
-        assert!(msg.contains("src/a.py"), "expected first candidate path: {msg}");
-        assert!(msg.contains("src/b.py"), "expected second candidate path: {msg}");
-        assert!(msg.contains("run_pipeline"), "payload must guide agent to retry: {msg}");
+        assert!(
+            msg.contains("Found 2 matches"),
+            "expected disambiguation payload: {msg}"
+        );
+        assert!(
+            msg.contains("src/a.py"),
+            "expected first candidate path: {msg}"
+        );
+        assert!(
+            msg.contains("src/b.py"),
+            "expected second candidate path: {msg}"
+        );
+        assert!(
+            msg.contains("run_pipeline"),
+            "payload must guide agent to retry: {msg}"
+        );
     }
 
     // ── analyze_impact ────────────────────────────────────────────────────────
@@ -1551,16 +1998,51 @@ mod tests {
     #[test]
     fn impact_multi_hop_traversal_with_correct_depths() {
         let conn = make_db();
-        insert_node(&conn, "r:a.py:base", "r", "a.py", "py", "base", "function", "def base(): pass\n");
-        insert_node(&conn, "r:a.py:mid", "r", "a.py", "py", "mid", "function", "def mid(): base()\n");
-        insert_node(&conn, "r:a.py:top", "r", "a.py", "py", "top", "function", "def top(): mid()\n");
+        insert_node(
+            &conn,
+            "r:a.py:base",
+            "r",
+            "a.py",
+            "py",
+            "base",
+            "function",
+            "def base(): pass\n",
+        );
+        insert_node(
+            &conn,
+            "r:a.py:mid",
+            "r",
+            "a.py",
+            "py",
+            "mid",
+            "function",
+            "def mid(): base()\n",
+        );
+        insert_node(
+            &conn,
+            "r:a.py:top",
+            "r",
+            "a.py",
+            "py",
+            "top",
+            "function",
+            "def top(): mid()\n",
+        );
         insert_edge(&conn, "r:a.py:mid", "r:a.py:base", "CALLS");
         insert_edge(&conn, "r:a.py:top", "r:a.py:mid", "CALLS");
 
         let result = analyze_impact(&conn, "base", "r", None).unwrap();
         assert_eq!(result.affected.len(), 2);
-        let mid = result.affected.iter().find(|n| n.symbol_name == "mid").unwrap();
-        let top = result.affected.iter().find(|n| n.symbol_name == "top").unwrap();
+        let mid = result
+            .affected
+            .iter()
+            .find(|n| n.symbol_name == "mid")
+            .unwrap();
+        let top = result
+            .affected
+            .iter()
+            .find(|n| n.symbol_name == "top")
+            .unwrap();
         assert_eq!(mid.depth, 1);
         assert_eq!(top.depth, 2);
     }
@@ -1588,7 +2070,12 @@ mod tests {
             "function",
             "def main(): pass\n",
         );
-        insert_edge(&conn, "repo_a:app.py:main", "repo_b:lib.ts:ApiClient", "IMPORTS");
+        insert_edge(
+            &conn,
+            "repo_a:app.py:main",
+            "repo_b:lib.ts:ApiClient",
+            "IMPORTS",
+        );
 
         let result = analyze_impact(&conn, "ApiClient", "repo_b", None).unwrap();
         assert_eq!(result.affected.len(), 1);
@@ -1629,11 +2116,24 @@ mod tests {
 
         // Disambiguation is now returned as Ok(ImpactResult) with DISAMBIGUATION: prefix.
         let result = analyze_impact(&conn, "bulk_update", "r", None).unwrap();
-        assert!(result.pivot_id.starts_with("DISAMBIGUATION:"), "expected disambig pivot_id: {}", result.pivot_id);
+        assert!(
+            result.pivot_id.starts_with("DISAMBIGUATION:"),
+            "expected disambig pivot_id: {}",
+            result.pivot_id
+        );
         let msg = &result.pivot_id["DISAMBIGUATION:".len()..];
-        assert!(msg.contains("Found 2 matches"), "expected disambiguation payload: {msg}");
-        assert!(msg.contains("src/a.py"), "expected first candidate path: {msg}");
-        assert!(msg.contains("src/b.py"), "expected second candidate path: {msg}");
+        assert!(
+            msg.contains("Found 2 matches"),
+            "expected disambiguation payload: {msg}"
+        );
+        assert!(
+            msg.contains("src/a.py"),
+            "expected first candidate path: {msg}"
+        );
+        assert!(
+            msg.contains("src/b.py"),
+            "expected second candidate path: {msg}"
+        );
     }
 
     // ── get_project_skeleton ──────────────────────────────────────────────────
@@ -1648,61 +2148,172 @@ mod tests {
     #[test]
     fn skeleton_lists_functions_and_classes_grouped_by_file() {
         let conn = make_db();
-        insert_node(&conn, "r:a.rs:main",   "r", "src/a.rs", "rs", "main",   "function", "fn main() {}");
-        insert_node(&conn, "r:a.rs:Foo",    "r", "src/a.rs", "rs", "Foo",    "struct",   "struct Foo {}");
-        insert_node(&conn, "r:b.py:helper", "r", "src/b.py", "py", "helper", "function", "def helper(): pass");
+        insert_node(
+            &conn,
+            "r:a.rs:main",
+            "r",
+            "src/a.rs",
+            "rs",
+            "main",
+            "function",
+            "fn main() {}",
+        );
+        insert_node(
+            &conn,
+            "r:a.rs:Foo",
+            "r",
+            "src/a.rs",
+            "rs",
+            "Foo",
+            "struct",
+            "struct Foo {}",
+        );
+        insert_node(
+            &conn,
+            "r:b.py:helper",
+            "r",
+            "src/b.py",
+            "py",
+            "helper",
+            "function",
+            "def helper(): pass",
+        );
         // Variable — should NOT appear
-        insert_node(&conn, "r:a.rs:X", "r", "src/a.rs", "rs", "X", "variable", "let x = 1;");
+        insert_node(
+            &conn,
+            "r:a.rs:X",
+            "r",
+            "src/a.rs",
+            "rs",
+            "X",
+            "variable",
+            "let x = 1;",
+        );
 
         let out = get_project_skeleton(&conn, "r", None).unwrap();
         assert!(out.contains("src/a.rs"), "a.rs missing: {out}");
         assert!(out.contains("src/b.py"), "b.py missing: {out}");
-        assert!(out.contains("[function] main"),   "main missing: {out}");
-        assert!(out.contains("[struct] Foo"),      "Foo missing: {out}");
+        assert!(out.contains("[function] main"), "main missing: {out}");
+        assert!(out.contains("[struct] Foo"), "Foo missing: {out}");
         assert!(out.contains("[function] helper"), "helper missing: {out}");
-        assert!(!out.contains("[variable]"),       "variable should be filtered: {out}");
+        assert!(
+            !out.contains("[variable]"),
+            "variable should be filtered: {out}"
+        );
     }
 
     #[test]
     fn skeleton_target_dir_filters_to_prefix() {
         let conn = make_db();
-        insert_node(&conn, "r:a:fn1", "r", "src/api/a.rs",  "rs", "fn1", "function", "fn fn1() {}");
-        insert_node(&conn, "r:b:fn2", "r", "src/core/b.rs", "rs", "fn2", "function", "fn fn2() {}");
+        insert_node(
+            &conn,
+            "r:a:fn1",
+            "r",
+            "src/api/a.rs",
+            "rs",
+            "fn1",
+            "function",
+            "fn fn1() {}",
+        );
+        insert_node(
+            &conn,
+            "r:b:fn2",
+            "r",
+            "src/core/b.rs",
+            "rs",
+            "fn2",
+            "function",
+            "fn fn2() {}",
+        );
 
         let out = get_project_skeleton(&conn, "r", Some("src/api")).unwrap();
-        assert!(out.contains("fn1"),  "fn1 missing: {out}");
+        assert!(out.contains("fn1"), "fn1 missing: {out}");
         assert!(!out.contains("fn2"), "fn2 should be filtered: {out}");
     }
 
     #[test]
     fn skeleton_target_dir_does_not_match_sibling_prefixes() {
         let conn = make_db();
-        insert_node(&conn, "r:a:fn1", "r", "src/api/a.rs", "rs", "fn1", "function", "fn fn1() {}");
-        insert_node(&conn, "r:b:fn2", "r", "src/api_old/b.rs", "rs", "fn2", "function", "fn fn2() {}");
+        insert_node(
+            &conn,
+            "r:a:fn1",
+            "r",
+            "src/api/a.rs",
+            "rs",
+            "fn1",
+            "function",
+            "fn fn1() {}",
+        );
+        insert_node(
+            &conn,
+            "r:b:fn2",
+            "r",
+            "src/api_old/b.rs",
+            "rs",
+            "fn2",
+            "function",
+            "fn fn2() {}",
+        );
 
         let out = get_project_skeleton(&conn, "r", Some("src/api")).unwrap();
         assert!(out.contains("fn1"), "expected api symbol: {out}");
-        assert!(!out.contains("fn2"), "sibling prefix should not match target_dir: {out}");
+        assert!(
+            !out.contains("fn2"),
+            "sibling prefix should not match target_dir: {out}"
+        );
     }
 
     #[test]
     fn skeleton_no_matching_nodes_after_filter_returns_message() {
         let conn = make_db();
-        insert_node(&conn, "r:a:fn1", "r", "src/a.rs", "rs", "fn1", "function", "fn fn1() {}");
+        insert_node(
+            &conn,
+            "r:a:fn1",
+            "r",
+            "src/a.rs",
+            "rs",
+            "fn1",
+            "function",
+            "fn fn1() {}",
+        );
 
         let out = get_project_skeleton(&conn, "r", Some("src/nonexistent")).unwrap();
-        assert!(out.contains("No matching symbols"), "expected no-match message: {out}");
+        assert!(
+            out.contains("No matching symbols"),
+            "expected no-match message: {out}"
+        );
     }
 
     #[test]
     fn skeleton_only_lists_symbols_for_requested_repo() {
         let conn = make_db();
-        insert_node(&conn, "repo_a:a:fn1", "repo_a", "src/a.rs", "rs", "fn1", "function", "fn fn1() {}");
-        insert_node(&conn, "repo_b:b:fn2", "repo_b", "src/b.rs", "rs", "fn2", "function", "fn fn2() {}");
+        insert_node(
+            &conn,
+            "repo_a:a:fn1",
+            "repo_a",
+            "src/a.rs",
+            "rs",
+            "fn1",
+            "function",
+            "fn fn1() {}",
+        );
+        insert_node(
+            &conn,
+            "repo_b:b:fn2",
+            "repo_b",
+            "src/b.rs",
+            "rs",
+            "fn2",
+            "function",
+            "fn fn2() {}",
+        );
 
         let out = get_project_skeleton(&conn, "repo_a", None).unwrap();
         assert!(out.contains("fn1"), "repo_a symbol missing: {out}");
-        assert!(!out.contains("fn2"), "repo_b symbol leaked into repo_a output: {out}");
+        assert!(
+            !out.contains("fn2"),
+            "repo_b symbol leaked into repo_a output: {out}"
+        );
     }
 
     #[test]
@@ -1724,8 +2335,15 @@ mod tests {
 
         // Missing file on disk should not crash — capsule still succeeds.
         let result = get_context_capsule(&conn, "foo", "r", None).unwrap();
-        assert!(result.optimized_text.contains("foo"), "pivot should still be present: {}", result.optimized_text);
-        assert!(result.original_text.is_empty(), "original_text should be empty when file is missing");
+        assert!(
+            result.optimized_text.contains("foo"),
+            "pivot should still be present: {}",
+            result.optimized_text
+        );
+        assert!(
+            result.original_text.is_empty(),
+            "original_text should be empty when file is missing"
+        );
     }
 
     #[test]
@@ -1799,6 +2417,17 @@ mod tests {
         assert!(result.original_text.is_empty());
         assert!(!result.optimized_text.is_empty());
         assert_eq!(result.file_tokens, 3, "4/4 + 8/4 = 1 + 2");
+        assert_eq!(result.provenance.baseline_token_source, "estimated");
+        assert_eq!(result.provenance.original_mode, "none");
+        let proof = result
+            .proof_snapshot
+            .as_ref()
+            .expect("default mode should include bounded proof");
+        assert!(
+            proof.proof_text.contains("aaaa"),
+            "proof should include touched source sample: {proof:?}"
+        );
+        assert_eq!(proof.token_source, "estimated");
 
         // Same DB + `MARROW_CAPSULE_ORIGINAL_LEGACY=1` → full concat for one release.
         std::env::set_var("MARROW_CAPSULE_ORIGINAL_LEGACY", "1");
@@ -1811,14 +2440,183 @@ mod tests {
         std::env::remove_var("MARROW_CAPSULE_ORIGINAL_LEGACY");
     }
 
+    #[test]
+    fn capsule_full_mode_labels_full_and_truncated_full_provenance() {
+        let _g = CAPSULE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("MARROW_CAPSULE_ORIGINAL_MODE", "full");
+        std::env::remove_var("MARROW_CAPSULE_ORIGINAL_LEGACY");
+        std::env::remove_var("MARROW_CAPSULE_ORIGINAL_MAX_BYTES");
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.py"), "aaaa").unwrap();
+        fs::write(root.join("src/b.py"), "bbbbbbbbbbbbbbbb").unwrap();
+
+        let conn = make_db();
+        insert_repo(&conn, "r", &root.to_string_lossy());
+        insert_node(
+            &conn,
+            "r:src/a.py:fa",
+            "r",
+            "src/a.py",
+            "py",
+            "fa",
+            "function",
+            "def fa(): pass",
+        );
+        insert_node(
+            &conn,
+            "r:src/b.py:fb",
+            "r",
+            "src/b.py",
+            "py",
+            "fb",
+            "function",
+            "def fb(): pass",
+        );
+        insert_edge(&conn, "r:src/a.py:fa", "r:src/b.py:fb", "CALLS");
+
+        let full = get_context_capsule(&conn, "fa", "r", None).unwrap();
+        assert!(full.original_text.contains("aaaa"));
+        assert!(full.original_text.contains("bbbbbbbbbbbbbbbb"));
+        assert!(full.proof_snapshot.is_none());
+        assert_eq!(full.provenance.baseline_token_source, "full");
+        assert_eq!(full.provenance.original_mode, "full");
+        assert_eq!(full.provenance.proof_label, "full");
+        assert_eq!(full.provenance.original_max_bytes, None);
+
+        std::env::set_var("MARROW_CAPSULE_ORIGINAL_MAX_BYTES", "8");
+        let truncated = get_context_capsule(&conn, "fa", "r", None).unwrap();
+        assert!(truncated.original_text.contains("aaaa"));
+        assert!(truncated.original_text.contains("original_text truncated"));
+        assert!(truncated.proof_snapshot.is_none());
+        assert_eq!(truncated.provenance.baseline_token_source, "truncated_full");
+        assert_eq!(truncated.provenance.proof_label, "truncated_full");
+        assert_eq!(truncated.provenance.original_max_bytes, Some(8));
+
+        std::env::remove_var("MARROW_CAPSULE_ORIGINAL_MODE");
+        std::env::remove_var("MARROW_CAPSULE_ORIGINAL_MAX_BYTES");
+    }
+
+    #[test]
+    fn precise_token_measurement_reports_failed_touched_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let conn = make_db();
+        insert_repo(&conn, "r", &root);
+        insert_node(
+            &conn,
+            "r:src/missing.py:fa",
+            "r",
+            "src/missing.py",
+            "py",
+            "fa",
+            "function",
+            "def fa(): pass",
+        );
+
+        let measured = measure_precise_tokens_touched_by_capsule(&conn, "fa", "r", None).unwrap();
+        assert_eq!(measured.tokens, 0);
+        assert_eq!(measured.touched_file_count, 1);
+        assert_eq!(measured.measured_file_count, 0);
+        assert_eq!(measured.failed_paths, vec!["src/missing.py".to_string()]);
+        assert_eq!(measured.tokenizer_mode, "cl100k_base");
+    }
+
+    #[test]
+    fn capsule_proof_reports_sampling_and_truncation_bounds() {
+        let _g = CAPSULE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("MARROW_CAPSULE_ORIGINAL_MODE");
+        std::env::remove_var("MARROW_CAPSULE_ORIGINAL_LEGACY");
+        std::env::set_var("MARROW_CAPSULE_PROOF_MAX_BYTES", "64");
+        std::env::set_var("MARROW_CAPSULE_PROOF_MAX_FILES", "1");
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/a.py"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+        fs::write(root.join("src/b.py"), "bbbbbbbb").unwrap();
+
+        let conn = make_db();
+        insert_repo(&conn, "r", &root.to_string_lossy());
+        insert_node(
+            &conn,
+            "r:src/a.py:fa",
+            "r",
+            "src/a.py",
+            "py",
+            "fa",
+            "function",
+            "def fa(): pass",
+        );
+        insert_node(
+            &conn,
+            "r:src/b.py:fb",
+            "r",
+            "src/b.py",
+            "py",
+            "fb",
+            "function",
+            "def fb(): pass",
+        );
+        insert_edge(&conn, "r:src/a.py:fa", "r:src/b.py:fb", "CALLS");
+
+        let result = get_context_capsule(&conn, "fa", "r", None).unwrap();
+        let proof = result.proof_snapshot.expect("proof snapshot");
+        assert!(
+            proof.sampled,
+            "many touched files should be sampled: {proof:?}"
+        );
+        assert!(
+            proof.truncated,
+            "small proof byte cap should truncate: {proof:?}"
+        );
+        assert_eq!(proof.max_bytes, 64);
+        assert_eq!(proof.max_files, 1);
+
+        std::env::remove_var("MARROW_CAPSULE_PROOF_MAX_BYTES");
+        std::env::remove_var("MARROW_CAPSULE_PROOF_MAX_FILES");
+    }
+
+    #[test]
+    fn trace_flow_omits_original_text_payload() {
+        let conn = make_db();
+        insert_node(
+            &conn,
+            "r:src/a.py:fa",
+            "r",
+            "src/a.py",
+            "py",
+            "fa",
+            "function",
+            "def fa(): pass",
+        );
+
+        let result = trace_logic_flow(&conn, "fa", "r", None).unwrap();
+        assert!(result.original_text.is_empty());
+        assert!(result.proof_snapshot.is_none());
+        assert_eq!(result.provenance.original_mode, "none");
+    }
+
     // ── condense (unit tests on raw text) ──────────────────────────────────
 
     #[test]
     fn condense_cpp_function_replaces_body() {
         let raw = "void process(int x) {\n    x += 1;\n    return;\n}";
         let result = condense(raw, "cpp");
-        assert!(result.contains("process(int x)"), "signature lost: {result}");
-        assert!(result.contains("{ /* ... */ }"), "placeholder missing: {result}");
+        assert!(
+            result.contains("process(int x)"),
+            "signature lost: {result}"
+        );
+        assert!(
+            result.contains("{ /* ... */ }"),
+            "placeholder missing: {result}"
+        );
         assert!(!result.contains("x += 1"), "body leaked: {result}");
     }
 
@@ -1832,8 +2630,14 @@ mod tests {
     fn condense_py_function_replaces_body_with_pass() {
         let raw = "def compute(n):\n    total = 0\n    return total\n";
         let result = condense(raw, "py");
-        assert!(result.contains("def compute(n):"), "signature lost: {result}");
-        assert!(result.contains("pass"), "pass placeholder missing: {result}");
+        assert!(
+            result.contains("def compute(n):"),
+            "signature lost: {result}"
+        );
+        assert!(
+            result.contains("pass"),
+            "pass placeholder missing: {result}"
+        );
         assert!(!result.contains("total"), "body leaked: {result}");
     }
 
@@ -1841,8 +2645,14 @@ mod tests {
     fn condense_ts_function_replaces_body() {
         let raw = "function greet(name: string): string {\n    return `Hello ${name}`;\n}";
         let result = condense(raw, "ts");
-        assert!(result.contains("greet(name: string)"), "signature lost: {result}");
-        assert!(result.contains("{ /* ... */ }"), "placeholder missing: {result}");
+        assert!(
+            result.contains("greet(name: string)"),
+            "signature lost: {result}"
+        );
+        assert!(
+            result.contains("{ /* ... */ }"),
+            "placeholder missing: {result}"
+        );
         assert!(!result.contains("Hello"), "body leaked: {result}");
     }
 
@@ -1850,8 +2660,14 @@ mod tests {
     fn condense_rust_function_replaces_body() {
         let raw = "fn compute(n: u32) -> u32 {\n    let x = n * 2;\n    x\n}";
         let result = condense(raw, "rs");
-        assert!(result.contains("fn compute(n: u32)"), "signature lost: {result}");
-        assert!(result.contains("{ /* ... */ }"), "placeholder missing: {result}");
+        assert!(
+            result.contains("fn compute(n: u32)"),
+            "signature lost: {result}"
+        );
+        assert!(
+            result.contains("{ /* ... */ }"),
+            "placeholder missing: {result}"
+        );
         assert!(!result.contains("n * 2"), "body leaked: {result}");
     }
 
@@ -1860,7 +2676,10 @@ mod tests {
         let raw = "def greet(name)\n  puts name\n  name.upcase\nend\n";
         let result = condense(raw, "rb");
         assert!(result.contains("def greet"), "signature lost: {result}");
-        assert!(result.contains("end"), "`end` keyword must be preserved: {result}");
+        assert!(
+            result.contains("end"),
+            "`end` keyword must be preserved: {result}"
+        );
         assert!(result.contains("# ..."), "placeholder missing: {result}");
         assert!(!result.contains("puts name"), "body leaked: {result}");
     }
@@ -1870,7 +2689,10 @@ mod tests {
         // Verifies the byte-range replacement does NOT consume the closing `end`.
         let raw = "def foo\n  x = 1\nend\n";
         let result = condense(raw, "rb");
-        assert!(result.ends_with("end\n"), "`end` must close the method: {result}");
+        assert!(
+            result.ends_with("end\n"),
+            "`end` must close the method: {result}"
+        );
     }
 
     // ── Filepath disambiguation ───────────────────────────────────────────
@@ -1879,22 +2701,36 @@ mod tests {
     fn capsule_disambiguates_by_filepath() {
         let conn = make_db();
         insert_node(
-            &conn, "r:src/a.py:bulk_update", "r", "src/a.py", "py",
-            "bulk_update", "function", "def bulk_update():\n    return 'a'\n",
+            &conn,
+            "r:src/a.py:bulk_update",
+            "r",
+            "src/a.py",
+            "py",
+            "bulk_update",
+            "function",
+            "def bulk_update():\n    return 'a'\n",
         );
         insert_node(
-            &conn, "r:src/b.py:bulk_update", "r", "src/b.py", "py",
-            "bulk_update", "function", "def bulk_update():\n    return 'b'\n",
+            &conn,
+            "r:src/b.py:bulk_update",
+            "r",
+            "src/b.py",
+            "py",
+            "bulk_update",
+            "function",
+            "def bulk_update():\n    return 'b'\n",
         );
 
         let result = get_context_capsule(&conn, "bulk_update", "r", Some("src/a.py")).unwrap();
         assert!(
             result.optimized_text.contains("return 'a'"),
-            "should resolve to src/a.py variant: {}", result.optimized_text
+            "should resolve to src/a.py variant: {}",
+            result.optimized_text
         );
         assert!(
             !result.optimized_text.contains("return 'b'"),
-            "src/b.py variant should not appear: {}", result.optimized_text
+            "src/b.py variant should not appear: {}",
+            result.optimized_text
         );
     }
 
@@ -1902,11 +2738,18 @@ mod tests {
     fn capsule_filepath_mismatch_returns_not_found() {
         let conn = make_db();
         insert_node(
-            &conn, "r:src/a.py:bulk_update", "r", "src/a.py", "py",
-            "bulk_update", "function", "def bulk_update():\n    pass\n",
+            &conn,
+            "r:src/a.py:bulk_update",
+            "r",
+            "src/a.py",
+            "py",
+            "bulk_update",
+            "function",
+            "def bulk_update():\n    pass\n",
         );
 
-        let err = get_context_capsule(&conn, "bulk_update", "r", Some("src/nonexistent.py")).unwrap_err();
+        let err =
+            get_context_capsule(&conn, "bulk_update", "r", Some("src/nonexistent.py")).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not found"), "expected not-found error: {msg}");
     }
@@ -1915,18 +2758,41 @@ mod tests {
     fn impact_disambiguates_by_filepath() {
         let conn = make_db();
         insert_node(
-            &conn, "r:src/a.py:bulk_update", "r", "src/a.py", "py",
-            "bulk_update", "function", "def bulk_update():\n    return 'a'\n",
+            &conn,
+            "r:src/a.py:bulk_update",
+            "r",
+            "src/a.py",
+            "py",
+            "bulk_update",
+            "function",
+            "def bulk_update():\n    return 'a'\n",
         );
         insert_node(
-            &conn, "r:src/b.py:bulk_update", "r", "src/b.py", "py",
-            "bulk_update", "function", "def bulk_update():\n    return 'b'\n",
+            &conn,
+            "r:src/b.py:bulk_update",
+            "r",
+            "src/b.py",
+            "py",
+            "bulk_update",
+            "function",
+            "def bulk_update():\n    return 'b'\n",
         );
         insert_node(
-            &conn, "r:src/a.py:caller", "r", "src/a.py", "py",
-            "caller", "function", "def caller(): bulk_update()\n",
+            &conn,
+            "r:src/a.py:caller",
+            "r",
+            "src/a.py",
+            "py",
+            "caller",
+            "function",
+            "def caller(): bulk_update()\n",
         );
-        insert_edge(&conn, "r:src/a.py:caller", "r:src/a.py:bulk_update", "CALLS");
+        insert_edge(
+            &conn,
+            "r:src/a.py:caller",
+            "r:src/a.py:bulk_update",
+            "CALLS",
+        );
 
         let result = analyze_impact(&conn, "bulk_update", "r", Some("src/a.py")).unwrap();
         assert_eq!(result.affected.len(), 1);
@@ -1947,7 +2813,16 @@ mod tests {
             big_body.len(),
             DEFAULT_MAX_PIVOT_BYTES
         );
-        insert_node(&conn, "r:m.rb:BigModel", "r", "m.rb", "rb", "BigModel", "class", &big_body);
+        insert_node(
+            &conn,
+            "r:m.rb:BigModel",
+            "r",
+            "m.rb",
+            "rb",
+            "BigModel",
+            "class",
+            &big_body,
+        );
         let result = get_context_capsule(&conn, "BigModel", "r", None).unwrap();
         assert!(
             result.optimized_text.contains("CONDENSED SOURCE"),
@@ -1955,7 +2830,9 @@ mod tests {
             &result.optimized_text[..200.min(result.optimized_text.len())]
         );
         assert!(
-            result.optimized_text.contains("MARROW_CAPSULE_MAX_PIVOT_BYTES"),
+            result
+                .optimized_text
+                .contains("MARROW_CAPSULE_MAX_PIVOT_BYTES"),
             "condensed output should mention the env var"
         );
         // The condensed text should NOT contain the full repeated body.
@@ -1972,7 +2849,16 @@ mod tests {
         let conn = make_db();
         let small_body = "def tiny():\n    return 1\n";
         assert!(small_body.len() < DEFAULT_MAX_PIVOT_BYTES);
-        insert_node(&conn, "r:f.py:tiny", "r", "f.py", "py", "tiny", "function", small_body);
+        insert_node(
+            &conn,
+            "r:f.py:tiny",
+            "r",
+            "f.py",
+            "py",
+            "tiny",
+            "function",
+            small_body,
+        );
         let result = get_context_capsule(&conn, "tiny", "r", None).unwrap();
         assert!(
             result.optimized_text.contains("FULL SOURCE"),
@@ -1989,19 +2875,32 @@ mod tests {
     fn capsule_no_filepath_still_errors_on_ambiguity() {
         let conn = make_db();
         insert_node(
-            &conn, "r:src/a.py:dup", "r", "src/a.py", "py",
-            "dup", "function", "def dup(): pass\n",
+            &conn,
+            "r:src/a.py:dup",
+            "r",
+            "src/a.py",
+            "py",
+            "dup",
+            "function",
+            "def dup(): pass\n",
         );
         insert_node(
-            &conn, "r:src/b.py:dup", "r", "src/b.py", "py",
-            "dup", "function", "def dup(): pass\n",
+            &conn,
+            "r:src/b.py:dup",
+            "r",
+            "src/b.py",
+            "py",
+            "dup",
+            "function",
+            "def dup(): pass\n",
         );
 
         // Disambiguation without filepath is now a successful payload, not an error.
         let result = get_context_capsule(&conn, "dup", "r", None).unwrap();
         assert!(
             result.optimized_text.contains("Found 2 matches"),
-            "should return disambiguation payload without filepath: {}", result.optimized_text
+            "should return disambiguation payload without filepath: {}",
+            result.optimized_text
         );
     }
 }
