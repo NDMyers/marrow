@@ -307,17 +307,7 @@ fn cap_raw_text(text: String) -> String {
     )
 }
 
-/// Per-file parse timeout in milliseconds. Configurable via MARROW_PARSE_TIMEOUT_MS.
-/// Default: 5000 ms. Set to 0 to disable timeout.
-fn parse_timeout_ms() -> u64 {
-    std::env::var("MARROW_PARSE_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5000)
-}
-
 /// Parse a single file and return its language tag plus extracted symbols.
-/// Skips files that exceed the configurable parse timeout (MARROW_PARSE_TIMEOUT_MS).
 pub fn parse_file(path: &Path) -> Result<(String, Vec<Symbol>)> {
     let ext = path
         .extension()
@@ -347,53 +337,13 @@ pub fn parse_file(path: &Path) -> Result<(String, Vec<Symbol>)> {
     }
 
     let source = std::fs::read_to_string(path)?;
-
-    // Get configurable parse timeout
-    let timeout_ms = parse_timeout_ms();
     let path_display = path.display().to_string();
-
-    let symbols = if timeout_ms == 0 {
-        // Timeout disabled — parse synchronously
-        parse_file_inner(&source, &ext, &config, &path_display)?
-    } else {
-        // Parse with timeout using a channel + rayon spawn
-        let (tx, rx) = std::sync::mpsc::channel();
-        let source_clone = source.clone();
-        let ext_clone = ext.clone();
-        let path_clone = path_display.clone();
-        let parse_start = std::time::Instant::now();
-
-        // Spawn parse work on rayon thread pool
-        rayon::spawn(move || {
-            let result = parse_file_inner(&source_clone, &ext_clone, &config, &path_clone);
-            let _ = tx.send(result);
-        });
-
-        // Wait with timeout
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-        match rx.recv_timeout(timeout) {
-            Ok(result) => result?,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let elapsed_ms = parse_start.elapsed().as_millis();
-                eprintln!(
-                    "[marrow] parse timeout (budget={}ms, elapsed={}ms), skipping file: {}",
-                    timeout_ms, elapsed_ms, path_display
-                );
-                return Ok((ext, Vec::new())); // skip file, log warning
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(anyhow!(
-                    "parse thread disconnected unexpectedly: {}",
-                    path_display
-                ));
-            }
-        }
-    };
+    let symbols = parse_file_inner(&source, &ext, &config, &path_display)?;
 
     Ok((ext, symbols))
 }
 
-/// Inner parse logic extracted for timeout wrapping.
+/// Shared tree-sitter parse logic for a single source buffer.
 fn parse_file_inner(
     source: &str,
     ext: &str,
@@ -511,6 +461,8 @@ fn default_marrow_ignore_patterns() -> Vec<String> {
         "target".into(),
         "dist".into(),
         ".git".into(),
+        "worktrees".into(),
+        ".worktrees".into(),
     ]
 }
 
@@ -538,7 +490,14 @@ fn walk_builder_for_repo(root: &Path) -> Result<WalkBuilder> {
         // Hardcoded exclusions for common non-source directories
         if matches!(
             name.as_ref(),
-            "node_modules" | ".git" | "target" | "dist" | "build" | "vendor"
+            "node_modules"
+                | ".git"
+                | "target"
+                | "dist"
+                | "build"
+                | "vendor"
+                | "worktrees"
+                | ".worktrees"
         ) {
             return false;
         }
@@ -2454,8 +2413,47 @@ function foo() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Serialize env mutation for `MARROW_INGEST_PARSE_QUEUE` (process-global).
-    static INGEST_QUEUE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    #[test]
+    fn ingest_skips_bad_source_file_and_completes_progress_for_other_candidates() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let dir = std::env::temp_dir().join("marrow_test_bad_source_progress");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("good.py"), "def good():\n    return 1\n").unwrap();
+        std::fs::write(dir.join("bad.py"), [0xff, 0xfe, 0xfd]).unwrap();
+
+        let progress_updates = std::sync::Mutex::new(Vec::new());
+        run_ingestion_with_progress(&conn, "test", &dir, |percent| {
+            progress_updates.lock().unwrap().push(percent);
+        })
+        .unwrap();
+
+        let updates = progress_updates.lock().unwrap();
+        assert_eq!(updates.last().copied(), Some(100));
+
+        let node_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test' AND symbol_name = 'good'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(node_count, 1);
+
+        let indexed_bad_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test' AND file_path = 'bad.py'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed_bad_count, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serialize env mutation for ingestion tests (process-global).
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn graph_fingerprint_calls(conn: &Connection, repo_id: &str) -> (Vec<String>, Vec<String>) {
         let mut stmt = conn
@@ -2490,7 +2488,7 @@ function foo() {
 
     #[test]
     fn test_ingest_multiple_files_parse_queue_k_equivalence() {
-        let _guard = INGEST_QUEUE_TEST_LOCK.lock().unwrap();
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join("marrow_test_parse_queue_k_equiv");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2582,6 +2580,31 @@ function foo() {
         assert!(
             symbols.iter().any(|s| s.name == "small_fn"),
             "expected 'small_fn' in symbols"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MARROW_PARSE_TIMEOUT_MS no longer affects parse_file behavior.
+    #[test]
+    fn parse_file_ignores_parse_timeout_env() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join("marrow_test_parse_timeout_env_ignored");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("timeout_env.py");
+        std::fs::write(&path, b"def timeout_env_fn():\n    pass\n").unwrap();
+
+        std::env::set_var("MARROW_PARSE_TIMEOUT_MS", "1");
+        let result = parse_file(&path);
+        std::env::remove_var("MARROW_PARSE_TIMEOUT_MS");
+
+        let (lang, symbols) = result.expect("parse_file should ignore timeout env and parse file");
+        assert_eq!(lang, "py");
+        assert!(
+            symbols.iter().any(|s| s.name == "timeout_env_fn"),
+            "expected timeout_env_fn in symbols"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2682,6 +2705,66 @@ function foo() {
             edge_exists, 1,
             "CALLS edge from 'caller' to 'callee' must exist"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ingest_representative_ruby_ts_tsx_writes_graph_data_and_completes_progress() {
+        let dir = std::env::temp_dir().join("marrow_test_representative_ruby_ts_tsx");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("billing.rb"),
+            "class BillingRun\n  def calculate\n    helper\n  end\n\n  def helper\n    1\n  end\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("data.ts"),
+            "export function normalizeData() {\n  return computeTotal();\n}\n\nexport function computeTotal() {\n  return 42;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Panel.tsx"),
+            "export function DashboardPanel() {\n  return <section>{formatTitle()}</section>;\n}\n\nfunction formatTitle() {\n  return 'Graph';\n}\n",
+        )
+        .unwrap();
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let progress_updates = std::sync::Mutex::new(Vec::new());
+        run_ingestion_with_progress(&conn, "test", &dir, |percent| {
+            progress_updates.lock().unwrap().push(percent);
+        })
+        .unwrap();
+
+        let updates = progress_updates.lock().unwrap();
+        assert_eq!(
+            updates.last().copied(),
+            Some(100),
+            "expected final progress to be 100: {updates:?}"
+        );
+        assert!(
+            updates.windows(2).all(|window| window[0] <= window[1]),
+            "progress should be monotonic: {updates:?}"
+        );
+
+        let node_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            node_count >= 6,
+            "expected representative Ruby/TS/TSX nodes, got {node_count}"
+        );
+
+        let edge_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+            .unwrap();
+        assert!(edge_count > 0, "expected AST graph edges to be written");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2887,6 +2970,52 @@ void processWidget() {}
             )
             .unwrap();
         assert_eq!(keep_count, 1, "keep.py should be indexed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_traversal_excludes_repo_local_worktrees_dirs() {
+        let dir = std::env::temp_dir().join("marrow_test_default_worktrees_ignore");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("worktrees")).unwrap();
+        std::fs::create_dir_all(dir.join(".worktrees")).unwrap();
+
+        std::fs::write(dir.join("real.py"), "def real():\n    pass\n").unwrap();
+        std::fs::write(
+            dir.join("worktrees").join("duplicate.py"),
+            "def duplicate():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".worktrees").join("hidden_duplicate.py"),
+            "def hidden_duplicate():\n    pass\n",
+        )
+        .unwrap();
+
+        let files = collect_source_files(&dir).unwrap();
+        let rels: HashSet<String> = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert!(
+            rels.contains("real.py"),
+            "real.py should be indexed: {rels:?}"
+        );
+        assert!(
+            !rels.contains("worktrees/duplicate.py"),
+            "worktrees duplicate checkout should be excluded: {rels:?}"
+        );
+        assert!(
+            !rels.contains(".worktrees/hidden_duplicate.py"),
+            ".worktrees duplicate checkout should be excluded: {rels:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
