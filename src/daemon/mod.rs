@@ -78,15 +78,20 @@ pub async fn run() -> Result<()> {
     // Bind and serve with graceful shutdown wired in.
     #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt;
         use tokio::net::UnixListener;
         let sock_path = crate::ipc::default_sock_path();
         let parent = sock_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("daemon socket path has no parent directory"))?;
         std::fs::create_dir_all(parent)?;
+        // Harden socket directory permissions to 0700 (owner-only access).
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         // Remove stale socket from a previous (crashed) daemon.
         let _ = std::fs::remove_file(&sock_path);
         let listener = UnixListener::bind(&sock_path)?;
+        // Harden socket file permissions to 0600 (owner read/write only).
+        std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
         eprintln!("[marrow daemon] listening on unix:{}", sock_path.display());
         axum::serve(listener, routes::build_router(state))
             .with_graceful_shutdown(async {

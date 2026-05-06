@@ -11,9 +11,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout — first-party, pinned to v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        # softprops/action-gh-release — third-party, pinned to v2.2.2
+        # Exception: Widely-used release action; monitored via Dependabot.
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
           generate_release_notes: true
 
@@ -34,15 +37,20 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       
       - name: Install Rust
+        # dtolnay/rust-toolchain — first-party Rust ecosystem, uses branch refs by design.
+        # Exception: This action uses branch-based refs (stable/nightly) intentionally;
+        # SHA pinning would break automatic toolchain updates.
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Build and Upload Binary
-        uses: taiki-e/upload-rust-binary-action@v1
+        # taiki-e/upload-rust-binary-action — third-party, pinned to v1.25.0
+        # Exception: Widely-used Rust binary release action; monitored via Dependabot.
+        uses: taiki-e/upload-rust-binary-action@0706eed15bb53dd0a5d076afea4e4a0a0e31e5cf # v1.25.0
         with:
           # (optional) Comma-separated list of binary names (non-extension portion of filename) to build and upload.
           # Note that glob pattern is not supported yet.
@@ -51,3 +59,30 @@ jobs:
           archive: marrow-${{ matrix.target }}
           target: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          build_args: --locked
+
+  generate-checksums:
+    needs: upload-assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.tar.gz"
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.zip" || true
+      
+      - name: Generate SHA256 checksums
+        run: |
+          cd assets
+          shasum -a 256 * > checksums.sha256
+          cat checksums.sha256
+      
+      - name: Upload checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" --repo "${{ github.repository }}" assets/checksums.sha256

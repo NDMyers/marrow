@@ -3,7 +3,6 @@
 .DS_Store
 .worktrees/
 .context_engine/
-Cargo.lock
 CLAUDE.md
 GEMINI.md
 TASK.md
