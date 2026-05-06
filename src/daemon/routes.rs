@@ -157,6 +157,26 @@ pub fn build_router(state: DaemonState) -> Router {
         .with_state(state)
 }
 
+/// Build the combined daemon + dashboard router for the TCP dashboard listener.
+/// This merges the dashboard routes (UI, SSE, stats, graph, compare, emit)
+/// with the daemon's management routes (health, watch, shutdown).
+pub fn build_dashboard_router(
+    daemon_state: DaemonState,
+    dashboard_state: crate::dashboard::AppState,
+) -> Router {
+    let daemon_routes = Router::new()
+        .route("/api/health", get(handle_health))
+        .route("/api/watch", post(handle_watch))
+        .route("/api/shutdown", post(handle_shutdown))
+        .with_state(daemon_state);
+
+    let dashboard_router = crate::dashboard::build_dashboard_router(dashboard_state);
+
+    // Dashboard routes take priority (they include /api/emit, /api/graph, etc.)
+    // then daemon management routes are merged underneath.
+    dashboard_router.merge(daemon_routes)
+}
+
 /// Address to bind when using TCP (Windows / fallback).
 #[allow(dead_code)]
 pub fn bind_address() -> std::net::SocketAddr {

@@ -14,6 +14,9 @@ use std::sync::Arc;
 /// Filesystem event debounce window required by the spec.
 const DEBOUNCE_MS: u64 = 300;
 
+/// Dashboard TCP port.
+const DASHBOARD_PORT: u16 = 8765;
+
 /// Entry-point called from `main()` for `marrow daemon`.
 pub async fn run() -> Result<()> {
     // Create channels before DaemonState so the receiver stays in scope here.
@@ -75,7 +78,46 @@ pub async fn run() -> Result<()> {
         }
     });
 
-    // Bind and serve with graceful shutdown wired in.
+    // ── Dashboard TCP listener on port 8765 ───────────────────────────
+    // The daemon now hosts the dashboard routes on a second listener so that
+    // the desktop app and browsers can access it at http://127.0.0.1:8765.
+    let dashboard_addr = std::net::SocketAddr::from(([127, 0, 0, 1], DASHBOARD_PORT));
+    let dashboard_listener = tokio::net::TcpListener::bind(dashboard_addr).await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                anyhow::anyhow!(
+                    "Port {} is already in use. Another process may be bound to it. \
+                     The daemon requires exclusive access to this port for the dashboard.",
+                    DASHBOARD_PORT
+                )
+            } else {
+                anyhow::anyhow!("Failed to bind dashboard listener on port {}: {e}", DASHBOARD_PORT)
+            }
+        })?;
+
+    // Build the dashboard AppState — uses an in-memory DB connection for stats
+    // since the daemon's actual repos are managed through the pool.
+    let db_path = std::env::var("MARROW_DB_PATH")
+        .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+    let dashboard_db = crate::db::init_db_or_memory(&db_path)?;
+    let dashboard_session = Arc::new(std::sync::Mutex::new(
+        crate::dashboard::SessionStats::default(),
+    ));
+    let dashboard_app_state = crate::dashboard::AppState {
+        tx: dash_tx.clone(),
+        session: dashboard_session,
+        db: Arc::new(std::sync::Mutex::new(dashboard_db)),
+    };
+
+    let dashboard_router = routes::build_dashboard_router(state.clone(), dashboard_app_state);
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(dashboard_listener, dashboard_router).await {
+            eprintln!("[marrow daemon] dashboard server error: {e}");
+        }
+    });
+    eprintln!("[marrow daemon] dashboard → http://127.0.0.1:{DASHBOARD_PORT}");
+
+    // Bind and serve IPC with graceful shutdown wired in.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
