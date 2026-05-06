@@ -7,6 +7,7 @@ mod retrieval;
 mod service;
 mod skills;
 mod state;
+mod ui_app;
 mod watcher;
 
 use std::{
@@ -111,6 +112,7 @@ fn log_emit_error(msg: &str) {
 /// there is a brief window between `tokio::spawn` returning and the first
 /// `accept()` completing. A missed ServerStarted is cosmetic (dashboard UI
 /// only), so this is best-effort rather than a hard synchronisation point.
+#[allow(dead_code)]
 const DASHBOARD_WARMUP_MS: u64 = 50;
 
 // ── Capsule formatting ────────────────────────────────────────────────────────
@@ -5092,6 +5094,11 @@ fn cmd_interactive() -> Result<()> {
         "2. Index Workspace    (Build the AST graph once)",
         "3. Watch Workspace    (Index & listen for file changes)",
         "4. Start MCP Server   (Run stdio server manually)",
+        #[cfg(feature = "desktop")]
+        "5. Desktop App        (Open native dashboard window)",
+        #[cfg(feature = "desktop")]
+        "6. Exit",
+        #[cfg(not(feature = "desktop"))]
         "5. Exit",
     ];
 
@@ -5119,7 +5126,39 @@ fn cmd_interactive() -> Result<()> {
                 .spawn()?
                 .wait()?;
         }
+        #[cfg(feature = "desktop")]
+        4 => cmd_desktop_submenu()?,
         _ => eprintln!("{}", style("Goodbye.").dim()),
+    }
+
+    Ok(())
+}
+
+/// Desktop App submenu for the interactive TUI.
+#[cfg(feature = "desktop")]
+fn cmd_desktop_submenu() -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Select};
+
+    let items = [
+        "Open       (Launch native dashboard window)",
+        "Enable     (Register OS launcher entry)",
+        "Disable    (Remove OS launcher entry)",
+        "Status     (Show registration and process state)",
+        "Back",
+    ];
+
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Desktop App")
+        .items(&items)
+        .default(0)
+        .interact()?;
+
+    match selection {
+        0 => ui_app::open_app()?,
+        1 => ui_app::enable()?,
+        2 => ui_app::disable()?,
+        3 => ui_app::status()?,
+        _ => {} // Back — return to main menu
     }
 
     Ok(())
@@ -5127,42 +5166,30 @@ fn cmd_interactive() -> Result<()> {
 
 // ── Daemon CLI helpers ────────────────────────────────────────────────────────
 
-fn cmd_status() -> Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(async {
-        let client = ipc::default_client();
-        match client.health_check().await {
-            Ok(true) => println!("[marrow] daemon is running."),
-            Ok(false) => println!("[marrow] daemon is NOT running."),
-            Err(e) => println!("[marrow] status check error: {e}"),
-        }
-    });
+async fn cmd_status() -> Result<()> {
+    let client = ipc::default_client();
+    match client.health_check().await {
+        Ok(true) => println!("[marrow] daemon is running."),
+        Ok(false) => println!("[marrow] daemon is NOT running."),
+        Err(e) => println!("[marrow] status check error: {e}"),
+    }
     Ok(())
 }
 
-fn cmd_stop() -> Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(async {
-        let client = ipc::default_client();
-        if client.health_check().await.unwrap_or(false) {
-            client.shutdown().await?;
-            println!("[marrow] shutdown signal sent to daemon.");
-        } else {
-            println!("[marrow] daemon is not running.");
-        }
-        Ok::<_, anyhow::Error>(())
-    })?;
+async fn cmd_stop() -> Result<()> {
+    let client = ipc::default_client();
+    if client.health_check().await.unwrap_or(false) {
+        client.shutdown().await?;
+        println!("[marrow] shutdown signal sent to daemon.");
+    } else {
+        println!("[marrow] daemon is not running.");
+    }
     Ok(())
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // ── Global panic hook – writes panics to ~/.marrow/debug.log ──────
     std::panic::set_hook(Box::new(|panic_info| {
         use std::io::Write;
@@ -5182,8 +5209,12 @@ async fn main() -> Result<()> {
     // ── CLI subcommand dispatch ────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
 
+    // Dispatch commands that MUST run on the main thread (macOS GUI requirement)
+    // or that don't need async, before constructing any Tokio runtime.
     match args.get(1).map(|s| s.as_str()) {
-        // M-19 FIX: Handle top-level help before default MCP launch.
+        // Human interactive mode: no arguments → launch the TUI menu.
+        None => return cmd_interactive(),
+        // Help — no runtime needed.
         Some("--help") | Some("-h") | Some("help") => {
             println!("Usage: marrow [COMMAND]\n");
             println!("Commands:");
@@ -5201,14 +5232,47 @@ async fn main() -> Result<()> {
             println!("  status          Show daemon status");
             println!("  stop            Stop daemon");
             println!("  ui              Open dashboard");
+            println!("  ui-app          Desktop app (open|enable|disable|status)");
             println!("  perf-harness    Run performance benchmarks");
             println!("  service install Install as system service");
             println!("\nOptions:");
             println!("  --help, -h      Show this help");
             return Ok(());
         }
-        // Human interactive mode: no arguments → launch the TUI menu.
-        None => return cmd_interactive(),
+        Some("ui-app") => {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("open");
+            match subcmd {
+                "open" | "run" => return ui_app::open_app(),
+                "enable" => return ui_app::enable(),
+                "disable" => return ui_app::disable(),
+                "status" => return ui_app::status(),
+                _ => {
+                    eprintln!("Usage: marrow ui-app [open|enable|disable|status]");
+                    return Ok(());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // All remaining commands use async I/O — build the Tokio multithread runtime.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Failed to build Tokio runtime")?;
+
+    rt.block_on(async_main(args))
+}
+
+/// Async entry point for commands that need the Tokio multithread runtime.
+/// Called from `main()` after GUI-related commands have been dispatched on
+/// the process main thread.
+async fn async_main(args: Vec<String>) -> Result<()> {
+    match args.get(1).map(|s| s.as_str()) {
+        // These cases are already dispatched from main() before the runtime is built.
+        None | Some("--help") | Some("-h") | Some("help") | Some("ui-app") => {
+            unreachable!("Dispatched from main() before Tokio runtime")
+        }
         Some("ui") => return cmd_ui(),
         Some("init") => return cmd_init(),
         Some("rules") => return cmd_rules(),
@@ -5298,19 +5362,13 @@ async fn main() -> Result<()> {
         Some("daemon") => {
             return daemon::run().await;
         }
-        Some("status") => return cmd_status(),
-        Some("stop") => return cmd_stop(),
+        Some("status") => return cmd_status().await,
+        Some("stop") => return cmd_stop().await,
         Some("watch") => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async {
-                ipc::ensure_daemon_running().await?;
-                let cwd = std::env::current_dir()?;
-                ipc::default_client().register_watch(&cwd).await?;
-                println!("[marrow] watching {}", cwd.display());
-                Ok::<_, anyhow::Error>(())
-            })?;
+            ipc::ensure_daemon_running().await?;
+            let cwd = std::env::current_dir()?;
+            ipc::default_client().register_watch(&cwd).await?;
+            println!("[marrow] watching {}", cwd.display());
             return Ok(());
         }
         Some("service") => {
@@ -5342,7 +5400,7 @@ async fn main() -> Result<()> {
 
     // ── Read config flags in one pass ───────────────────────────────
     // Config read is always best-effort; a missing/unreadable file is not fatal.
-    let (show_dashboard, auto_open_ui, enable_watcher, watch_debounce_ms) = {
+    let (_show_dashboard, _auto_open_ui, enable_watcher, watch_debounce_ms) = {
         let cfg = read_workspace_config();
         let show = cfg
             .get("show_dashboard")
@@ -5374,50 +5432,12 @@ async fn main() -> Result<()> {
     // Hoisted outside `if show_dashboard` so the watcher can use it even
     // when the dashboard UI is disabled.
     let (tx, _) = tokio::sync::broadcast::channel::<DashboardEvent>(256);
-    let session = Arc::new(Mutex::new(dashboard::SessionStats::default()));
+    let _session = Arc::new(Mutex::new(dashboard::SessionStats::default()));
 
-    // ── Dashboard Hub election ────────────────────────────────────────
-    if show_dashboard {
-        match dashboard::start(
-            tx.clone(),
-            Arc::clone(&session),
-            Arc::clone(&db_arc),
-            auto_open_ui,
-        )
-        .await?
-        {
-            dashboard::HubRole::Hub => {
-                // Fire-and-forget: POST ServerStarted to ourselves.
-                // Spawned so we don't block while the listener finishes binding.
-                let client = http_client.clone();
-                let db_path = db_path.clone();
-                tokio::spawn(async move {
-                    // Brief yield so the Axum accept-loop is ready.
-                    tokio::time::sleep(std::time::Duration::from_millis(DASHBOARD_WARMUP_MS)).await;
-                    match client
-                        .post(DASHBOARD_EMIT_URL)
-                        .json(&DashboardEvent::ServerStarted {
-                            port: 8765,
-                            db_path,
-                        })
-                        .send()
-                        .await
-                    {
-                        Err(e) => log_emit_error(&e.to_string()),
-                        Ok(resp) if !resp.status().is_success() => {
-                            let status = resp.status();
-                            let body = resp.text().await.unwrap_or_default();
-                            log_emit_error(&format!("status={status} body={body}"));
-                        }
-                        Ok(_) => {}
-                    }
-                });
-            }
-            dashboard::HubRole::Spoke => {
-                eprintln!("Marrow running as Spoke (Hub already active on :8765).");
-            }
-        }
-    }
+    // ── Dashboard is now hosted by the daemon ──────────────────────
+    // The MCP process no longer binds port 8765 or opens a browser.
+    // The daemon (started via ensure_daemon_running above) serves the
+    // dashboard at http://127.0.0.1:8765.
 
     // ── Background file watcher (opt-in) ──────────────────────────────
     if enable_watcher {

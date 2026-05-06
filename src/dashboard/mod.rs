@@ -113,6 +113,7 @@ pub enum DashboardEvent {
 
 /// Result of the Hub election attempt.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum HubRole {
     /// This process bound 127.0.0.1:8765 and owns the Axum server.
     Hub,
@@ -928,31 +929,12 @@ async fn graph_neighbors_handler(
 
 // ── Server startup ────────────────────────────────────────────────────────────
 
-/// Attempts to bind strictly to 127.0.0.1:8765.
+/// Build the dashboard router fragment (all dashboard routes + CORS layer).
 ///
-/// Returns `HubRole::Hub` if this process won the election and the Axum
-/// server is running in the background. Returns `HubRole::Spoke` if the
-/// port is already taken — the caller continues in headless mode.
-pub async fn start(
-    tx: broadcast::Sender<DashboardEvent>,
-    session: Arc<Mutex<SessionStats>>,
-    db: Arc<Mutex<rusqlite::Connection>>,
-    auto_open_ui: bool,
-) -> Result<HubRole> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8765));
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            return Ok(HubRole::Spoke);
-        }
-        // Any other bind error (e.g. PermissionDenied) is a genuine failure
-        // that should propagate — not silently downgraded to Spoke mode.
-        Err(e) => return Err(e.into()),
-    };
-
-    let state = AppState { tx, session, db };
-
-    let router = Router::new()
+/// This returns a `Router<AppState>` that can be merged into a larger application
+/// or served standalone. The caller is responsible for binding a listener.
+pub fn build_dashboard_router(state: AppState) -> Router {
+    Router::new()
         .route("/", get(index_handler))
         .route("/d3-v7.min.js", get(d3_handler))
         .route("/stream", get(sse_handler))
@@ -972,7 +954,34 @@ pub async fn start(
                 .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
                 .allow_headers(tower_http::cors::Any),
         )
-        .with_state(state);
+        .with_state(state)
+}
+
+/// Attempts to bind strictly to 127.0.0.1:8765.
+///
+/// Returns `HubRole::Hub` if this process won the election and the Axum
+/// server is running in the background. Returns `HubRole::Spoke` if the
+/// port is already taken — the caller continues in headless mode.
+#[allow(dead_code)]
+pub async fn start(
+    tx: broadcast::Sender<DashboardEvent>,
+    session: Arc<Mutex<SessionStats>>,
+    db: Arc<Mutex<rusqlite::Connection>>,
+    auto_open_ui: bool,
+) -> Result<HubRole> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8765));
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            return Ok(HubRole::Spoke);
+        }
+        // Any other bind error (e.g. PermissionDenied) is a genuine failure
+        // that should propagate — not silently downgraded to Spoke mode.
+        Err(e) => return Err(e.into()),
+    };
+
+    let state = AppState { tx, session, db };
+    let router = build_dashboard_router(state);
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router).await {
