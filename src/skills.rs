@@ -85,30 +85,22 @@ impl Agent {
             (Agent::Cursor, Scope::Project) => {
                 PathBuf::from(".cursor/rules/marrow-optimization.mdc")
             }
-            (Agent::Cursor, Scope::Global) => {
-                home.join(".cursor/rules/marrow-optimization.mdc")
-            }
+            (Agent::Cursor, Scope::Global) => home.join(".cursor/rules/marrow-optimization.mdc"),
 
             (Agent::GitHubCopilot, Scope::Project) => {
                 PathBuf::from(".github/instructions/marrow-optimization.instructions.md")
             }
-            (Agent::GitHubCopilot, Scope::Global) => {
-                home.join(
-                    "Library/Application Support/Code/User/prompts/marrow-optimization.instructions.md",
-                )
-            }
+            (Agent::GitHubCopilot, Scope::Global) => home.join(
+                "Library/Application Support/Code/User/prompts/marrow-optimization.instructions.md",
+            ),
 
             // Cline project target is a bare file at the repo root — no subdirectory.
             (Agent::Cline, Scope::Project) => PathBuf::from(".clinerules"),
-            (Agent::Cline, Scope::Global) => {
-                home.join(".cline/rules/marrow-optimization.md")
-            }
+            (Agent::Cline, Scope::Global) => home.join(".cline/rules/marrow-optimization.md"),
 
             // Zed project target is a bare file at the repo root — no subdirectory.
             (Agent::Zed, Scope::Project) => PathBuf::from(".rules"),
-            (Agent::Zed, Scope::Global) => {
-                home.join(".config/zed/rules/marrow-optimization.rules")
-            }
+            (Agent::Zed, Scope::Global) => home.join(".config/zed/rules/marrow-optimization.rules"),
         }
     }
 }
@@ -176,8 +168,9 @@ pub fn install_source_path(method: Method, home: &Path) -> Option<PathBuf> {
 pub fn install_source_description(method: Method, home: &Path) -> String {
     match install_source_path(method, home) {
         Some(path) => format!("source: {}", path.display()),
-        None => "source: embedded Marrow template; edit/remove the target file directly"
-            .to_string(),
+        None => {
+            "source: embedded Marrow template; edit/remove the target file directly".to_string()
+        }
     }
 }
 
@@ -213,7 +206,10 @@ fn install(target: &Path, method: Method, central: &Path) -> Result<InstallStatu
 
 #[cfg(test)]
 mod tests {
-    use super::{install, install_source_description, install_source_path, Agent, InstallStatus, Method, Scope};
+    use super::{
+        install, install_source_description, install_source_path, Agent, InstallStatus, Method,
+        Scope,
+    };
     use std::{fs, path::Path};
     use tempfile::tempdir;
 
@@ -281,7 +277,10 @@ mod tests {
 
         // Create a dangling symlink pointing at a nonexistent path.
         std::os::unix::fs::symlink(&nonexistent, &target).unwrap();
-        assert!(target.symlink_metadata().is_ok(), "symlink entry should exist");
+        assert!(
+            target.symlink_metadata().is_ok(),
+            "symlink entry should exist"
+        );
         assert!(!target.exists(), "dangling symlink should not resolve");
 
         // install should remove the dangling symlink and write the file.
@@ -289,8 +288,14 @@ mod tests {
         let result = install(&target, Method::WriteFile, &central).unwrap();
 
         assert_eq!(result, InstallStatus::Written);
-        assert!(target.exists(), "file should now exist after replacing dangling symlink");
-        assert!(fs::read_to_string(&target).unwrap().to_lowercase().contains("marrow"));
+        assert!(
+            target.exists(),
+            "file should now exist after replacing dangling symlink"
+        );
+        assert!(fs::read_to_string(&target)
+            .unwrap()
+            .to_lowercase()
+            .contains("marrow"));
     }
 
     #[test]

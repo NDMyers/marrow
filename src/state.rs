@@ -4,7 +4,9 @@ use std::sync::RwLock;
 pub enum IndexState {
     Uninitialized,
     #[allow(dead_code)]
-    Indexing { progress_percent: u8 },
+    Indexing {
+        progress_percent: u8,
+    },
     Ready,
 }
 
@@ -51,21 +53,37 @@ pub fn run_pipeline_guard_message() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IndexState, run_pipeline_guard_message, run_pipeline_wait_message, set_index_state};
+    use super::{
+        run_pipeline_guard_message, run_pipeline_wait_message, set_index_state, IndexState,
+    };
 
     #[test]
     fn wait_message_includes_progress_and_retry_instruction() {
         let message = run_pipeline_wait_message(42);
-        assert!(message.contains("Progress: 42%"), "progress missing: {message}");
-        assert!(message.contains("autonomously call this tool again in 5 seconds"), "retry guidance missing: {message}");
+        assert!(
+            message.contains("Progress: 42%"),
+            "progress missing: {message}"
+        );
+        assert!(
+            message.contains("autonomously call this tool again in 5 seconds"),
+            "retry guidance missing: {message}"
+        );
     }
 
     #[test]
     fn guard_message_is_absent_only_when_index_ready() {
-        set_index_state(IndexState::Indexing { progress_percent: 7 });
-        assert!(run_pipeline_guard_message().is_some(), "indexing state should block queries");
+        set_index_state(IndexState::Indexing {
+            progress_percent: 7,
+        });
+        assert!(
+            run_pipeline_guard_message().is_some(),
+            "indexing state should block queries"
+        );
 
         set_index_state(IndexState::Ready);
-        assert!(run_pipeline_guard_message().is_none(), "ready state should allow queries");
+        assert!(
+            run_pipeline_guard_message().is_none(),
+            "ready state should allow queries"
+        );
     }
 }

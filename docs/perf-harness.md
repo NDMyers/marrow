@@ -2,6 +2,8 @@
 
 Deterministic driver for epic benchmarks: runs the **canonical** ingest pipeline (`ingestion::run_ingestion`), then times **MCP-equivalent** read queries (`get_context_capsule` + `analyze_impact`) on one symbol.
 
+For ad hoc terminal exploration against an existing graph, `marrow benchmark` opens an interactive wizard when run with no arguments in a TTY. It guides repository selection, symbol search/filtering, and estimated versus exact proof mode. Keep using `marrow benchmark [--precise-file-tokens] <symbol> <repo_id>` or `marrow perf-harness ... --json` for scripted, reproducible harness runs.
+
 ## Usage
 
 ```bash
@@ -18,6 +20,7 @@ cargo build --release
 | `--db <path>` | SQLite path (default: `./.marrow/perf-graph.db`). |
 | `--symbol <name>` | Symbol for query phase (default: first `symbol_name` in `nodes` for this `repo_id`). |
 | `--fresh` | Delete `--db` before run if it exists. |
+| `--precise-file-tokens` | Measure exact cl100k_base baseline tokens for files touched by the capsule. Fails the run if any touched file cannot be tokenized. |
 | `--json` | Print a single JSON object on **stdout**; progress on **stderr**. |
 
 ### Example
@@ -39,9 +42,30 @@ Fields emitted with `--json`:
 - `ingest_wall_ms`, `query_wall_ms`
 - `symbols`, `edges`
 - `query_symbol` — symbol used for capsule/impact
+- `baseline_file_tokens`, `capsule_tokens`
+- `baseline_token_source` — `estimated`, `exact`, `full`, or `truncated_full`
+- `tokenizer_mode` — `metadata_len/4`, `text_len/4`, or `cl100k_base`
+- `original_mode`, `proof_mode`, `precise_file_tokens`
+- `original_max_bytes`, `proof_max_bytes`, `proof_max_files`, `touched_file_count`
 - `db_file_bytes` — DB file size on disk after ingest (0 if missing)
 - `rusage_max_rss_bytes` — `null` on unsupported OS, else best-effort high-water from `getrusage`
-- `git_dirty` / `marrow_version` — build metadata when available
+- `marrow_git_dirty`, `marrow_git_sha`, `marrow_version` — build metadata when available
+
+## Evidence-grade token claims
+
+Use exact mode for published or skeptical-user claims:
+
+```bash
+./target/release/marrow perf-harness \
+  --root ~/src/example \
+  --repo-id example \
+  --symbol target_symbol \
+  --fresh \
+  --precise-file-tokens \
+  --json
+```
+
+Treat dashboard reductions and default harness runs as estimates when `baseline_token_source` is `estimated`. Treat `proof_mode` values containing `sampled` or `truncated` as partial inspectable evidence, not complete baseline text. Exact claims should quote the JSON fields needed to rerun the same measurement: `query_symbol`, `repo_id`, `tokenizer_mode`, `original_mode`, `proof_mode`, `precise_file_tokens`, `original_max_bytes`, `proof_max_bytes`, `proof_max_files`, and the git/build metadata.
 
 ## Pinning fixtures
 

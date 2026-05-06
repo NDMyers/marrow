@@ -22,6 +22,8 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 
+use crate::retrieval::{CapsuleProofSnapshot, CapsuleProvenance};
+
 static INDEX_HTML: &str = include_str!("index.html");
 static D3_JS: &str = include_str!("d3-v7.min.js");
 const GRAPH_INITIAL_NODE_CAP: usize = 500;
@@ -73,6 +75,12 @@ pub enum DashboardEvent {
         /// Condensed capsule text. Same rationale as `original_text`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         optimized_text: Option<String>,
+        /// Bounded proof text plus sampling/truncation metadata. Text is
+        /// stripped before SSE/stats storage; metadata is retained.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proof_snapshot: Option<Box<CapsuleProofSnapshot>>,
+        #[serde(default)]
+        provenance: Box<CapsuleProvenance>,
         /// Whether the original+optimized texts are cached on the Hub,
         /// enabling the client-side delta viewer button.
         #[serde(default)]
@@ -132,7 +140,17 @@ pub struct SessionStats {
     /// Populated from the telemetry POST body so the compare endpoint works
     /// even when the Axum server (Hub) is running against a different DB than
     /// the process that served the capsule (Spoke).
-    pub capsule_text_cache: HashMap<String, (String, String)>,
+    pub capsule_text_cache: HashMap<String, CachedCapsuleDelta>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CachedCapsuleDelta {
+    pub baseline_text: String,
+    pub optimized_text: String,
+    pub original_length: usize,
+    pub optimized_length: usize,
+    pub proof_snapshot: Option<CapsuleProofSnapshot>,
+    pub provenance: CapsuleProvenance,
 }
 
 impl SessionStats {
@@ -155,22 +173,43 @@ impl SessionStats {
             ref repo,
             ref original_text,
             ref optimized_text,
+            ref proof_snapshot,
+            ref provenance,
+            file_tokens,
+            capsule_tokens,
             ts,
             ..
         } = event
         {
             let mut cached = false;
-            if let (Some(orig), Some(opt)) = (original_text, optimized_text) {
-                if !orig.is_empty() {
+            if let Some(opt) = optimized_text {
+                let baseline_text = original_text
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .or_else(|| {
+                        proof_snapshot
+                            .as_ref()
+                            .map(|p| p.proof_text.clone())
+                            .filter(|s| !s.is_empty())
+                    });
+                if let Some(baseline_text) = baseline_text {
                     let key = format!("{}@{}@{}", symbol, repo, ts);
-                    self.capsule_text_cache
-                        .insert(key, (orig.clone(), opt.clone()));
-                    cached = true;
-                    // Prevent unbounded growth; a simple clear-on-overflow is fine
-                    // for a local dashboard cache that holds at most ~50 entries.
-                    if self.capsule_text_cache.len() > 100 {
+                    if self.capsule_text_cache.len() >= 100 {
                         self.capsule_text_cache.clear();
                     }
+                    self.capsule_text_cache.insert(
+                        key,
+                        CachedCapsuleDelta {
+                            original_length: file_tokens,
+                            optimized_length: capsule_tokens,
+                            baseline_text,
+                            optimized_text: opt.clone(),
+                            proof_snapshot: proof_snapshot.as_deref().cloned(),
+                            provenance: (**provenance).clone(),
+                        },
+                    );
+                    cached = true;
                 }
             }
             // Strip the large text blobs before pushing into recent_events so
@@ -184,6 +223,8 @@ impl SessionStats {
                 tokens_saved,
                 origin,
                 ts,
+                proof_snapshot,
+                provenance,
                 ..
             } = event
             {
@@ -198,6 +239,11 @@ impl SessionStats {
                     ts,
                     original_text: None,
                     optimized_text: None,
+                    proof_snapshot: proof_snapshot
+                        .as_deref()
+                        .map(CapsuleProofSnapshot::without_text)
+                        .map(Box::new),
+                    provenance,
                     has_cached_delta: cached,
                 }
             } else {
@@ -434,6 +480,8 @@ struct CompareResponse {
     optimized_text: String,
     original_length: usize,
     optimized_length: usize,
+    proof_snapshot: Option<CapsuleProofSnapshot>,
+    provenance: CapsuleProvenance,
 }
 
 async fn compare_handler(
@@ -473,16 +521,17 @@ async fn compare_handler(
             // (e.g., Cursor + Copilot both running Marrow from different CWDs).
             let cache_key = format!("{}@{}@{}", symbol, repo, params.ts.unwrap_or_default());
             if let Ok(sess) = state.session.lock() {
-                if let Some((original_text, optimized_text)) =
-                    sess.capsule_text_cache.get(&cache_key)
-                {
-                    let original_length = original_text.len() / 4;
-                    let optimized_length = optimized_text.len() / 4;
+                if let Some(cached) = sess.capsule_text_cache.get(&cache_key) {
                     return axum::Json(CompareResponse {
-                        original_text: original_text.clone(),
-                        optimized_text: optimized_text.clone(),
-                        original_length,
-                        optimized_length,
+                        original_text: cached.baseline_text.clone(),
+                        optimized_text: cached.optimized_text.clone(),
+                        original_length: cached.original_length,
+                        optimized_length: cached.optimized_length,
+                        proof_snapshot: cached
+                            .proof_snapshot
+                            .as_ref()
+                            .map(CapsuleProofSnapshot::without_text),
+                        provenance: cached.provenance.clone(),
                     })
                     .into_response();
                 }
@@ -514,6 +563,11 @@ async fn compare_handler(
             };
             match crate::retrieval::get_context_capsule(&conn, &symbol, &repo, None) {
                 Ok(result) => {
+                    if result.original_text.is_empty() {
+                        return axum::Json(serde_json::json!({
+                            "error": "Compare baseline unavailable: no cached proof snapshot or full original text is available for this event."
+                        })).into_response();
+                    }
                     let original_length = result.file_tokens;
                     let optimized_length = result.optimized_text.len() / 4;
                     axum::Json(CompareResponse {
@@ -521,6 +575,8 @@ async fn compare_handler(
                         optimized_text: result.optimized_text,
                         original_length,
                         optimized_length,
+                        proof_snapshot: result.proof_snapshot.map(|p| p.without_text()),
+                        provenance: result.provenance,
                     })
                     .into_response()
                 }
@@ -611,6 +667,8 @@ async fn emit_handler(
             origin,
             ts,
             has_cached_delta,
+            proof_snapshot,
+            provenance,
             ..
         } => DashboardEvent::CapsuleServed {
             symbol,
@@ -623,6 +681,11 @@ async fn emit_handler(
             ts,
             original_text: None,
             optimized_text: None,
+            proof_snapshot: proof_snapshot
+                .as_deref()
+                .map(CapsuleProofSnapshot::without_text)
+                .map(Box::new),
+            provenance,
             has_cached_delta,
         },
         other => other,
@@ -1102,6 +1165,178 @@ mod tests {
         );
     }
 
+    async fn compare_json(state: AppState, params: CompareQuery) -> serde_json::Value {
+        use axum::body::to_bytes;
+        use axum::extract::{Query, State};
+
+        let response =
+            compare_handler(axum::http::HeaderMap::new(), State(state), Query(params)).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn cached_capsule_delta() -> CachedCapsuleDelta {
+        CachedCapsuleDelta {
+            baseline_text: "bounded proof text".to_string(),
+            optimized_text: "optimized capsule text".to_string(),
+            original_length: 101,
+            optimized_length: 17,
+            proof_snapshot: Some(CapsuleProofSnapshot {
+                proof_text: "bounded proof text".to_string(),
+                proof_label: "sampled proof".to_string(),
+                token_source: "estimated".to_string(),
+                truncated: true,
+                sampled: true,
+                max_bytes: 64,
+                max_files: 2,
+                touched_file_count: 3,
+                included_file_count: 2,
+                omitted_file_count: 1,
+                omitted_paths_preview: vec!["src/omitted.rs".to_string()],
+            }),
+            provenance: CapsuleProvenance {
+                baseline_token_source: "estimated".to_string(),
+                tokenizer_mode: "text_len/4".to_string(),
+                original_mode: "none".to_string(),
+                proof_label: "sampled proof".to_string(),
+                precise_file_tokens: false,
+                original_max_bytes: None,
+                proof_max_bytes: 64,
+                proof_max_files: 2,
+                touched_file_count: 3,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn compare_cached_proof_returns_bounded_text_and_provenance() {
+        let state = graph_test_state(crate::db::init_db(":memory:").unwrap());
+        state
+            .session
+            .lock()
+            .unwrap()
+            .capsule_text_cache
+            .insert("foo@repo@777".to_string(), cached_capsule_delta());
+
+        let data = compare_json(
+            state,
+            CompareQuery {
+                filepath: "ignored.rs".to_string(),
+                tool_used: "get_context_capsule".to_string(),
+                symbol: Some("foo".to_string()),
+                repo: Some("repo".to_string()),
+                ts: Some(777),
+            },
+        )
+        .await;
+
+        assert_eq!(data["original_text"], "bounded proof text");
+        assert_eq!(data["optimized_text"], "optimized capsule text");
+        assert_eq!(data["original_length"], 101);
+        assert_eq!(data["optimized_length"], 17);
+        assert_eq!(data["proof_snapshot"]["proof_text"], "");
+        assert_eq!(data["proof_snapshot"]["proof_label"], "sampled proof");
+        assert_eq!(data["provenance"]["proof_label"], "sampled proof");
+        assert_eq!(data["provenance"]["touched_file_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn compare_timestamp_cache_miss_reports_unavailable_proof() {
+        let data = compare_json(
+            graph_test_state(crate::db::init_db(":memory:").unwrap()),
+            CompareQuery {
+                filepath: "ignored.rs".to_string(),
+                tool_used: "get_context_capsule".to_string(),
+                symbol: Some("missing".to_string()),
+                repo: Some("repo".to_string()),
+                ts: Some(404),
+            },
+        )
+        .await;
+
+        assert!(data["error"]
+            .as_str()
+            .unwrap()
+            .contains("proof snapshot is no longer cached"));
+    }
+
+    #[tokio::test]
+    async fn compare_ignores_filepath_when_cached_proof_exists() {
+        let state = graph_test_state(crate::db::init_db(":memory:").unwrap());
+        state
+            .session
+            .lock()
+            .unwrap()
+            .capsule_text_cache
+            .insert("foo@repo@777".to_string(), cached_capsule_delta());
+
+        let data = compare_json(
+            state,
+            CompareQuery {
+                filepath: "/definitely/not/a/readable/source/file.rs".to_string(),
+                tool_used: "get_context_capsule".to_string(),
+                symbol: Some("foo".to_string()),
+                repo: Some("repo".to_string()),
+                ts: Some(777),
+            },
+        )
+        .await;
+
+        assert_eq!(data["original_text"], "bounded proof text");
+        assert!(data.get("error").is_none());
+    }
+
+    #[test]
+    fn record_capsule_strips_blobs_but_retains_bounded_proof_metadata() {
+        let mut stats = SessionStats::default();
+        stats.record_capsule(
+            17,
+            101,
+            DashboardEvent::CapsuleServed {
+                symbol: "foo".to_string(),
+                repo: "repo".to_string(),
+                file: "src/foo.rs".to_string(),
+                capsule_tokens: 17,
+                file_tokens: 101,
+                tokens_saved: 84,
+                origin: "test".to_string(),
+                ts: 777,
+                original_text: None,
+                optimized_text: Some("optimized capsule text".to_string()),
+                proof_snapshot: cached_capsule_delta().proof_snapshot.map(Box::new),
+                provenance: Box::new(cached_capsule_delta().provenance),
+                has_cached_delta: false,
+            },
+        );
+
+        let DashboardEvent::CapsuleServed {
+            original_text,
+            optimized_text,
+            proof_snapshot,
+            has_cached_delta,
+            ..
+        } = stats.recent_events.front().unwrap()
+        else {
+            panic!("expected capsule event");
+        };
+        assert!(original_text.is_none());
+        assert!(optimized_text.is_none());
+        assert!(*has_cached_delta);
+        let proof = proof_snapshot
+            .as_ref()
+            .expect("proof metadata should remain");
+        assert!(proof.proof_text.is_empty());
+        assert_eq!(proof.proof_label, "sampled proof");
+        assert_eq!(proof.max_bytes, 64);
+
+        let cached = stats
+            .capsule_text_cache
+            .get("foo@repo@777")
+            .expect("bounded proof should be cached for compare");
+        assert_eq!(cached.baseline_text, "bounded proof text");
+        assert_eq!(cached.provenance.proof_max_files, 2);
+    }
+
     fn graph_test_state(conn: rusqlite::Connection) -> AppState {
         let (tx, _rx) = broadcast::channel(4);
         AppState {
@@ -1452,7 +1687,10 @@ mod tests {
 
     #[test]
     fn dashboard_html_lifetime_panel_hides_advanced_metrics_until_toggle() {
-        let lifetime_panel = html_between("<section id=\"panel-lifetime\"", "<!-- TREE VISUALIZATION panel -->");
+        let lifetime_panel = html_between(
+            "<section id=\"panel-lifetime\"",
+            "<!-- TREE VISUALIZATION panel -->",
+        );
         assert!(lifetime_panel.contains("All-Time Requests"));
         assert!(lifetime_panel.contains("All-Time Tokens Saved"));
         assert!(lifetime_panel.contains("Lifetime Reduction %"));
@@ -1473,8 +1711,32 @@ mod tests {
 
     #[test]
     fn dashboard_html_lifetime_advanced_toggle_uses_high_contrast_default_styling() {
-        let toggle_style = html_between("#lifetime-advanced-toggle {", "#lifetime-advanced-toggle:hover,");
+        let toggle_style = html_between(
+            "#lifetime-advanced-toggle {",
+            "#lifetime-advanced-toggle:hover,",
+        );
         assert!(toggle_style.contains("color: var(--surface);"));
         assert!(toggle_style.contains("font-weight: 600;"));
+    }
+
+    #[test]
+    fn dashboard_html_session_table_resists_short_viewport_collapse() {
+        let panel_style = html_between(".panel {", ".panel.active");
+        assert!(panel_style.contains("overflow-y: auto;"));
+
+        let table_style = html_between(".table-wrap {", ".table-wrap::-webkit-scrollbar");
+        assert!(table_style.contains("flex: 1 0"));
+        assert!(table_style.contains("min-height:"));
+    }
+
+    #[test]
+    fn dashboard_html_compare_button_has_stable_hit_target() {
+        let button_style = html_between(".view-delta-btn {", ".view-delta-btn:hover");
+        assert!(button_style.contains("position: relative;"));
+        assert!(button_style.contains("z-index: 1;"));
+        assert!(button_style.contains("scroll-margin-top:"));
+
+        let tool_label_style = html_between(".tool-label {", ".tool-label .sym");
+        assert!(tool_label_style.contains("overflow: visible;"));
     }
 }

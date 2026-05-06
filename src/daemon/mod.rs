@@ -18,8 +18,7 @@ const DEBOUNCE_MS: u64 = 300;
 pub async fn run() -> Result<()> {
     // Create channels before DaemonState so the receiver stays in scope here.
     let (watcher_tx, mut watcher_rx) = tokio::sync::mpsc::channel::<std::path::PathBuf>(64);
-    let (dash_tx, _) =
-        tokio::sync::broadcast::channel::<crate::dashboard::DashboardEvent>(256);
+    let (dash_tx, _) = tokio::sync::broadcast::channel::<crate::dashboard::DashboardEvent>(256);
 
     // Oneshot for graceful shutdown — sent by POST /api/shutdown.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -57,11 +56,9 @@ pub async fn run() -> Result<()> {
             }
             match pool_for_watcher.get_or_open(&canonical).await {
                 Ok(conn) => {
-                    if let Err(e) = crate::watcher::spawn_watcher(
-                        conn,
-                        dash_tx_watcher.clone(),
-                        DEBOUNCE_MS,
-                    ) {
+                    if let Err(e) =
+                        crate::watcher::spawn_watcher(conn, dash_tx_watcher.clone(), DEBOUNCE_MS)
+                    {
                         eprintln!(
                             "[marrow daemon] watcher error for {}: {e}",
                             canonical.display()
@@ -92,7 +89,9 @@ pub async fn run() -> Result<()> {
         let listener = UnixListener::bind(&sock_path)?;
         eprintln!("[marrow daemon] listening on unix:{}", sock_path.display());
         axum::serve(listener, routes::build_router(state))
-            .with_graceful_shutdown(async { let _ = shutdown_rx.await; })
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
             .await?;
     }
     #[cfg(not(unix))]
@@ -102,7 +101,9 @@ pub async fn run() -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
         eprintln!("[marrow daemon] listening on tcp:{addr}");
         axum::serve(listener, routes::build_router(state))
-            .with_graceful_shutdown(async { let _ = shutdown_rx.await; })
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
             .await?;
     }
     Ok(())

@@ -136,14 +136,23 @@ mod tests {
     fn plist_content_contains_binary_path() {
         let bin = PathBuf::from("/usr/local/bin/marrow");
         let plist = generate_plist(&bin);
-        assert!(plist.contains("/usr/local/bin/marrow"), "plist missing binary: {plist}");
-        assert!(plist.contains("daemon"), "plist must pass 'daemon' arg: {plist}");
+        assert!(
+            plist.contains("/usr/local/bin/marrow"),
+            "plist missing binary: {plist}"
+        );
+        assert!(
+            plist.contains("daemon"),
+            "plist must pass 'daemon' arg: {plist}"
+        );
     }
 
     #[test]
     fn systemd_unit_contains_binary_path() {
         let bin = PathBuf::from("/usr/local/bin/marrow");
         let unit = generate_systemd_unit(&bin);
-        assert!(unit.contains("/usr/local/bin/marrow daemon"), "unit missing exec: {unit}");
+        assert!(
+            unit.contains("/usr/local/bin/marrow daemon"),
+            "unit missing exec: {unit}"
+        );
     }
 }

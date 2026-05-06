@@ -1,6 +1,6 @@
 mod daemon;
-mod db;
 mod dashboard;
+mod db;
 mod ingestion;
 mod ipc;
 mod retrieval;
@@ -12,6 +12,7 @@ mod watcher;
 use std::{
     fmt::Write as FmtWrite,
     fs,
+    io::IsTerminal,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::Instant,
@@ -20,17 +21,16 @@ use std::{
 use anyhow::{Context as _, Result};
 use dashboard::DashboardEvent;
 use rmcp::{
-    RoleServer, ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResult, Content, Implementation,
-        InitializeRequestParams, InitializeResult,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
-        ToolsCapability,
+        CallToolRequestParams, CallToolResult, Content, Implementation, InitializeRequestParams,
+        InitializeResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+        Tool, ToolsCapability,
     },
     service::RequestContext,
     transport::stdio,
+    RoleServer, ServerHandler, ServiceExt,
 };
-use state::{IndexState, set_index_state, update_index_progress};
+use state::{set_index_state, update_index_progress, IndexState};
 
 const DASHBOARD_EMIT_URL: &str = "http://127.0.0.1:8765/api/emit";
 
@@ -124,25 +124,35 @@ pub(crate) fn format_capsule_string(capsule: &retrieval::ContextCapsule) -> Stri
         out,
         "CONTEXT CAPSULE — pivot: {} ({})",
         capsule.pivot.symbol_name, capsule.pivot.language
-    ).ok();
+    )
+    .ok();
     writeln!(out, "File : {}", capsule.pivot.file_path).ok();
     writeln!(out, "Type : {}", capsule.pivot.symbol_type).ok();
-    writeln!(out, "\n── FULL SOURCE ──────────────────────────────────────────────").ok();
+    writeln!(
+        out,
+        "\n── FULL SOURCE ──────────────────────────────────────────────"
+    )
+    .ok();
     writeln!(out, "{}", capsule.pivot.text).ok();
 
     if capsule.neighbors.is_empty() {
-        writeln!(out, "── NEIGHBORS ────────────────────────────────────────────────").ok();
+        writeln!(
+            out,
+            "── NEIGHBORS ────────────────────────────────────────────────"
+        )
+        .ok();
         writeln!(out, "  (none — isolated symbol)").ok();
     } else {
         for n in &capsule.neighbors {
             writeln!(
                 out,
                 "\n── NEIGHBOR  [{rel}]  {name}  ({lang})  {path}",
-                rel  = n.relationship,
+                rel = n.relationship,
                 name = n.node.symbol_name,
                 lang = n.node.language,
                 path = n.node.file_path,
-            ).ok();
+            )
+            .ok();
             writeln!(out, "{}", n.node.text).ok();
         }
     }
@@ -168,19 +178,253 @@ fn fmt_num(n: usize) -> String {
     out.chars().rev().collect()
 }
 
+const BENCHMARK_REPOSITORY_LIMIT: usize = 50;
+const BENCHMARK_SYMBOL_LIMIT: usize = 50;
+const BENCHMARK_FILTER_LIMIT: usize = 50;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BenchmarkRepositoryChoice {
+    repo_id: String,
+    root_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BenchmarkSymbolChoice {
+    repo_id: String,
+    symbol_name: String,
+    file_path: String,
+    language: String,
+    symbol_type: String,
+}
+
+struct BenchmarkMeasurement {
+    file_path: String,
+    file_tokens: usize,
+    capsule_tokens: usize,
+    provenance: retrieval::CapsuleProvenance,
+    #[cfg(test)]
+    optimized_text: String,
+}
+
+fn benchmark_usage(program: &str) -> String {
+    format!("Usage: {program} benchmark [--precise-file-tokens] <symbol> <repo_id>")
+}
+
+fn benchmark_prompts_available() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+fn benchmark_repository_choices(
+    conn: &rusqlite::Connection,
+    limit: usize,
+) -> anyhow::Result<Vec<BenchmarkRepositoryChoice>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, root_path
+         FROM repositories
+         ORDER BY id ASC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        Ok(BenchmarkRepositoryChoice {
+            repo_id: row.get(0)?,
+            root_path: row.get(1)?,
+        })
+    })?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn escape_like_pattern(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn benchmark_symbol_choices(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    search: &str,
+    language: Option<&str>,
+    symbol_type: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<(Vec<BenchmarkSymbolChoice>, bool)> {
+    let search = search.trim();
+    let pattern = format!("%{}%", escape_like_pattern(search));
+    let language = language.filter(|value| !value.is_empty());
+    let symbol_type = symbol_type.filter(|value| !value.is_empty());
+    let query_limit = limit.saturating_add(1) as i64;
+
+    let mut stmt = conn.prepare(
+        "SELECT repo_id, symbol_name, file_path, language, symbol_type
+         FROM nodes
+         WHERE repo_id = ?1
+           AND (?2 = '' OR symbol_name LIKE ?3 ESCAPE '\\' OR file_path LIKE ?3 ESCAPE '\\')
+           AND (?4 IS NULL OR language = ?4)
+           AND (?5 IS NULL OR symbol_type = ?5)
+         ORDER BY symbol_name COLLATE NOCASE ASC, file_path ASC, id ASC
+         LIMIT ?6",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![repo_id, search, pattern, language, symbol_type, query_limit],
+        |row| {
+            Ok(BenchmarkSymbolChoice {
+                repo_id: row.get(0)?,
+                symbol_name: row.get(1)?,
+                file_path: row.get(2)?,
+                language: row.get(3)?,
+                symbol_type: row.get(4)?,
+            })
+        },
+    )?;
+    let mut choices = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let limited = choices.len() > limit;
+    choices.truncate(limit);
+    Ok((choices, limited))
+}
+
+fn benchmark_distinct_node_values(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    column: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<String>> {
+    let sql = format!(
+        "SELECT DISTINCT {column}
+         FROM nodes
+         WHERE repo_id = ?1
+         ORDER BY {column} COLLATE NOCASE ASC
+         LIMIT ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![repo_id, limit as i64], |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn benchmark_repo_symbol_count(conn: &rusqlite::Connection, repo_id: &str) -> anyhow::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
+        rusqlite::params![repo_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn benchmark_prompt_select(
+    prompt: &str,
+    items: &[String],
+    default: usize,
+) -> anyhow::Result<Option<usize>> {
+    use dialoguer::{theme::ColorfulTheme, Select};
+
+    match Select::with_theme(&ColorfulTheme::default())
+        .with_prompt(prompt)
+        .items(items)
+        .default(default.min(items.len().saturating_sub(1)))
+        .interact_opt()
+    {
+        Ok(choice) => Ok(choice),
+        Err(dialoguer::Error::IO(err)) if err.kind() == std::io::ErrorKind::Interrupted => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn benchmark_prompt_input(prompt: &str) -> anyhow::Result<Option<String>> {
+    use dialoguer::{theme::ColorfulTheme, Input};
+
+    match Input::<String>::with_theme(&ColorfulTheme::default())
+        .with_prompt(prompt)
+        .allow_empty(true)
+        .interact_text()
+    {
+        Ok(value) => Ok(Some(value)),
+        Err(dialoguer::Error::IO(err)) if err.kind() == std::io::ErrorKind::Interrupted => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn benchmark_optional_filter(
+    prompt: &str,
+    values: &[String],
+) -> anyhow::Result<Option<Option<String>>> {
+    if values.is_empty() {
+        return Ok(Some(None));
+    }
+
+    let mut items = Vec::with_capacity(values.len() + 1);
+    items.push("Any".to_string());
+    items.extend(values.iter().cloned());
+
+    let Some(selection) = benchmark_prompt_select(prompt, &items, 0)? else {
+        return Ok(None);
+    };
+    if selection == 0 {
+        Ok(Some(None))
+    } else {
+        Ok(Some(Some(items[selection].clone())))
+    }
+}
+
+fn resolve_benchmark_file_path(
+    conn: &rusqlite::Connection,
+    symbol: &str,
+    repo_id: &str,
+    filepath: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(filepath) = filepath {
+        return conn
+            .query_row(
+                "SELECT file_path FROM nodes
+                 WHERE symbol_name = ?1 AND repo_id = ?2 AND file_path = ?3
+                 ORDER BY file_path ASC, id ASC
+                 LIMIT 1",
+                rusqlite::params![symbol, repo_id, filepath],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Selected symbol '{}' in repo '{}' at '{}' is no longer available.",
+                    symbol,
+                    repo_id,
+                    filepath
+                )
+            });
+    }
+
+    conn.query_row(
+        "SELECT file_path FROM nodes
+         WHERE symbol_name = ?1 AND repo_id = ?2
+         ORDER BY file_path ASC, id ASC
+         LIMIT 1",
+        rusqlite::params![symbol, repo_id],
+        |row| row.get(0),
+    )
+    .map_err(|_| anyhow::anyhow!("Symbol '{}' not found in repo '{}'.", symbol, repo_id))
+}
+
 /// Build the terminal benchmark table.
 ///
 /// Layout (67-char inner width, 69-char total with border chars):
 ///   header rows span full 67 chars (W = L + 1 + R = 27 + 1 + 39)
 ///   metric rows: 27-char left col │ 39-char right col
 fn format_benchmark_table(
-    symbol:         &str,
-    repo_id:        &str,
-    file_path:      &str,
-    file_tokens:    usize,
+    symbol: &str,
+    repo_id: &str,
+    file_path: &str,
+    file_tokens: usize,
     capsule_tokens: usize,
+    provenance: &retrieval::CapsuleProvenance,
 ) -> String {
-    let saved     = file_tokens.saturating_sub(capsule_tokens);
+    let saved = file_tokens.saturating_sub(capsule_tokens);
     let reduction = if file_tokens == 0 {
         0.0_f64
     } else {
@@ -192,24 +436,28 @@ fn format_benchmark_table(
     const R: usize = 39; // right value column
     const W: usize = L + 1 + R; // total inner width = 67
 
-    let h_full  = "─".repeat(W);
-    let h_left  = "─".repeat(L);
+    let h_full = "─".repeat(W);
+    let h_left = "─".repeat(L);
     let h_right = "─".repeat(R);
 
     let hdr_title = "  Marrow Token Benchmark".to_string();
-    let hdr_sym   = format!("  Symbol: {symbol}  ·  Repo: {repo_id}");
-    let hdr_file  = format!("  File:   {file_path}");
+    let hdr_sym = format!("  Symbol: {symbol}  ·  Repo: {repo_id}");
+    let hdr_file = format!("  File:   {file_path}");
 
     let row = |label: &str, value: &str| -> String {
-        format!("│  {label:<25}│  {value:<37}│\n", label = label, value = value)
+        format!(
+            "│  {label:<25}│  {value:<37}│\n",
+            label = label,
+            value = value
+        )
     };
 
     let mut t = String::new();
     // Top border + header
     writeln!(t, "┌{h_full}┐").ok();
     writeln!(t, "│{hdr_title:<W$}│", W = W).ok();
-    writeln!(t, "│{hdr_sym:<W$}│",   W = W).ok();
-    writeln!(t, "│{hdr_file:<W$}│",  W = W).ok();
+    writeln!(t, "│{hdr_sym:<W$}│", W = W).ok();
+    writeln!(t, "│{hdr_file:<W$}│", W = W).ok();
     // Column divider
     writeln!(t, "├{h_left}┬{h_right}┤").ok();
     // Column headers
@@ -217,10 +465,36 @@ fn format_benchmark_table(
     // Body divider
     writeln!(t, "├{h_left}┼{h_right}┤").ok();
     // Metric rows
-    t.push_str(&row("Original File Tokens", &fmt_num(file_tokens)));
-    t.push_str(&row("Capsule Tokens",       &fmt_num(capsule_tokens)));
-    t.push_str(&row("Tokens Saved",         &fmt_num(saved)));
-    t.push_str(&row("Reduction",            &format!("{:.1}%", reduction)));
+    t.push_str(&row("Baseline Tokens", &fmt_num(file_tokens)));
+    t.push_str(&row("Baseline Source", &provenance.baseline_token_source));
+    t.push_str(&row("Tokenizer", &provenance.tokenizer_mode));
+    t.push_str(&row("Original Mode", &provenance.original_mode));
+    t.push_str(&row("Proof Mode", &provenance.proof_label));
+    t.push_str(&row(
+        "Precise File Tokens",
+        if provenance.precise_file_tokens {
+            "true"
+        } else {
+            "false"
+        },
+    ));
+    t.push_str(&row(
+        "Original Max Bytes",
+        &provenance
+            .original_max_bytes
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    ));
+    t.push_str(&row(
+        "Proof Caps",
+        &format!(
+            "{} bytes / {} files",
+            provenance.proof_max_bytes, provenance.proof_max_files
+        ),
+    ));
+    t.push_str(&row("Capsule Tokens", &fmt_num(capsule_tokens)));
+    t.push_str(&row("Tokens Saved", &fmt_num(saved)));
+    t.push_str(&row("Reduction", &format!("{:.1}%", reduction)));
     // Bottom border
     write!(t, "└{h_left}┴{h_right}┘").ok();
     t
@@ -232,42 +506,185 @@ fn format_benchmark_table(
 /// 3. Build the Context Capsule and format it.
 /// 4. Count tokens in both strings.
 /// 5. Print the table.
-fn run_benchmark(
-    conn:                 &rusqlite::Connection,
-    symbol:               &str,
-    repo_id:              &str,
-    precise_file_tokens:  bool,
-) -> anyhow::Result<()> {
-    // ── Step 1: resolve file path for display ────────────────────────
-    let file_path: String = conn
-        .query_row(
-            "SELECT file_path FROM nodes \
-             WHERE symbol_name = ?1 AND repo_id = ?2 LIMIT 1",
-            rusqlite::params![symbol, repo_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| {
-            anyhow::anyhow!("Symbol '{}' not found in repo '{}'.", symbol, repo_id)
-        })?;
+fn benchmark_measurement(
+    conn: &rusqlite::Connection,
+    symbol: &str,
+    repo_id: &str,
+    filepath: Option<&str>,
+    precise_file_tokens: bool,
+) -> anyhow::Result<BenchmarkMeasurement> {
+    let file_path = resolve_benchmark_file_path(conn, symbol, repo_id, filepath)?;
+    let result = retrieval::get_context_capsule(conn, symbol, repo_id, filepath)?;
 
-    // ── Step 2: build capsule (file_tokens is mode-aware in the engine) ─
-    let result = retrieval::get_context_capsule(conn, symbol, repo_id, None)?;
-
-    // ── Step 3: count tokens ──────────────────────────────────────────
+    let mut provenance = result.provenance.clone();
     let file_tokens = if precise_file_tokens {
-        retrieval::sum_precise_tokens_touched_by_capsule(conn, symbol, repo_id, None)?
+        let measured =
+            retrieval::measure_precise_tokens_touched_by_capsule(conn, symbol, repo_id, filepath)?;
+        if !measured.failed_paths.is_empty() {
+            anyhow::bail!(
+                "exact baseline unavailable: failed to tokenize touched file(s): {}",
+                measured.failed_paths.join(", ")
+            );
+        }
+        provenance.baseline_token_source = "exact".to_string();
+        provenance.tokenizer_mode = measured.tokenizer_mode;
+        provenance.precise_file_tokens = true;
+        provenance.touched_file_count = measured.touched_file_count;
+        measured.tokens
     } else {
         result.file_tokens
     };
     let capsule_tokens = count_tokens(&result.optimized_text)?;
 
-    // ── Step 4: print table ───────────────────────────────────────────
+    Ok(BenchmarkMeasurement {
+        file_path,
+        file_tokens,
+        capsule_tokens,
+        provenance,
+        #[cfg(test)]
+        optimized_text: result.optimized_text,
+    })
+}
+
+fn run_benchmark(
+    conn: &rusqlite::Connection,
+    symbol: &str,
+    repo_id: &str,
+    filepath: Option<&str>,
+    precise_file_tokens: bool,
+) -> anyhow::Result<()> {
+    let measurement = benchmark_measurement(conn, symbol, repo_id, filepath, precise_file_tokens)?;
+
     eprintln!(
         "{}",
-        format_benchmark_table(symbol, repo_id, &file_path, file_tokens, capsule_tokens)
+        format_benchmark_table(
+            symbol,
+            repo_id,
+            &measurement.file_path,
+            measurement.file_tokens,
+            measurement.capsule_tokens,
+            &measurement.provenance
+        )
     );
 
     Ok(())
+}
+
+fn cmd_benchmark_wizard(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    let repos = benchmark_repository_choices(conn, BENCHMARK_REPOSITORY_LIMIT)?;
+    if repos.is_empty() {
+        eprintln!("No repositories found in the graph database. Run `marrow index` first.");
+        return Ok(());
+    }
+
+    let repo_labels: Vec<String> = repos
+        .iter()
+        .map(|repo| format!("{}  ({})", repo.repo_id, repo.root_path))
+        .collect();
+    let Some(repo_index) = benchmark_prompt_select("Select repository", &repo_labels, 0)? else {
+        eprintln!("Benchmark cancelled.");
+        return Ok(());
+    };
+    let repo = &repos[repo_index];
+
+    if benchmark_repo_symbol_count(conn, &repo.repo_id)? == 0 {
+        eprintln!(
+            "Repository '{}' has no symbols in the graph. Run `marrow index` for that workspace.",
+            repo.repo_id
+        );
+        return Ok(());
+    }
+
+    let languages =
+        benchmark_distinct_node_values(conn, &repo.repo_id, "language", BENCHMARK_FILTER_LIMIT)?;
+    let symbol_types =
+        benchmark_distinct_node_values(conn, &repo.repo_id, "symbol_type", BENCHMARK_FILTER_LIMIT)?;
+
+    loop {
+        let Some(search) = benchmark_prompt_input("Search symbol name or file path")? else {
+            eprintln!("Benchmark cancelled.");
+            return Ok(());
+        };
+        let Some(language) = benchmark_optional_filter("Filter by language", &languages)? else {
+            eprintln!("Benchmark cancelled.");
+            return Ok(());
+        };
+        let Some(symbol_type) = benchmark_optional_filter("Filter by symbol type", &symbol_types)?
+        else {
+            eprintln!("Benchmark cancelled.");
+            return Ok(());
+        };
+
+        let (symbols, limited) = benchmark_symbol_choices(
+            conn,
+            &repo.repo_id,
+            &search,
+            language.as_deref(),
+            symbol_type.as_deref(),
+            BENCHMARK_SYMBOL_LIMIT,
+        )?;
+
+        if symbols.is_empty() {
+            eprintln!("No symbols matched. Revise the search text or filters.");
+            let retry_items = vec!["Revise search/filter".to_string(), "Cancel".to_string()];
+            match benchmark_prompt_select("No results", &retry_items, 0)? {
+                Some(0) => continue,
+                _ => {
+                    eprintln!("Benchmark cancelled.");
+                    return Ok(());
+                }
+            }
+        }
+
+        if limited {
+            eprintln!(
+                "Showing the first {BENCHMARK_SYMBOL_LIMIT} matching symbols. Narrow the search/filter to reach omitted results."
+            );
+        }
+
+        let mut symbol_labels: Vec<String> = symbols
+            .iter()
+            .map(|symbol| {
+                format!(
+                    "{}  [{} {}]  {}",
+                    symbol.symbol_name, symbol.language, symbol.symbol_type, symbol.file_path
+                )
+            })
+            .collect();
+        symbol_labels.push("Revise search/filter".to_string());
+        symbol_labels.push("Cancel".to_string());
+
+        let Some(symbol_index) = benchmark_prompt_select("Select symbol", &symbol_labels, 0)?
+        else {
+            eprintln!("Benchmark cancelled.");
+            return Ok(());
+        };
+        if symbol_index == symbols.len() {
+            continue;
+        }
+        if symbol_index > symbols.len() {
+            eprintln!("Benchmark cancelled.");
+            return Ok(());
+        }
+
+        let selected = &symbols[symbol_index];
+        let modes = vec![
+            "Estimated baseline (default)".to_string(),
+            "Exact proof mode (--precise-file-tokens)".to_string(),
+        ];
+        let Some(mode_index) = benchmark_prompt_select("Select benchmark mode", &modes, 0)? else {
+            eprintln!("Benchmark cancelled.");
+            return Ok(());
+        };
+
+        return run_benchmark(
+            conn,
+            &selected.symbol_name,
+            &selected.repo_id,
+            Some(&selected.file_path),
+            mode_index == 1,
+        );
+    }
 }
 
 // ── Server struct ─────────────────────────────────────────────────────────────
@@ -276,16 +693,13 @@ fn run_benchmark(
 /// Clone + Send + Sync, as required by rmcp's ServerHandler bound.
 #[derive(Clone)]
 struct ContextEngine {
-    db:          Arc<Mutex<rusqlite::Connection>>,
+    db: Arc<Mutex<rusqlite::Connection>>,
     http_client: reqwest::Client,
 }
 
 impl ContextEngine {
     #[allow(dead_code)]
-    fn new(
-        db_path:     &str,
-        http_client: reqwest::Client,
-    ) -> Result<Self> {
+    fn new(db_path: &str, http_client: reqwest::Client) -> Result<Self> {
         let conn = db::init_db(db_path)?;
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
@@ -301,11 +715,7 @@ impl ContextEngine {
 
     /// Non-blocking guard for tool calls while the boot-time indexer is still
     /// building the AST graph in the background.
-    fn maybe_jit_index(
-        &self,
-        _repo_id: &str,
-        _fallback_root: &std::path::Path,
-    ) -> Option<String> {
+    fn maybe_jit_index(&self, _repo_id: &str, _fallback_root: &std::path::Path) -> Option<String> {
         state::run_pipeline_guard_message()
     }
 
@@ -412,21 +822,15 @@ impl ContextEngine {
         });
     }
 
-
     /// Pull a required string argument out of the tool arguments map, returning
     /// a well-formed MCP error if absent.
     fn require_str<'a>(
         args: &'a serde_json::Map<String, serde_json::Value>,
         key: &str,
     ) -> Result<&'a str, rmcp::ErrorData> {
-        args.get(key)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                rmcp::ErrorData::invalid_params(
-                    format!("missing required argument: '{key}'"),
-                    None,
-                )
-            })
+        args.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+            rmcp::ErrorData::invalid_params(format!("missing required argument: '{key}'"), None)
+        })
     }
 }
 
@@ -446,7 +850,10 @@ fn current_workspace_root() -> PathBuf {
     if let Ok(override_path) = std::env::var("MARROW_WORKSPACE") {
         let p = PathBuf::from(&override_path);
         if let Ok(canonical) = p.canonicalize() {
-            trace!("current_workspace_root: MARROW_WORKSPACE override → {}", canonical.display());
+            trace!(
+                "current_workspace_root: MARROW_WORKSPACE override → {}",
+                canonical.display()
+            );
             return canonical;
         }
     }
@@ -461,7 +868,10 @@ fn current_workspace_root() -> PathBuf {
         let mut probe = cwd.clone();
         loop {
             if probe.join(".marrowrc.json").exists() {
-                trace!("current_workspace_root: found .marrowrc.json → {}", probe.display());
+                trace!(
+                    "current_workspace_root: found .marrowrc.json → {}",
+                    probe.display()
+                );
                 return probe;
             }
             if !probe.pop() {
@@ -475,15 +885,20 @@ fn current_workspace_root() -> PathBuf {
     // to be indexed (64 k+ files). The CLI is invoked from the project root,
     // so checking only the current directory is sufficient.
     if cwd.join(".git").exists() {
-        trace!("current_workspace_root: found .git at cwd → {}", cwd.display());
+        trace!(
+            "current_workspace_root: found .git at cwd → {}",
+            cwd.display()
+        );
         return cwd;
     }
 
     // Tier 4: fall back to cwd
-    trace!("current_workspace_root: no marker found, falling back to cwd → {}", cwd.display());
+    trace!(
+        "current_workspace_root: no marker found, falling back to cwd → {}",
+        cwd.display()
+    );
     cwd
 }
-
 
 fn fallback_repo_id_for_path(path: &Path) -> String {
     path.file_name()
@@ -525,7 +940,8 @@ fn ensure_repo_ready(
                 rusqlite::params![repo_id],
                 |row| row.get::<_, i64>(0),
             )
-            .unwrap_or(0) > 0;
+            .unwrap_or(0)
+            > 0;
         if !exists {
             return Err(anyhow::anyhow!(
                 "Repo '{}' not found in the Marrow database. Run ingest_repo first.",
@@ -574,7 +990,12 @@ fn path_contains_marrow_marker(path: &Path) -> bool {
 }
 
 fn workspace_is_initialized(root: &Path) -> bool {
-    let rules = [".cursorrules", ".clinerules", ".roomrules", ".windsurfrules"];
+    let rules = [
+        ".cursorrules",
+        ".clinerules",
+        ".roomrules",
+        ".windsurfrules",
+    ];
     root.join(".marrow").is_dir()
         && root.join(".marrowrc.json").exists()
         && root.join(".vscode/mcp.json").exists()
@@ -635,9 +1056,7 @@ fn read_workspace_config() -> serde_json::Value {
 
 fn read_enforcement_mode() -> EnforcementMode {
     let cfg = read_workspace_config();
-    EnforcementMode::from_config_value(
-        cfg.get("enforcement_mode").and_then(|v| v.as_str()),
-    )
+    EnforcementMode::from_config_value(cfg.get("enforcement_mode").and_then(|v| v.as_str()))
 }
 
 fn apply_compliance_gate(
@@ -669,7 +1088,10 @@ fn apply_compliance_gate(
         )),
         EnforcementMode::Default => {
             let mut routed = serde_json::Map::new();
-            routed.insert("intent".to_string(), serde_json::Value::String(intent.to_string()));
+            routed.insert(
+                "intent".to_string(),
+                serde_json::Value::String(intent.to_string()),
+            );
             if let Some(key) = target_key {
                 if let Some(value) = args.remove(key) {
                     routed.insert("target".to_string(), value);
@@ -740,10 +1162,16 @@ fn coverage_status_for_agent(
     let global_target = agent.target_path(skills::Scope::Global, home);
 
     if project_target.exists() && path_contains_marrow_marker(&project_target) {
-        return ("protected", format!("project instructions at {}", project_target.display()));
+        return (
+            "protected",
+            format!("project instructions at {}", project_target.display()),
+        );
     }
     if global_target.exists() && path_contains_marrow_marker(&global_target) {
-        return ("protected", format!("global instructions at {}", global_target.display()));
+        return (
+            "protected",
+            format!("global instructions at {}", global_target.display()),
+        );
     }
 
     let fallback_hits: Vec<String> = fallback_paths_for_agent(agent, workspace_root)
@@ -754,7 +1182,10 @@ fn coverage_status_for_agent(
     if !fallback_hits.is_empty() {
         return (
             "partial",
-            format!("fallback workspace files present: {}", fallback_hits.join(", ")),
+            format!(
+                "fallback workspace files present: {}",
+                fallback_hits.join(", ")
+            ),
         );
     }
 
@@ -849,12 +1280,16 @@ async fn try_auto_init() -> Option<String> {
     }
     let result = tokio::task::spawn_blocking(|| -> anyhow::Result<()> {
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        std::fs::create_dir_all(root.join(".marrow"))
-            .map_err(|e| {
-                eprintln!("[MARROW AUTO-INIT] Warning: could not create .marrow/: {e}");
-                e
-            })?;
-        if let Err(e) = write_workspace_rules(&root, &[0, 1, 2], WORKSPACE_RULES_CONTENT, WriteMode::SafeAppend) {
+        std::fs::create_dir_all(root.join(".marrow")).map_err(|e| {
+            eprintln!("[MARROW AUTO-INIT] Warning: could not create .marrow/: {e}");
+            e
+        })?;
+        if let Err(e) = write_workspace_rules(
+            &root,
+            &[0, 1, 2],
+            WORKSPACE_RULES_CONTENT,
+            WriteMode::SafeAppend,
+        ) {
             eprintln!("[MARROW AUTO-INIT] Warning: could not write workspace rules: {e}");
         }
         if let Err(e) = write_vscode_mcp_config(&root, WriteMode::SafeAppend) {
@@ -925,7 +1360,8 @@ impl ServerHandler for ContextEngine {
         &self,
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<InitializeResult, rmcp::ErrorData>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<InitializeResult, rmcp::ErrorData>> + Send + '_
+    {
         // Capture the connecting client's name from the MCP handshake (best-effort).
         let _ = CLIENT_NAME.set(request.client_info.name.clone());
 
@@ -937,9 +1373,9 @@ impl ServerHandler for ContextEngine {
         async move {
             Ok(InitializeResult {
                 protocol_version: rmcp::model::ProtocolVersion::default(),
-                capabilities:     info.capabilities,
-                server_info:      info.server_info,
-                instructions:     info.instructions,
+                capabilities: info.capabilities,
+                server_info: info.server_info,
+                instructions: info.instructions,
             })
         }
     }
@@ -950,7 +1386,8 @@ impl ServerHandler for ContextEngine {
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_
+    {
         use serde_json::json;
 
         let tools = vec![
@@ -1174,7 +1611,8 @@ impl ServerHandler for ContextEngine {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_
+    {
         let db = Arc::clone(&self.db);
 
         async move {
@@ -1189,15 +1627,16 @@ impl ServerHandler for ContextEngine {
             let stats_db = Arc::clone(&db);
             let args = request.arguments.unwrap_or_default();
             let enforcement_mode = read_enforcement_mode();
-            let compliance = match apply_compliance_gate(&original_tool_name, args, enforcement_mode) {
-                Ok(rewrite) => rewrite,
-                Err(err) => {
-                    if let Ok(conn) = db.lock() {
-                        let _ = db::increment_stat(&conn, "direct_low_level_rejected", 1);
+            let compliance =
+                match apply_compliance_gate(&original_tool_name, args, enforcement_mode) {
+                    Ok(rewrite) => rewrite,
+                    Err(err) => {
+                        if let Ok(conn) = db.lock() {
+                            let _ = db::increment_stat(&conn, "direct_low_level_rejected", 1);
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
-                }
-            };
+                };
             let compliance_notice = compliance.notice;
             let compliance_action = compliance.action;
             let args = compliance.args;
@@ -1207,89 +1646,120 @@ impl ServerHandler for ContextEngine {
             let mut result = match compliance.tool_name.as_str() {
                 // ── get_context_capsule ───────────────────────────────────────
                 "get_context_capsule" => {
-                    let symbol_name  = Self::require_str(&args, "symbol_name")?.to_string();
-                    let repo_id      = Self::require_str(&args, "repo_id")?.to_string();
-                    let filepath_arg = args.get("filepath").and_then(|v| v.as_str()).map(str::to_string);
-                    let client_name  = CLIENT_NAME.get()
-                                           .cloned()
-                                           .unwrap_or_else(|| "Unknown Agent".to_string());
+                    let symbol_name = Self::require_str(&args, "symbol_name")?.to_string();
+                    let repo_id = Self::require_str(&args, "repo_id")?.to_string();
+                    let filepath_arg = args
+                        .get("filepath")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let client_name = CLIENT_NAME
+                        .get()
+                        .cloned()
+                        .unwrap_or_else(|| "Unknown Agent".to_string());
 
                     let cwd = current_workspace_root();
                     if let Some(msg) = self.maybe_jit_index(&repo_id, &cwd) {
                         return Ok(CallToolResult::success(vec![Content::text(msg)]));
                     }
 
-                    let sym_for_event  = symbol_name.clone();
+                    let sym_for_event = symbol_name.clone();
                     let repo_for_event = repo_id.clone();
 
-                    let (out, original_text, capsule_tokens, file_tokens, abs_file_path) =
-                        tokio::task::spawn_blocking(move || {
-                            let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
-                            let cwd = current_workspace_root();
-                            let _resolved_repo_id =
-                                ensure_repo_ready(&conn, Some(&repo_id), &cwd)?;
+                    let (
+                        out,
+                        original_text,
+                        capsule_tokens,
+                        file_tokens,
+                        abs_file_path,
+                        proof_snapshot,
+                        provenance,
+                    ) = tokio::task::spawn_blocking(move || {
+                        let conn = db
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                        let cwd = current_workspace_root();
+                        let _resolved_repo_id = ensure_repo_ready(&conn, Some(&repo_id), &cwd)?;
 
-                            let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())?;
+                        let capsule_result = retrieval::get_context_capsule(
+                            &conn,
+                            &symbol_name,
+                            &repo_id,
+                            filepath_arg.as_deref(),
+                        )?;
 
-                            let full_file_tokens  = capsule_result.file_tokens;
-                            let optimized_tokens  = capsule_result.optimized_text.len() / 4;
-                            let original_text_out = capsule_result.original_text;
-                            let out               = capsule_result.optimized_text;
+                        let full_file_tokens = capsule_result.file_tokens;
+                        let optimized_tokens = capsule_result.optimized_text.len() / 4;
+                        let original_text_out = capsule_result.original_text;
+                        let proof_snapshot = capsule_result.proof_snapshot;
+                        let provenance = capsule_result.provenance;
+                        let out = capsule_result.optimized_text;
 
-                            // Derive the absolute pivot file path for the dashboard event.
-                            let abs_path_str: String = conn
-                                .query_row(
-                                    "SELECT n.file_path, r.root_path \
+                        // Derive the absolute pivot file path for the dashboard event.
+                        let abs_path_str: String = conn
+                            .query_row(
+                                "SELECT n.file_path, r.root_path \
                                      FROM nodes n \
                                      JOIN repositories r ON r.id = n.repo_id \
                                      WHERE n.symbol_name = ?1 AND n.repo_id = ?2 \
                                      ORDER BY n.file_path ASC LIMIT 1",
-                                    rusqlite::params![symbol_name, repo_id],
-                                    |row| {
-                                        let fp: String = row.get(0)?;
-                                        let rp: String = row.get(1)?;
-                                        Ok(std::path::PathBuf::from(&rp)
-                                            .join(&fp)
-                                            .to_string_lossy()
-                                            .to_string())
-                                    },
-                                )
-                                .unwrap_or_else(|_| symbol_name.clone());
+                                rusqlite::params![symbol_name, repo_id],
+                                |row| {
+                                    let fp: String = row.get(0)?;
+                                    let rp: String = row.get(1)?;
+                                    Ok(std::path::PathBuf::from(&rp)
+                                        .join(&fp)
+                                        .to_string_lossy()
+                                        .to_string())
+                                },
+                            )
+                            .unwrap_or_else(|_| symbol_name.clone());
 
-                            // Persist to lifetime stats
-                            let saved = (full_file_tokens as i64).saturating_sub(optimized_tokens as i64);
-                            let _ = db::increment_stat(&conn, "total_requests",     1);
-                            let _ = db::increment_stat(&conn, "total_file_tokens",  full_file_tokens as i64);
-                            let _ = db::increment_stat(&conn, "total_tokens_saved", saved);
+                        // Persist to lifetime stats
+                        let saved =
+                            (full_file_tokens as i64).saturating_sub(optimized_tokens as i64);
+                        let _ = db::increment_stat(&conn, "total_requests", 1);
+                        let _ =
+                            db::increment_stat(&conn, "total_file_tokens", full_file_tokens as i64);
+                        let _ = db::increment_stat(&conn, "total_tokens_saved", saved);
 
-                            Ok::<_, anyhow::Error>((out, original_text_out, optimized_tokens, full_file_tokens, abs_path_str))
-                        })
-                        .await
-                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-                        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                        Ok::<_, anyhow::Error>((
+                            out,
+                            original_text_out,
+                            optimized_tokens,
+                            full_file_tokens,
+                            abs_path_str,
+                            proof_snapshot,
+                            provenance,
+                        ))
+                    })
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
                     let tokens_saved = file_tokens.saturating_sub(capsule_tokens);
 
-                    let original_for_emit =
-                        if retrieval::capsule_original_mode() == retrieval::CapsuleOriginalMode::None
-                            && original_text.is_empty()
-                        {
-                            None
-                        } else {
-                            Some(original_text)
-                        };
+                    let original_for_emit = if retrieval::capsule_original_mode()
+                        == retrieval::CapsuleOriginalMode::None
+                        && original_text.is_empty()
+                    {
+                        None
+                    } else {
+                        Some(original_text)
+                    };
 
                     let event = DashboardEvent::CapsuleServed {
-                        symbol:         sym_for_event,
-                        repo:           repo_for_event,
-                        file:           abs_file_path,
+                        symbol: sym_for_event,
+                        repo: repo_for_event,
+                        file: abs_file_path,
                         capsule_tokens,
                         file_tokens,
                         tokens_saved,
-                        origin:         client_name,
-                        ts:             dashboard::now_ts(),
-                        original_text:  original_for_emit,
+                        origin: client_name,
+                        ts: dashboard::now_ts(),
+                        original_text: original_for_emit,
                         optimized_text: Some(out.clone()),
+                        proof_snapshot: proof_snapshot.map(Box::new),
+                        provenance: Box::new(provenance),
                         has_cached_delta: false,
                     };
                     let http_client = self.http_client.clone();
@@ -1316,15 +1786,18 @@ impl ServerHandler for ContextEngine {
                 // ── analyze_impact ────────────────────────────────────────────
                 "analyze_impact" => {
                     let symbol_name = Self::require_str(&args, "symbol_name")?.to_string();
-                    let repo_id     = Self::require_str(&args, "repo_id")?.to_string();
-                    let filepath_arg = args.get("filepath").and_then(|v| v.as_str()).map(str::to_string);
+                    let repo_id = Self::require_str(&args, "repo_id")?.to_string();
+                    let filepath_arg = args
+                        .get("filepath")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
 
                     let cwd = current_workspace_root();
                     if let Some(msg) = self.maybe_jit_index(&repo_id, &cwd) {
                         return Ok(CallToolResult::success(vec![Content::text(msg)]));
                     }
 
-                    let sym_clone  = symbol_name.clone();
+                    let sym_clone = symbol_name.clone();
                     let repo_clone = repo_id.clone();
 
                     let result = tokio::task::spawn_blocking(move || {
@@ -1332,10 +1805,14 @@ impl ServerHandler for ContextEngine {
                             .lock()
                             .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
                         let cwd = current_workspace_root();
-                        let _resolved_repo_id =
-                            ensure_repo_ready(&conn, Some(&repo_id), &cwd)?;
+                        let _resolved_repo_id = ensure_repo_ready(&conn, Some(&repo_id), &cwd)?;
 
-                        retrieval::analyze_impact(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())
+                        retrieval::analyze_impact(
+                            &conn,
+                            &symbol_name,
+                            &repo_id,
+                            filepath_arg.as_deref(),
+                        )
                     })
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -1391,10 +1868,10 @@ impl ServerHandler for ContextEngine {
                     }
 
                     let event = DashboardEvent::ImpactAnalyzed {
-                        symbol:         sym_clone,
-                        repo:           repo_clone,
+                        symbol: sym_clone,
+                        repo: repo_clone,
                         affected_count: result.affected.len(),
-                        ts:             dashboard::now_ts(),
+                        ts: dashboard::now_ts(),
                     };
                     let http_client = self.http_client.clone();
                     tokio::spawn(async move {
@@ -1419,8 +1896,8 @@ impl ServerHandler for ContextEngine {
 
                 // ── ingest_repo ───────────────────────────────────────────────
                 "ingest_repo" => {
-                    let repo_id   = Self::require_str(&args, "repo_id")?.to_string();
-                    let raw_path  = Self::require_str(&args, "root_path")?.to_string();
+                    let repo_id = Self::require_str(&args, "repo_id")?.to_string();
+                    let raw_path = Self::require_str(&args, "root_path")?.to_string();
                     let user_confirmed = args
                         .get("user_confirmed")
                         .and_then(|v| v.as_bool())
@@ -1455,7 +1932,7 @@ impl ServerHandler for ContextEngine {
                     for blocked_root in blocked_roots {
                         if root_path == blocked_root || root_path.starts_with(blocked_root) {
                             return Ok(CallToolResult::success(vec![Content::text(
-                                "CRITICAL SECURITY: Cannot index protected system directories."
+                                "CRITICAL SECURITY: Cannot index protected system directories.",
                             )]));
                         }
                     }
@@ -1519,16 +1996,27 @@ impl ServerHandler for ContextEngine {
 
                 // ── save_observation ──────────────────────────────────────────
                 "save_observation" => {
-                    let symbol_name      = Self::require_str(&args, "symbol_name")?.to_string();
-                    let filepath         = Self::require_str(&args, "filepath")?.to_string();
+                    let symbol_name = Self::require_str(&args, "symbol_name")?.to_string();
+                    let filepath = Self::require_str(&args, "filepath")?.to_string();
                     let observation_text = Self::require_str(&args, "observation")?.to_string();
-                    let repo_id_arg      = args.get("repo_id").and_then(|v| v.as_str()).map(str::to_string);
+                    let repo_id_arg = args
+                        .get("repo_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
 
                     let result = tokio::task::spawn_blocking(move || {
-                        let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                        let conn = db
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
                         let cwd = current_workspace_root();
                         let repo_id = resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)?;
-                        db::save_observation(&conn, &repo_id, &symbol_name, &filepath, &observation_text)
+                        db::save_observation(
+                            &conn,
+                            &repo_id,
+                            &symbol_name,
+                            &filepath,
+                            &observation_text,
+                        )
                     })
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -1539,12 +2027,23 @@ impl ServerHandler for ContextEngine {
 
                 // ── get_session_context ───────────────────────────────────────
                 "get_session_context" => {
-                    let repo_id     = args.get("repo_id").and_then(|v| v.as_str()).map(str::to_string);
-                    let symbol_name = args.get("symbol_name").and_then(|v| v.as_str()).map(str::to_string);
-                    let filepath    = args.get("filepath").and_then(|v| v.as_str()).map(str::to_string);
+                    let repo_id = args
+                        .get("repo_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let symbol_name = args
+                        .get("symbol_name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let filepath = args
+                        .get("filepath")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
 
                     let result = tokio::task::spawn_blocking(move || {
-                        let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                        let conn = db
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
                         let cwd = current_workspace_root();
                         let resolved_repo_id = match repo_id {
                             Some(ref repo) => Some(repo.clone()),
@@ -1570,12 +2069,17 @@ impl ServerHandler for ContextEngine {
                         .get("target_dir")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
-                    let repo_id_arg = args.get("repo_id").and_then(|v| v.as_str()).map(str::to_string);
+                    let repo_id_arg = args
+                        .get("repo_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
 
                     let cwd = current_workspace_root();
                     // Resolve the repo_id for JIT check (may be None → fallback)
                     let jit_repo_id = {
-                        let conn = db.lock().map_err(|_| rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None))?;
+                        let conn = db.lock().map_err(|_| {
+                            rmcp::ErrorData::internal_error("DB mutex poisoned".to_string(), None)
+                        })?;
                         resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
                             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                     };
@@ -1584,10 +2088,11 @@ impl ServerHandler for ContextEngine {
                     }
 
                     let result = tokio::task::spawn_blocking(move || {
-                        let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                        let conn = db
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
                         let cwd = current_workspace_root();
-                        let repo_id =
-                            ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
+                        let repo_id = ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
                         retrieval::get_project_skeleton(&conn, &repo_id, target_dir.as_deref())
                     })
                     .await
@@ -1600,10 +2105,20 @@ impl ServerHandler for ContextEngine {
                 // ── run_pipeline ──────────────────────────────────────────────
                 "run_pipeline" => {
                     let intent = Self::require_str(&args, "intent")?.to_string();
-                    let target = args.get("target").and_then(|v| v.as_str()).map(str::to_string);
-                    let repo_id_arg = args.get("repo_id").and_then(|v| v.as_str()).map(str::to_string);
-                    let filepath_arg = args.get("filepath").and_then(|v| v.as_str()).map(str::to_string);
-                    let client_name = CLIENT_NAME.get()
+                    let target = args
+                        .get("target")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let repo_id_arg = args
+                        .get("repo_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let filepath_arg = args
+                        .get("filepath")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let client_name = CLIENT_NAME
+                        .get()
                         .cloned()
                         .unwrap_or_else(|| "Unknown Agent".to_string());
 
@@ -1624,17 +2139,23 @@ impl ServerHandler for ContextEngine {
                         if node_count == 0 {
                             let cwd = current_workspace_root();
                             if cwd.is_dir() {
-                                let repo_id = resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
-                                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                                let repo_id =
+                                    resolve_request_repo_id(&conn, repo_id_arg.as_deref(), &cwd)
+                                        .map_err(|e| {
+                                            rmcp::ErrorData::internal_error(e.to_string(), None)
+                                        })?;
                                 eprintln!(
                                     "[MARROW] run_pipeline JIT auto-indexing '{}' at {} …",
-                                    repo_id, cwd.display()
+                                    repo_id,
+                                    cwd.display()
                                 );
                                 let t = Instant::now();
-                                ingestion::ingest_repo(&conn, &repo_id, &cwd)
-                                    .map_err(|e| rmcp::ErrorData::internal_error(
-                                        format!("JIT auto-indexing failed: {e}"), None,
-                                    ))?;
+                                ingestion::ingest_repo(&conn, &repo_id, &cwd).map_err(|e| {
+                                    rmcp::ErrorData::internal_error(
+                                        format!("JIT auto-indexing failed: {e}"),
+                                        None,
+                                    )
+                                })?;
                                 eprintln!(
                                     "[MARROW] run_pipeline JIT auto-indexing complete in {}ms.",
                                     t.elapsed().as_millis()
@@ -1753,7 +2274,7 @@ impl ServerHandler for ContextEngine {
                                 return Ok(CallToolResult::success(vec![Content::text(msg)]));
                             }
 
-                            let (out, original_text, capsule_tokens, file_tokens, abs_file_path, repo_used) =
+                            let (out, original_text, capsule_tokens, file_tokens, abs_file_path, repo_used, proof_snapshot, provenance) =
                                 tokio::task::spawn_blocking(move || {
                                     let t_lock = Instant::now();
                                     let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
@@ -1768,6 +2289,8 @@ impl ServerHandler for ContextEngine {
                                     let full_file_tokens  = capsule_result.file_tokens;
                                     let optimized_tokens  = capsule_result.optimized_text.len() / 4;
                                     let original_text_out = capsule_result.original_text;
+                                    let proof_snapshot    = capsule_result.proof_snapshot;
+                                    let provenance        = capsule_result.provenance;
                                     let out               = capsule_result.optimized_text;
                                     trace!("explore_symbol: get_context_capsule [{:?}ms] — orig={}B opt={}B", t_cap.elapsed().as_millis(), original_text_out.len(), out.len());
 
@@ -1794,7 +2317,7 @@ impl ServerHandler for ContextEngine {
                                     let _ = db::increment_stat(&conn, "total_file_tokens",  full_file_tokens as i64);
                                     let _ = db::increment_stat(&conn, "total_tokens_saved", saved);
 
-                                    Ok::<_, anyhow::Error>((out, original_text_out, optimized_tokens, full_file_tokens, abs_path_str, repo_id))
+                                    Ok::<_, anyhow::Error>((out, original_text_out, optimized_tokens, full_file_tokens, abs_path_str, repo_id, proof_snapshot, provenance))
                                 })
                                 .await
                                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -1823,6 +2346,8 @@ impl ServerHandler for ContextEngine {
                                 ts:             dashboard::now_ts(),
                                 original_text:  original_for_emit,
                                 optimized_text: Some(out.clone()),
+                                proof_snapshot: proof_snapshot.map(Box::new),
+                                provenance: Box::new(provenance),
                                 has_cached_delta: false,
                             };
                             let http_client = self.http_client.clone();
@@ -1867,7 +2392,7 @@ impl ServerHandler for ContextEngine {
                                 return Ok(CallToolResult::success(vec![Content::text(msg)]));
                             }
 
-                            let (out, capsule_tokens, file_tokens, abs_file_path, repo_used) =
+                            let (out, capsule_tokens, file_tokens, abs_file_path, repo_used, provenance) =
                                 tokio::task::spawn_blocking(move || {
                                     let t_lock = Instant::now();
                                     let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
@@ -1881,6 +2406,7 @@ impl ServerHandler for ContextEngine {
                                     let result = retrieval::trace_logic_flow(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())?;
                                     let optimized_tokens = result.optimized_text.len() / 4;
                                     let file_tokens = result.file_tokens;
+                                    let provenance = result.provenance;
                                     let out = result.optimized_text;
                                     trace!("trace_flow: trace_logic_flow [{:?}ms] — {}B", t_trace.elapsed().as_millis(), out.len());
 
@@ -1905,7 +2431,7 @@ impl ServerHandler for ContextEngine {
                                     let _ = db::increment_stat(&conn, "total_file_tokens",  file_tokens as i64);
                                     let _ = db::increment_stat(&conn, "total_tokens_saved", saved);
 
-                                    Ok::<_, anyhow::Error>((out, optimized_tokens, file_tokens, abs_path_str, repo_id))
+                                    Ok::<_, anyhow::Error>((out, optimized_tokens, file_tokens, abs_path_str, repo_id, provenance))
                                 })
                                 .await
                                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -1925,6 +2451,8 @@ impl ServerHandler for ContextEngine {
                                 ts:             dashboard::now_ts(),
                                 original_text:  None,
                                 optimized_text: Some(out.clone()),
+                                proof_snapshot: None,
+                                provenance: Box::new(provenance),
                                 has_cached_delta: false,
                             };
                             let http_client = self.http_client.clone();
@@ -2054,9 +2582,14 @@ impl ServerHandler for ContextEngine {
                         args.get("enforcement_mode").and_then(|v| v.as_str()),
                     );
                     tokio::task::spawn_blocking(move || {
-                        let workspace_root = std::env::current_dir()
-                            .unwrap_or_else(|_| PathBuf::from("."));
-                        write_workspace_rules(&workspace_root, &[0, 1, 2], WORKSPACE_RULES_CONTENT, WriteMode::SafeAppend)?;
+                        let workspace_root =
+                            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                        write_workspace_rules(
+                            &workspace_root,
+                            &[0, 1, 2],
+                            WORKSPACE_RULES_CONTENT,
+                            WriteMode::SafeAppend,
+                        )?;
                         write_vscode_mcp_config(&workspace_root, WriteMode::SafeAppend)?;
                         ensure_workspace_config(Some(enforcement_mode))?;
                         Ok::<_, anyhow::Error>(workspace_root)
@@ -2093,15 +2626,21 @@ impl ServerHandler for ContextEngine {
 
             // Prepend compliance notice and auto-init notice to successful responses
             if let (Some(notice), Ok(ref mut tool_result)) = (&compliance_notice, &mut result) {
-                tool_result.content.insert(0, Content::text(notice.as_str()));
+                tool_result
+                    .content
+                    .insert(0, Content::text(notice.as_str()));
             }
             if let (Some(notice), Ok(ref mut tool_result)) = (&init_notice, &mut result) {
-                tool_result.content.insert(0, Content::text(notice.as_str()));
+                tool_result
+                    .content
+                    .insert(0, Content::text(notice.as_str()));
             }
             // M-13 FIX: Prepend auto-indexed system note when JIT ran
             if jit_auto_indexed {
                 if let Ok(ref mut tool_result) = result {
-                    tool_result.content.insert(0, Content::text("[SYSTEM NOTE: Auto-Indexed]\n\n"));
+                    tool_result
+                        .content
+                        .insert(0, Content::text("[SYSTEM NOTE: Auto-Indexed]\n\n"));
                 }
             }
 
@@ -2191,36 +2730,194 @@ mod tests {
             neighbors: vec![],
         };
         let s = format_capsule_string(&capsule);
-        assert!(s.contains("foo"),           "symbol name missing: {s}");
+        assert!(s.contains("foo"), "symbol name missing: {s}");
         assert!(s.contains("def foo(): pass"), "pivot text missing: {s}");
-        assert!(s.contains("none"),          "isolated-symbol marker missing: {s}");
+        assert!(s.contains("none"), "isolated-symbol marker missing: {s}");
     }
 
     #[test]
     fn format_benchmark_table_contains_all_metrics() {
-        let table = format_benchmark_table(
-            "my_func",
-            "my_repo",
-            "src/foo.cpp",
-            1_000,
-            100,
-        );
+        let provenance = retrieval::CapsuleProvenance {
+            baseline_token_source: "exact".to_string(),
+            tokenizer_mode: "cl100k_base".to_string(),
+            original_mode: "none".to_string(),
+            proof_label: "cached_proof".to_string(),
+            precise_file_tokens: true,
+            original_max_bytes: None,
+            proof_max_bytes: 16_384,
+            proof_max_files: 8,
+            touched_file_count: 2,
+        };
+        let table =
+            format_benchmark_table("my_func", "my_repo", "src/foo.cpp", 1_000, 100, &provenance);
         // Header info
-        assert!(table.contains("my_func"),     "symbol missing:\n{table}");
-        assert!(table.contains("my_repo"),     "repo missing:\n{table}");
+        assert!(table.contains("my_func"), "symbol missing:\n{table}");
+        assert!(table.contains("my_repo"), "repo missing:\n{table}");
         assert!(table.contains("src/foo.cpp"), "file path missing:\n{table}");
         // Metric values
-        assert!(table.contains("1,000"),       "file tokens missing:\n{table}");
-        assert!(table.contains("100"),         "capsule tokens missing:\n{table}");
-        assert!(table.contains("900"),         "saved tokens missing:\n{table}");
-        assert!(table.contains("90.0%"),       "reduction % missing:\n{table}");
+        assert!(table.contains("1,000"), "file tokens missing:\n{table}");
+        assert!(table.contains("100"), "capsule tokens missing:\n{table}");
+        assert!(table.contains("900"), "saved tokens missing:\n{table}");
+        assert!(table.contains("90.0%"), "reduction % missing:\n{table}");
+        assert!(table.contains("exact"), "baseline source missing:\n{table}");
+        assert!(table.contains("cl100k_base"), "tokenizer missing:\n{table}");
     }
 
     #[test]
     fn format_benchmark_table_zero_reduction_when_equal() {
-        let table = format_benchmark_table("s", "r", "f.py", 500, 500);
+        let table = format_benchmark_table(
+            "s",
+            "r",
+            "f.py",
+            500,
+            500,
+            &retrieval::CapsuleProvenance::default(),
+        );
         assert!(table.contains("Tokens Saved"), "label missing:\n{table}");
-        assert!(table.contains("0.0%"),         "reduction should be 0.0%:\n{table}");
+        assert!(table.contains("0.0%"), "reduction should be 0.0%:\n{table}");
+    }
+
+    fn insert_benchmark_repo(conn: &rusqlite::Connection, id: &str, root_path: &str) {
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![id, root_path],
+        )
+        .unwrap();
+    }
+
+    fn insert_benchmark_node(
+        conn: &rusqlite::Connection,
+        repo_id: &str,
+        file_path: &str,
+        language: &str,
+        symbol_name: &str,
+        symbol_type: &str,
+        raw_text: &str,
+    ) {
+        let id = format!("{repo_id}:{file_path}:{symbol_name}");
+        conn.execute(
+            "INSERT INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![id, repo_id, file_path, language, symbol_name, symbol_type, raw_text],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn benchmark_repository_choices_are_bounded_and_deterministic() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        insert_benchmark_repo(&conn, "repo_c", "/tmp/c");
+        insert_benchmark_repo(&conn, "repo_a", "/tmp/a");
+        insert_benchmark_repo(&conn, "repo_b", "/tmp/b");
+
+        let choices = benchmark_repository_choices(&conn, 2).unwrap();
+
+        assert_eq!(choices.len(), 2);
+        assert_eq!(choices[0].repo_id, "repo_a");
+        assert_eq!(choices[0].root_path, "/tmp/a");
+        assert_eq!(choices[1].repo_id, "repo_b");
+    }
+
+    #[test]
+    fn benchmark_symbol_choices_scope_search_filter_and_bound_results() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        insert_benchmark_repo(&conn, "repo_a", "/tmp/a");
+        insert_benchmark_repo(&conn, "repo_b", "/tmp/b");
+        insert_benchmark_node(
+            &conn,
+            "repo_a",
+            "src/foo.py",
+            "py",
+            "foo",
+            "function",
+            "def foo(): pass",
+        );
+        insert_benchmark_node(
+            &conn,
+            "repo_a",
+            "src/foo_utils.ts",
+            "ts",
+            "helper",
+            "function",
+            "function helper() {}",
+        );
+        insert_benchmark_node(
+            &conn,
+            "repo_a",
+            "src/widget.ts",
+            "ts",
+            "Widget",
+            "class",
+            "class Widget {}",
+        );
+        insert_benchmark_node(
+            &conn,
+            "repo_b",
+            "src/foo.py",
+            "py",
+            "foo",
+            "function",
+            "def foo(): pass",
+        );
+
+        let (choices, limited) =
+            benchmark_symbol_choices(&conn, "repo_a", "foo", Some("ts"), Some("function"), 10)
+                .unwrap();
+
+        assert!(!limited);
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].repo_id, "repo_a");
+        assert_eq!(choices[0].symbol_name, "helper");
+        assert_eq!(choices[0].file_path, "src/foo_utils.ts");
+
+        let (choices, limited) =
+            benchmark_symbol_choices(&conn, "repo_a", "", None, None, 2).unwrap();
+        assert!(limited);
+        assert_eq!(choices.len(), 2);
+        assert!(choices.iter().all(|choice| choice.repo_id == "repo_a"));
+    }
+
+    #[test]
+    fn benchmark_measurement_uses_selected_filepath_for_duplicate_symbols() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("left.py"),
+            "def dupe():\n    return 'left'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("right.py"),
+            "def dupe():\n    return 'right'\n",
+        )
+        .unwrap();
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        insert_benchmark_repo(&conn, "repo", &root.path().to_string_lossy());
+        insert_benchmark_node(
+            &conn,
+            "repo",
+            "left.py",
+            "py",
+            "dupe",
+            "function",
+            "def dupe():\n    return 'left'\n",
+        );
+        insert_benchmark_node(
+            &conn,
+            "repo",
+            "right.py",
+            "py",
+            "dupe",
+            "function",
+            "def dupe():\n    return 'right'\n",
+        );
+
+        let measurement =
+            benchmark_measurement(&conn, "dupe", "repo", Some("right.py"), false).unwrap();
+
+        assert_eq!(measurement.file_path, "right.py");
+        assert!(measurement.optimized_text.contains("return 'right'"));
+        assert!(!measurement.optimized_text.contains("return 'left'"));
     }
 
     #[test]
@@ -2264,7 +2961,10 @@ mod tests {
             skills::Method::Symlink,
             Path::new("/tmp/home"),
         );
-        assert!(line.contains("GitHub Copilot"), "agent name missing: {line}");
+        assert!(
+            line.contains("GitHub Copilot"),
+            "agent name missing: {line}"
+        );
         assert!(
             line.contains(".github/instructions/marrow-optimization.instructions.md"),
             "target path missing: {line}"
@@ -2331,11 +3031,17 @@ mod tests {
             notice_str.contains("[MARROW AUTO-INIT]"),
             "notice should contain MARROW AUTO-INIT tag"
         );
-        assert!(tmp.path().join(".marrow").is_dir(), ".marrow/ should exist after init");
+        assert!(
+            tmp.path().join(".marrow").is_dir(),
+            ".marrow/ should exist after init"
+        );
 
         // Second call: .marrow/ now exists → should return None
         let second = try_auto_init().await;
-        assert!(second.is_none(), "expected None on second call when .marrow/ exists");
+        assert!(
+            second.is_none(),
+            "expected None on second call when .marrow/ exists"
+        );
 
         // Restore CWD
         std::env::set_current_dir(original).unwrap();
@@ -2355,11 +3061,24 @@ mod tests {
             .expect("default mode should auto-route direct low-level calls");
 
         assert_eq!(routed.tool_name, "run_pipeline");
-        assert_eq!(routed.args.get("intent").and_then(|v| v.as_str()), Some("explore_symbol"));
-        assert_eq!(routed.args.get("target").and_then(|v| v.as_str()), Some("bulk_update"));
-        assert_eq!(routed.args.get("repo_id").and_then(|v| v.as_str()), Some("accrualify-rails"));
+        assert_eq!(
+            routed.args.get("intent").and_then(|v| v.as_str()),
+            Some("explore_symbol")
+        );
+        assert_eq!(
+            routed.args.get("target").and_then(|v| v.as_str()),
+            Some("bulk_update")
+        );
+        assert_eq!(
+            routed.args.get("repo_id").and_then(|v| v.as_str()),
+            Some("accrualify-rails")
+        );
         assert!(
-            routed.notice.as_deref().unwrap_or_default().contains("auto-routed"),
+            routed
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("auto-routed"),
             "expected compliance warning notice"
         );
     }
@@ -2399,10 +3118,22 @@ mod tests {
             &conn,
         );
 
-        assert!(report.contains("run_pipeline requests: 5"), "pipeline count missing: {report}");
-        assert!(report.contains("direct low-level auto-routed: 2"), "autoroute count missing: {report}");
-        assert!(report.contains("direct low-level rejected: 1"), "reject count missing: {report}");
-        assert!(report.contains("Enforcement mode: strict"), "mode missing: {report}");
+        assert!(
+            report.contains("run_pipeline requests: 5"),
+            "pipeline count missing: {report}"
+        );
+        assert!(
+            report.contains("direct low-level auto-routed: 2"),
+            "autoroute count missing: {report}"
+        );
+        assert!(
+            report.contains("direct low-level rejected: 1"),
+            "reject count missing: {report}"
+        );
+        assert!(
+            report.contains("Enforcement mode: strict"),
+            "mode missing: {report}"
+        );
     }
 
     #[test]
@@ -2414,19 +3145,28 @@ mod tests {
         fs::write(workspace.path().join(".vscode/mcp.json"), "{}").unwrap();
 
         let summary = format_agent_coverage_summary(workspace.path(), home.path());
-        assert!(summary.contains("Cursor: partial"), "cursor fallback coverage should be partial: {summary}");
+        assert!(
+            summary.contains("Cursor: partial"),
+            "cursor fallback coverage should be partial: {summary}"
+        );
     }
 
     #[test]
     fn agent_coverage_ignores_unrelated_instruction_file_contents() {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let target = workspace.path().join(".cursor/rules/marrow-optimization.mdc");
+        let target = workspace
+            .path()
+            .join(".cursor/rules/marrow-optimization.mdc");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, "unrelated content").unwrap();
 
-        let (status, _) = coverage_status_for_agent(skills::Agent::Cursor, workspace.path(), home.path());
-        assert_eq!(status, "unprotected", "non-Marrow files should not count as protected");
+        let (status, _) =
+            coverage_status_for_agent(skills::Agent::Cursor, workspace.path(), home.path());
+        assert_eq!(
+            status, "unprotected",
+            "non-Marrow files should not count as protected"
+        );
     }
 
     #[test]
@@ -2439,19 +3179,30 @@ mod tests {
 
         conn.execute(
             "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
-            rusqlite::params!["other_repo", indexed_root_path.to_string_lossy().to_string()],
+            rusqlite::params![
+                "other_repo",
+                indexed_root_path.to_string_lossy().to_string()
+            ],
         )
         .unwrap();
 
         // Repo exists in DB — should succeed even from a different workspace.
         let result = ensure_repo_ready(&conn, Some("other_repo"), &current_root_path);
-        assert!(result.is_ok(), "existing repo should be accepted: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "existing repo should be accepted: {:?}",
+            result.err()
+        );
 
         // Repo does NOT exist in DB — should be rejected.
-        let err = ensure_repo_ready(&conn, Some("nonexistent_repo"), &current_root_path).unwrap_err();
+        let err =
+            ensure_repo_ready(&conn, Some("nonexistent_repo"), &current_root_path).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not found"), "expected not-found error: {msg}");
-        assert!(msg.contains("ingest_repo"), "expected guidance to ingest: {msg}");
+        assert!(
+            msg.contains("ingest_repo"),
+            "expected guidance to ingest: {msg}"
+        );
     }
 
     /// M-8: ensure_repo_ready auto-indexes when the repo has no symbols.
@@ -2472,7 +3223,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(count > 0, "auto-indexing should have produced symbols, got {count}");
+        assert!(
+            count > 0,
+            "auto-indexing should have produced symbols, got {count}"
+        );
     }
 
     // ── launch-spec helpers ────────────────────────────────────────────────────
@@ -2482,7 +3236,10 @@ mod tests {
         let spec = mcp_launch_spec();
         let cmd = spec["command"].as_str().expect("command must be a string");
         assert_eq!(cmd, "marrow");
-        assert!(!cmd.starts_with('/'), "command must not be an absolute path: {cmd}");
+        assert!(
+            !cmd.starts_with('/'),
+            "command must not be an absolute path: {cmd}"
+        );
         assert_eq!(spec["args"][0], "mcp");
     }
 
@@ -2495,13 +3252,22 @@ mod tests {
 
         // Command must be an absolute path to a shell — never "marrow" itself.
         #[cfg(not(target_os = "windows"))]
-        assert!(cmd.starts_with('/'), "shell must be an absolute path on Unix: {cmd}");
+        assert!(
+            cmd.starts_with('/'),
+            "shell must be an absolute path on Unix: {cmd}"
+        );
         #[cfg(target_os = "windows")]
-        assert!(cmd.ends_with(".exe"), "shell must be an .exe on Windows: {cmd}");
+        assert!(
+            cmd.ends_with(".exe"),
+            "shell must be an .exe on Windows: {cmd}"
+        );
 
         // The args must ultimately invoke "marrow mcp".
         let full = args_str.join(" ");
-        assert!(full.contains("marrow mcp"), "args must invoke 'marrow mcp': {full}");
+        assert!(
+            full.contains("marrow mcp"),
+            "args must invoke 'marrow mcp': {full}"
+        );
     }
 
     #[test]
@@ -2514,7 +3280,10 @@ mod tests {
     #[test]
     fn gui_safe_path_includes_cargo_bin() {
         let path = gui_safe_path("/some/other/marrow");
-        assert!(path.contains(".cargo/bin"), "expected .cargo/bin in: {path}");
+        assert!(
+            path.contains(".cargo/bin"),
+            "expected .cargo/bin in: {path}"
+        );
     }
 
     #[test]
@@ -2523,7 +3292,11 @@ mod tests {
         let path = gui_safe_path("/usr/local/bin/marrow");
         let segments: Vec<&str> = path.split(':').collect();
         let unique: std::collections::HashSet<_> = segments.iter().collect();
-        assert_eq!(segments.len(), unique.len(), "duplicate entries in PATH: {path}");
+        assert_eq!(
+            segments.len(),
+            unique.len(),
+            "duplicate entries in PATH: {path}"
+        );
     }
 
     #[test]
@@ -2547,7 +3320,10 @@ mod tests {
         let result = validate_marrow_command("/nonexistent/path:/also/nonexistent");
         assert!(result.is_err());
         let msg = format!("{:#}", result.unwrap_err());
-        assert!(msg.contains("not found"), "error should mention not found: {msg}");
+        assert!(
+            msg.contains("not found"),
+            "error should mention not found: {msg}"
+        );
     }
 
     // ── per-agent integration config tests ────────────────────────────────────
@@ -2565,7 +3341,10 @@ mod tests {
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
         assert_eq!(cmd, "marrow", "command must be 'marrow', got: {cmd}");
         assert!(!cmd.starts_with('/'), "command must not be absolute path");
-        assert!(cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string(), "env.PATH must be present");
+        assert!(
+            cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string(),
+            "env.PATH must be present"
+        );
     }
 
     #[test]
@@ -2599,11 +3378,20 @@ mod tests {
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
         // Cursor uses shell wrapper — cmd is the shell binary, not "marrow".
-        assert!(cmd.ends_with("zsh") || cmd.ends_with("bash"), "expected shell binary, got: {cmd}");
+        assert!(
+            cmd.ends_with("zsh") || cmd.ends_with("bash"),
+            "expected shell binary, got: {cmd}"
+        );
         assert_eq!(cfg["mcpServers"]["marrow"]["args"][0], "-lc");
-        assert!(cfg["mcpServers"]["marrow"]["args"][1].as_str().unwrap().contains("marrow mcp"));
+        assert!(cfg["mcpServers"]["marrow"]["args"][1]
+            .as_str()
+            .unwrap()
+            .contains("marrow mcp"));
         // ctx.binary must not appear anywhere in the config.
-        assert!(!raw.contains("/absolute/path/to/marrow"), "binary path must not leak into config");
+        assert!(
+            !raw.contains("/absolute/path/to/marrow"),
+            "binary path must not leak into config"
+        );
     }
 
     #[test]
@@ -2619,7 +3407,10 @@ mod tests {
         let raw = std::fs::read_to_string(vscode_dir.join("mcp.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["servers"]["marrow"]["command"].as_str().unwrap();
-        assert!(cmd.ends_with("zsh") || cmd.ends_with("bash"), "vscode: expected shell binary, got: {cmd}");
+        assert!(
+            cmd.ends_with("zsh") || cmd.ends_with("bash"),
+            "vscode: expected shell binary, got: {cmd}"
+        );
         assert_eq!(cfg["servers"]["marrow"]["args"][0], "-lc");
         assert!(!raw.contains("/absolute/path/to/marrow"));
     }
@@ -2636,7 +3427,10 @@ mod tests {
         let raw = std::fs::read_to_string(home.path().join(".copilot/mcp-config.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
-        assert!(cmd.ends_with("zsh") || cmd.ends_with("bash"), "copilot cli: expected shell binary, got: {cmd}");
+        assert!(
+            cmd.ends_with("zsh") || cmd.ends_with("bash"),
+            "copilot cli: expected shell binary, got: {cmd}"
+        );
         assert_eq!(cfg["mcpServers"]["marrow"]["args"][0], "-lc");
         assert_eq!(cfg["mcpServers"]["marrow"]["type"], "stdio");
         assert!(!raw.contains("/absolute/path/to/marrow"));
@@ -2645,7 +3439,8 @@ mod tests {
     #[test]
     fn integrate_cline_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
-        let cline_dir = home.path()
+        let cline_dir = home
+            .path()
             .join("Library/Application Support/Code/User/globalStorage")
             .join("saoudrizwan.claude-dev/settings");
         std::fs::create_dir_all(&cline_dir).unwrap();
@@ -2657,7 +3452,10 @@ mod tests {
         let raw = std::fs::read_to_string(cline_dir.join("cline_mcp_settings.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
-        assert!(cmd.ends_with("zsh") || cmd.ends_with("bash"), "cline: expected shell binary, got: {cmd}");
+        assert!(
+            cmd.ends_with("zsh") || cmd.ends_with("bash"),
+            "cline: expected shell binary, got: {cmd}"
+        );
         assert_eq!(cfg["mcpServers"]["marrow"]["args"][0], "-lc");
         assert_eq!(cfg["mcpServers"]["marrow"]["disabled"], false);
         assert!(!raw.contains("/absolute/path/to/marrow"));
@@ -2676,8 +3474,13 @@ mod tests {
         integrate_zed(&ctx).unwrap();
         let raw = std::fs::read_to_string(zed_dir.join("settings.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let path_val = cfg["context_servers"]["marrow"]["command"]["path"].as_str().unwrap();
-        assert_eq!(path_val, "marrow", "Zed command.path must be 'marrow', got: {path_val}");
+        let path_val = cfg["context_servers"]["marrow"]["command"]["path"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            path_val, "marrow",
+            "Zed command.path must be 'marrow', got: {path_val}"
+        );
         assert!(!path_val.starts_with('/'));
         assert!(cfg["context_servers"]["marrow"]["command"]["env"]["PATH"].is_string());
     }
@@ -2699,7 +3502,9 @@ mod tests {
         let ag = h.join(".gemini/antigravity/mcp_config.json");
         std::fs::create_dir_all(ag.parent().unwrap()).unwrap();
         std::fs::write(&ag, "{}").unwrap();
-        let cline = h.join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings");
+        let cline = h.join(
+            "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings",
+        );
         std::fs::create_dir_all(&cline).unwrap();
         let zed = h.join(".config/zed");
         std::fs::create_dir_all(&zed).unwrap();
@@ -2745,7 +3550,10 @@ mod tests {
         // Zed must use portable path name in nested command object.
         let zed_raw = std::fs::read_to_string(zed.join("settings.json")).unwrap();
         let zed_cfg: serde_json::Value = serde_json::from_str(&zed_raw).unwrap();
-        assert_eq!(zed_cfg["context_servers"]["marrow"]["command"]["path"], "marrow");
+        assert_eq!(
+            zed_cfg["context_servers"]["marrow"]["command"]["path"],
+            "marrow"
+        );
 
         // Shell-wrapper hosts must use a shell binary, not "marrow" directly.
         for (rel, ptr) in [
@@ -2770,7 +3578,7 @@ mod tests {
 
 /// `marrow ui` — interactive dashboard configuration menu.
 fn cmd_ui() -> Result<()> {
-    use dialoguer::{Select, theme::ColorfulTheme};
+    use dialoguer::{theme::ColorfulTheme, Select};
 
     loop {
         // Re-read config each iteration so the toggle label is always current.
@@ -2785,11 +3593,7 @@ fn cmd_ui() -> Result<()> {
             if auto_open { "ON" } else { "OFF" }
         );
 
-        let items = vec![
-            "Open Dashboard in Browser",
-            toggle_label.as_str(),
-            "Exit",
-        ];
+        let items = vec!["Open Dashboard in Browser", toggle_label.as_str(), "Exit"];
 
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Marrow Dashboard")
@@ -2941,14 +3745,14 @@ pub fn write_vscode_mcp_config(workspace_root: &Path, mode: WriteMode) -> Result
     let marrow_entry = mcp_shell_launch_spec();
 
     // Overwrite mode discards existing config; all other modes preserve it.
-    let mut config: serde_json::Value = if mcp_path.exists() && !matches!(mode, WriteMode::Overwrite) {
-        let raw = fs::read_to_string(&mcp_path)
-            .with_context(|| format!("could not read {}", mcp_path.display()))?;
-        serde_json::from_str(&raw)
-            .unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
+    let mut config: serde_json::Value =
+        if mcp_path.exists() && !matches!(mode, WriteMode::Overwrite) {
+            let raw = fs::read_to_string(&mcp_path)
+                .with_context(|| format!("could not read {}", mcp_path.display()))?;
+            serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
 
     // VS Code workspace mcp.json uses "servers" (not "mcpServers" which is the Cline/Claude format).
     if !config["servers"].is_object() {
@@ -2956,8 +3760,7 @@ pub fn write_vscode_mcp_config(workspace_root: &Path, mode: WriteMode) -> Result
     }
     config["servers"]["marrow"] = marrow_entry;
 
-    let pretty = serde_json::to_string_pretty(&config)
-        .context("could not serialize mcp.json")?;
+    let pretty = serde_json::to_string_pretty(&config).context("could not serialize mcp.json")?;
     fs::write(&mcp_path, pretty)
         .with_context(|| format!("could not write {}", mcp_path.display()))?;
 
@@ -2965,7 +3768,11 @@ pub fn write_vscode_mcp_config(workspace_root: &Path, mode: WriteMode) -> Result
         WriteMode::Overwrite => "overwritten",
         _ => "merged",
     };
-    eprintln!("Wrote VS Code MCP config to {} ({})", mcp_path.display(), action);
+    eprintln!(
+        "Wrote VS Code MCP config to {} ({})",
+        mcp_path.display(),
+        action
+    );
     Ok(Some(mcp_path.display().to_string()))
 }
 
@@ -3059,12 +3866,13 @@ pub fn write_workspace_rules(
                     }
                     #[cfg(unix)]
                     {
-                        std::os::unix::fs::symlink(central, &path)
-                            .with_context(|| format!(
+                        std::os::unix::fs::symlink(central, &path).with_context(|| {
+                            format!(
                                 "could not symlink {} → {}",
                                 path.display(),
                                 central.display()
-                            ))?;
+                            )
+                        })?;
                         eprintln!("Symlinked {} → {}", path.display(), central.display());
                         modified.push(path.display().to_string());
                     }
@@ -3089,7 +3897,12 @@ pub fn write_workspace_rules(
 
 fn cmd_rules() -> Result<()> {
     let root = std::env::current_dir().context("could not determine current directory")?;
-    write_workspace_rules(&root, &[0, 1, 2], WORKSPACE_RULES_CONTENT, WriteMode::SafeAppend)?;
+    write_workspace_rules(
+        &root,
+        &[0, 1, 2],
+        WORKSPACE_RULES_CONTENT,
+        WriteMode::SafeAppend,
+    )?;
     write_vscode_mcp_config(&root, WriteMode::SafeAppend)?;
     ensure_workspace_config(Some(EnforcementMode::Default))?;
     eprintln!("[MARROW] Successfully integrated! Workspace rules appended, VS Code / Copilot MCP configuration generated, and workspace enforcement set to default.");
@@ -3115,16 +3928,17 @@ fn cmd_init() -> Result<()> {
 /// `marrow test-capsules` — run get_context_capsule for every (repo_id, symbol)
 /// in the graph. Reports success/failure counts.
 fn cmd_test_capsules() -> Result<()> {
-    let db_path = std::env::var("MARROW_DB_PATH")
-        .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+    let db_path =
+        std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
     let conn = db::init_db_or_memory(&db_path)?;
 
-    let pairs: Vec<(String, String)> = conn.prepare(
-        "SELECT DISTINCT repo_id, symbol_name FROM nodes ORDER BY repo_id, symbol_name",
-    )?
-    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
-    .filter_map(|r| r.ok())
-    .collect();
+    let pairs: Vec<(String, String)> = conn
+        .prepare("SELECT DISTINCT repo_id, symbol_name FROM nodes ORDER BY repo_id, symbol_name")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
 
     let total = pairs.len();
     let mut ok = 0usize;
@@ -3165,7 +3979,7 @@ const MARROW_BANNER: &str = r#"
 /// Paths + binary string resolved once and threaded into every per-agent fn.
 struct IntegrationCtx {
     binary: String,
-    home:   String,
+    home: String,
 }
 
 /// What a per-agent function reports back.
@@ -3374,8 +4188,7 @@ fn integrate_claude(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
 
 /// ~/.gemini/antigravity/mcp_config.json
 fn integrate_antigravity(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
-    let path = PathBuf::from(&ctx.home)
-        .join(".gemini/antigravity/mcp_config.json");
+    let path = PathBuf::from(&ctx.home).join(".gemini/antigravity/mcp_config.json");
     if !path.exists() {
         return Ok(AgentOutcome::NotFound);
     }
@@ -3410,7 +4223,8 @@ fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     //    Uses shell wrapper — VS Code's extension host resolves command via parent PATH,
     //    so env injection cannot prevent ENOENT for GUI-launched IDE.
     #[cfg(target_os = "macos")]
-    let vscode_path = PathBuf::from(&ctx.home).join("Library/Application Support/Code/User/mcp.json");
+    let vscode_path =
+        PathBuf::from(&ctx.home).join("Library/Application Support/Code/User/mcp.json");
     #[cfg(target_os = "linux")]
     let vscode_path = PathBuf::from(&ctx.home).join(".config/Code/User/mcp.json");
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -3478,7 +4292,7 @@ fn integrate_zed(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
 /// `marrow integrate` — launch the interactive TUI installer.
 fn cmd_integrate() -> Result<()> {
     use console::style;
-    use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
+    use dialoguer::{theme::ColorfulTheme, MultiSelect, Select};
 
     eprintln!("{}", style(MARROW_BANNER).cyan().bold());
     eprintln!(
@@ -3488,13 +4302,25 @@ fn cmd_integrate() -> Result<()> {
     eprintln!();
 
     #[allow(clippy::type_complexity)]
-    let agents: &[(&str, fn(&IntegrationCtx) -> Result<AgentOutcome>, skills::Agent)] = &[
-        ("Claude Code",          integrate_claude,       skills::Agent::ClaudeCode),
-        ("Antigravity (Gemini)", integrate_antigravity,  skills::Agent::Antigravity),
-        ("Cursor",               integrate_cursor,       skills::Agent::Cursor),
-        ("GitHub Copilot",       integrate_copilot,      skills::Agent::GitHubCopilot),
-        ("Cline",                integrate_cline,        skills::Agent::Cline),
-        ("Zed",                  integrate_zed,          skills::Agent::Zed),
+    let agents: &[(
+        &str,
+        fn(&IntegrationCtx) -> Result<AgentOutcome>,
+        skills::Agent,
+    )] = &[
+        ("Claude Code", integrate_claude, skills::Agent::ClaudeCode),
+        (
+            "Antigravity (Gemini)",
+            integrate_antigravity,
+            skills::Agent::Antigravity,
+        ),
+        ("Cursor", integrate_cursor, skills::Agent::Cursor),
+        (
+            "GitHub Copilot",
+            integrate_copilot,
+            skills::Agent::GitHubCopilot,
+        ),
+        ("Cline", integrate_cline, skills::Agent::Cline),
+        ("Zed", integrate_zed, skills::Agent::Zed),
     ];
 
     let labels: Vec<&str> = agents.iter().map(|(name, _, _)| *name).collect();
@@ -3537,7 +4363,10 @@ fn cmd_integrate() -> Result<()> {
             );
             eprintln!(
                 "  {}",
-                style("Continuing install — ensure `marrow` is on PATH before restarting your IDE.").dim()
+                style(
+                    "Continuing install — ensure `marrow` is on PATH before restarting your IDE."
+                )
+                .dim()
             );
             eprintln!();
         }
@@ -3574,7 +4403,14 @@ fn cmd_integrate() -> Result<()> {
             let (name, _, skill_agent) = agents[*idx];
             eprintln!(
                 "    {}",
-                style(format_rule_plan_line(name, skill_agent, scope, method, &home_path)).dim()
+                style(format_rule_plan_line(
+                    name,
+                    skill_agent,
+                    scope,
+                    method,
+                    &home_path
+                ))
+                .dim()
             );
         }
         eprintln!(
@@ -3609,7 +4445,11 @@ fn cmd_integrate() -> Result<()> {
     ensure_workspace_config(Some(enforcement_mode))?;
     eprintln!(
         "  {}",
-        style(format!("Workspace enforcement mode set to '{}'.", enforcement_mode.as_str())).dim()
+        style(format!(
+            "Workspace enforcement mode set to '{}'.",
+            enforcement_mode.as_str()
+        ))
+        .dim()
     );
 
     eprintln!();
@@ -3669,7 +4509,11 @@ fn cmd_integrate() -> Result<()> {
     eprintln!();
     eprintln!(
         "  {}",
-        style(format_agent_coverage_summary(&current_workspace_root(), &home_path)).dim()
+        style(format_agent_coverage_summary(
+            &current_workspace_root(),
+            &home_path
+        ))
+        .dim()
     );
     eprintln!("  {}", style("Done.").bold());
     Ok(())
@@ -3681,8 +4525,8 @@ fn cmd_validate() -> Result<()> {
         .map(PathBuf::from)
         .context("$HOME is not set")?;
     let mode = read_enforcement_mode();
-    let db_path = std::env::var("MARROW_DB_PATH")
-        .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+    let db_path =
+        std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
     let conn = db::init_db(&db_path)?;
     println!(
         "{}",
@@ -3708,6 +4552,8 @@ Options:
   --db <path>       SQLite file (default: .marrow/perf-graph.db)
   --symbol <name>   Symbol for query phase (default: first symbol in graph)
   --fresh           Delete db and SQLite sidecars before ingest
+    --precise-file-tokens
+                                        Measure exact cl100k_base baseline tokens for touched files
   --json            Emit one JSON object on stdout; progress on stderr
   -h, --help        This message
 
@@ -3723,6 +4569,7 @@ See docs/perf-harness.md and docs/perf-baseline-runbook.md.
     let mut symbol_override: Option<String> = None;
     let mut fresh = false;
     let mut json_mode = false;
+    let mut precise_file_tokens = false;
 
     let mut i = 0usize;
     while i < cli_args.len() {
@@ -3761,6 +4608,10 @@ See docs/perf-harness.md and docs/perf-baseline-runbook.md.
             }
             "--json" => {
                 json_mode = true;
+                i += 1;
+            }
+            "--precise-file-tokens" => {
+                precise_file_tokens = true;
                 i += 1;
             }
             other => {
@@ -3816,9 +4667,28 @@ See docs/perf-harness.md and docs/perf-baseline-runbook.md.
     };
 
     let t_query = Instant::now();
-    let _capsule = retrieval::get_context_capsule(&conn, &query_symbol, &rid, None)?;
+    let capsule = retrieval::get_context_capsule(&conn, &query_symbol, &rid, None)?;
     let _impact = retrieval::analyze_impact(&conn, &query_symbol, &rid, None)?;
     let query_wall_ms = t_query.elapsed().as_millis() as u64;
+    let mut provenance = capsule.provenance.clone();
+    let baseline_file_tokens = if precise_file_tokens {
+        let measured =
+            retrieval::measure_precise_tokens_touched_by_capsule(&conn, &query_symbol, &rid, None)?;
+        if !measured.failed_paths.is_empty() {
+            anyhow::bail!(
+                "exact baseline unavailable: failed to tokenize touched file(s): {}",
+                measured.failed_paths.join(", ")
+            );
+        }
+        provenance.baseline_token_source = "exact".to_string();
+        provenance.tokenizer_mode = measured.tokenizer_mode;
+        provenance.precise_file_tokens = true;
+        provenance.touched_file_count = measured.touched_file_count;
+        measured.tokens
+    } else {
+        capsule.file_tokens
+    };
+    let capsule_tokens = count_tokens(&capsule.optimized_text)?;
 
     let db_file_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
     let rss = rusage_max_rss_bytes();
@@ -3848,6 +4718,17 @@ See docs/perf-harness.md and docs/perf-baseline-runbook.md.
         "symbols": symbols,
         "edges": edges,
         "query_symbol": query_symbol,
+        "baseline_file_tokens": baseline_file_tokens,
+        "capsule_tokens": capsule_tokens,
+        "baseline_token_source": provenance.baseline_token_source,
+        "tokenizer_mode": provenance.tokenizer_mode,
+        "original_mode": provenance.original_mode,
+        "proof_mode": provenance.proof_label,
+        "precise_file_tokens": provenance.precise_file_tokens,
+        "original_max_bytes": provenance.original_max_bytes,
+        "proof_max_bytes": provenance.proof_max_bytes,
+        "proof_max_files": provenance.proof_max_files,
+        "touched_file_count": provenance.touched_file_count,
         "db_file_bytes": db_file_bytes,
         "rusage_max_rss_bytes": rss,
         "marrow_version": env!("CARGO_PKG_VERSION"),
@@ -3877,9 +4758,7 @@ See docs/perf-harness.md and docs/perf-baseline-runbook.md.
 fn cmd_index() -> Result<()> {
     let t0 = Instant::now();
     let cwd = std::env::current_dir()?;
-    let root = cwd
-        .canonicalize()
-        .unwrap_or_else(|_| cwd.clone());
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
     let repo_id = root
         .file_name()
         .and_then(|n| n.to_str())
@@ -3916,7 +4795,7 @@ fn cmd_index() -> Result<()> {
 ///   Phase 4 — Execution & summary
 pub fn run_integrate_command(workspace_root: &Path) -> Result<()> {
     use console::style;
-    use dialoguer::{MultiSelect, Select, theme::ColorfulTheme};
+    use dialoguer::{theme::ColorfulTheme, MultiSelect, Select};
 
     // ── Phase 1: Agent Selection ──────────────────────────────────────────────
     let agent_labels = &[
@@ -3932,7 +4811,10 @@ pub fn run_integrate_command(workspace_root: &Path) -> Result<()> {
         .interact()?;
 
     if selected_agents.is_empty() {
-        eprintln!("{}", style("No agents selected. Aborting integration.").yellow());
+        eprintln!(
+            "{}",
+            style("No agents selected. Aborting integration.").yellow()
+        );
         return Ok(());
     }
 
@@ -3980,9 +4862,15 @@ pub fn run_integrate_command(workspace_root: &Path) -> Result<()> {
     let mut summary: Vec<String> = Vec::new();
 
     // Rule files for markdown-based agents (indices 0, 1, 2).
-    let rule_agent_indices: Vec<usize> = selected_agents.iter().copied().filter(|&i| i < 3).collect();
+    let rule_agent_indices: Vec<usize> =
+        selected_agents.iter().copied().filter(|&i| i < 3).collect();
     if !rule_agent_indices.is_empty() {
-        match write_workspace_rules(workspace_root, &rule_agent_indices, rules_content, write_mode) {
+        match write_workspace_rules(
+            workspace_root,
+            &rule_agent_indices,
+            rules_content,
+            write_mode,
+        ) {
             Ok(modified) => summary.extend(modified),
             Err(e) => eprintln!("{}", style(format!("  ✗ Rule file error: {e}")).red()),
         }
@@ -3993,13 +4881,21 @@ pub fn run_integrate_command(workspace_root: &Path) -> Result<()> {
         match write_vscode_mcp_config(workspace_root, write_mode) {
             Ok(Some(path)) => summary.push(path),
             Ok(None) => {}
-            Err(e) => eprintln!("{}", style(format!("  ✗ Copilot MCP config error: {e}")).red()),
+            Err(e) => eprintln!(
+                "{}",
+                style(format!("  ✗ Copilot MCP config error: {e}")).red()
+            ),
         }
     }
 
     // ── Summary ───────────────────────────────────────────────────────────────
     eprintln!();
-    eprintln!("{}", style("[Marrow] Integration complete. Files modified:").green().bold());
+    eprintln!(
+        "{}",
+        style("[Marrow] Integration complete. Files modified:")
+            .green()
+            .bold()
+    );
     if summary.is_empty() {
         eprintln!("  {}", style("(none — all files already up to date)").dim());
     } else {
@@ -4050,14 +4946,10 @@ pub fn run_index_command(workspace_root: &Path) -> Result<()> {
     pb.set_message("indexing");
     pb.enable_steady_tick(Duration::from_millis(120));
 
-    let (symbol_count, edge_count) = ingestion::run_ingestion_with_progress(
-        &conn,
-        &repo_id,
-        &root,
-        |pct| {
+    let (symbol_count, edge_count) =
+        ingestion::run_ingestion_with_progress(&conn, &repo_id, &root, |pct| {
             pb.set_position(pct as u64);
-        },
-    )?;
+        })?;
 
     pb.finish_with_message("indexing complete");
     let elapsed = t0.elapsed();
@@ -4082,25 +4974,33 @@ pub fn run_index_command(workspace_root: &Path) -> Result<()> {
 pub fn run_watch_command(workspace_root: &Path) -> Result<()> {
     use console::style;
     use notify::RecursiveMode;
-    use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
+    use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
     use std::time::Duration;
 
     eprintln!("{}", style("[Marrow] Building baseline index...").cyan());
     run_index_command(workspace_root)?;
 
     let db_path = workspace_root.join(".marrow/graph.db");
-    let conn = Arc::new(Mutex::new(db::init_db_or_memory(&db_path.to_string_lossy())?));
+    let conn = Arc::new(Mutex::new(db::init_db_or_memory(
+        &db_path.to_string_lossy(),
+    )?));
 
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
-    debouncer.watcher().watch(workspace_root, RecursiveMode::Recursive)?;
+    debouncer
+        .watcher()
+        .watch(workspace_root, RecursiveMode::Recursive)?;
 
     eprintln!(
         "{}",
-        style("[Marrow] Watching for changes. Press Ctrl+C to stop.").green().bold()
+        style("[Marrow] Watching for changes. Press Ctrl+C to stop.")
+            .green()
+            .bold()
     );
 
-    let supported_exts = ["cpp", "cc", "cxx", "h", "hpp", "py", "ts", "tsx", "rs", "rb"];
+    let supported_exts = [
+        "cpp", "cc", "cxx", "h", "hpp", "py", "ts", "tsx", "rs", "rb",
+    ];
     let repo_id = workspace_root
         .file_name()
         .and_then(|n| n.to_str())
@@ -4122,7 +5022,11 @@ pub fn run_watch_command(workspace_root: &Path) -> Result<()> {
                     if !ext_ok {
                         continue;
                     }
-                    let rel = path.strip_prefix(workspace_root).unwrap_or(path).to_string_lossy().to_string();
+                    let rel = path
+                        .strip_prefix(workspace_root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .to_string();
                     match ingestion::parse_file(path) {
                         Ok((lang, symbols)) => {
                             if let Ok(conn) = conn.lock() {
@@ -4148,7 +5052,10 @@ pub fn run_watch_command(workspace_root: &Path) -> Result<()> {
                             eprintln!("{}", style(format!("[Marrow] Updated AST for {rel}")).dim());
                         }
                         Err(e) => {
-                            eprintln!("{}", style(format!("[Marrow] Parse error for {rel}: {e}")).yellow());
+                            eprintln!(
+                                "{}",
+                                style(format!("[Marrow] Parse error for {rel}: {e}")).yellow()
+                            );
                         }
                     }
                 }
@@ -4163,7 +5070,7 @@ pub fn run_watch_command(workspace_root: &Path) -> Result<()> {
 /// Interactive TUI — shown when `marrow` is run with no arguments.
 fn cmd_interactive() -> Result<()> {
     use console::style;
-    use dialoguer::{Select, theme::ColorfulTheme};
+    use dialoguer::{theme::ColorfulTheme, Select};
 
     // Clear terminal
     print!("\x1B[2J\x1B[1;1H");
@@ -4203,10 +5110,14 @@ fn cmd_interactive() -> Result<()> {
         3 => {
             eprintln!(
                 "{}",
-                style("[Marrow] Starting MCP server... (tip: run 'marrow mcp' to bypass the menu)").yellow()
+                style("[Marrow] Starting MCP server... (tip: run 'marrow mcp' to bypass the menu)")
+                    .yellow()
             );
             let current_exe = std::env::current_exe()?;
-            std::process::Command::new(current_exe).arg("mcp").spawn()?.wait()?;
+            std::process::Command::new(current_exe)
+                .arg("mcp")
+                .spawn()?
+                .wait()?;
         }
         _ => eprintln!("{}", style("Goodbye.").dim()),
     }
@@ -4223,9 +5134,9 @@ fn cmd_status() -> Result<()> {
     rt.block_on(async {
         let client = ipc::default_client();
         match client.health_check().await {
-            Ok(true)  => println!("[marrow] daemon is running."),
+            Ok(true) => println!("[marrow] daemon is running."),
             Ok(false) => println!("[marrow] daemon is NOT running."),
-            Err(e)    => println!("[marrow] status check error: {e}"),
+            Err(e) => println!("[marrow] status check error: {e}"),
         }
     });
     Ok(())
@@ -4298,62 +5209,73 @@ async fn main() -> Result<()> {
         }
         // Human interactive mode: no arguments → launch the TUI menu.
         None => return cmd_interactive(),
-        Some("ui")        => return cmd_ui(),
-        Some("init")      => return cmd_init(),
-        Some("rules")     => return cmd_rules(),
-        Some("index")     => return cmd_index(),
+        Some("ui") => return cmd_ui(),
+        Some("init") => return cmd_init(),
+        Some("rules") => return cmd_rules(),
+        Some("index") => return cmd_index(),
         Some("test-capsules") => return cmd_test_capsules(),
         Some("perf-harness") => {
             let rest: Vec<String> = args.iter().skip(2).cloned().collect();
             return cmd_perf_harness(&rest);
         }
         Some("maintenance") => {
-            let db_path = std::env::var("MARROW_DB_PATH")
-                .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+            let db_path =
+                std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
             let conn = db::init_db_or_memory(&db_path)?;
             db::run_graph_maintenance(&conn)?;
-            println!("[marrow] maintenance complete (WAL checkpoint + incremental_vacuum) on {db_path}");
+            println!(
+                "[marrow] maintenance complete (WAL checkpoint + incremental_vacuum) on {db_path}"
+            );
             return Ok(());
         }
         Some("integrate") => return cmd_integrate(),
-        Some("validate")  => return cmd_validate(),
-Some("benchmark") => {
+        Some("validate") => return cmd_validate(),
+        Some("benchmark") => {
             let mut tail: Vec<String> = args.iter().skip(2).cloned().collect();
-            let precise = tail.iter().position(|a| a == "--precise-file-tokens").map(|i| {
-                tail.remove(i);
-                true
-            }).unwrap_or(false);
+            let precise = tail
+                .iter()
+                .position(|a| a == "--precise-file-tokens")
+                .map(|i| {
+                    tail.remove(i);
+                    true
+                })
+                .unwrap_or(false);
 
-            let symbol = tail.first().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Usage: {} benchmark [--precise-file-tokens] <symbol> <repo_id>",
-                    args[0]
-                )
-            })?;
-            let repo_id = tail.get(1).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Usage: {} benchmark [--precise-file-tokens] <symbol> <repo_id>",
-                    args[0]
-                )
-            })?;
+            if tail.is_empty() && !precise {
+                let db_path = std::env::var("MARROW_DB_PATH")
+                    .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+                if benchmark_prompts_available() {
+                    let conn = db::init_db_or_memory(&db_path)?;
+                    cmd_benchmark_wizard(&conn)?;
+                    return Ok(());
+                }
+                anyhow::bail!("{}", benchmark_usage(&args[0]));
+            }
 
-            let db_path = std::env::var("MARROW_DB_PATH")
-                .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+            let symbol = tail
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("{}", benchmark_usage(&args[0])))?;
+            let repo_id = tail
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("{}", benchmark_usage(&args[0])))?;
+
+            let db_path =
+                std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
 
             let conn = db::init_db_or_memory(&db_path)?;
-            run_benchmark(&conn, symbol, repo_id, precise)?;
+            run_benchmark(&conn, symbol, repo_id, None, precise)?;
             return Ok(());
         }
         Some("query") => {
-            let symbol = args.get(2).ok_or_else(|| {
-                anyhow::anyhow!("Usage: {} query <symbol> <repo_id>", args[0])
-            })?;
-            let repo_id = args.get(3).ok_or_else(|| {
-                anyhow::anyhow!("Usage: {} query <symbol> <repo_id>", args[0])
-            })?;
+            let symbol = args
+                .get(2)
+                .ok_or_else(|| anyhow::anyhow!("Usage: {} query <symbol> <repo_id>", args[0]))?;
+            let repo_id = args
+                .get(3)
+                .ok_or_else(|| anyhow::anyhow!("Usage: {} query <symbol> <repo_id>", args[0]))?;
 
-            let db_path = std::env::var("MARROW_DB_PATH")
-                .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+            let db_path =
+                std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
 
             let conn = db::init_db_or_memory(&db_path)?;
             let result = retrieval::get_context_capsule(&conn, symbol, repo_id, None)?;
@@ -4365,7 +5287,10 @@ Some("benchmark") => {
                 println!("  No downstream dependents found.");
             } else {
                 for n in impact.affected {
-                    println!("  [Depth {}] {} ({}) in {}", n.depth, n.symbol_name, n.symbol_type, n.file_path);
+                    println!(
+                        "  [Depth {}] {} ({}) in {}",
+                        n.depth, n.symbol_name, n.symbol_type, n.file_path
+                    );
                 }
             }
             return Ok(());
@@ -4374,8 +5299,8 @@ Some("benchmark") => {
             return daemon::run().await;
         }
         Some("status") => return cmd_status(),
-        Some("stop")   => return cmd_stop(),
-        Some("watch")  => {
+        Some("stop") => return cmd_stop(),
+        Some("watch") => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -4412,23 +5337,34 @@ Some("benchmark") => {
     }
 
     // ── Default: start MCP stdio server ──────────────────────────────
-    let db_path = std::env::var("MARROW_DB_PATH")
-        .unwrap_or_else(|_| ".marrow/graph.db".to_string());
+    let db_path =
+        std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
 
     // ── Read config flags in one pass ───────────────────────────────
     // Config read is always best-effort; a missing/unreadable file is not fatal.
     let (show_dashboard, auto_open_ui, enable_watcher, watch_debounce_ms) = {
         let cfg = read_workspace_config();
-        let show      = cfg.get("show_dashboard").and_then(|b| b.as_bool()).unwrap_or(true);
-        let open      = cfg.get("auto_open_ui").and_then(|b| b.as_bool()).unwrap_or(true);
-        let watcher   = cfg.get("enable_watcher").and_then(|b| b.as_bool()).unwrap_or(false);
-        let debounce  = cfg.get("watch_debounce_ms").and_then(|v| v.as_u64()).unwrap_or(500);
+        let show = cfg
+            .get("show_dashboard")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(true);
+        let open = cfg
+            .get("auto_open_ui")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(true);
+        let watcher = cfg
+            .get("enable_watcher")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        let debounce = cfg
+            .get("watch_debounce_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(500);
         (show, open, watcher, debounce)
     };
 
-
     // ── Init DB (falls back to :memory: on read-only filesystems) ─────
-    let conn   = db::init_db_or_memory(&db_path)?;
+    let conn = db::init_db_or_memory(&db_path)?;
     let db_arc = Arc::new(Mutex::new(conn));
 
     // ── Create the HTTP client once — shared by Hub startup and engine ─
@@ -4453,14 +5389,17 @@ Some("benchmark") => {
             dashboard::HubRole::Hub => {
                 // Fire-and-forget: POST ServerStarted to ourselves.
                 // Spawned so we don't block while the listener finishes binding.
-                let client  = http_client.clone();
+                let client = http_client.clone();
                 let db_path = db_path.clone();
                 tokio::spawn(async move {
                     // Brief yield so the Axum accept-loop is ready.
                     tokio::time::sleep(std::time::Duration::from_millis(DASHBOARD_WARMUP_MS)).await;
                     match client
                         .post(DASHBOARD_EMIT_URL)
-                        .json(&DashboardEvent::ServerStarted { port: 8765, db_path })
+                        .json(&DashboardEvent::ServerStarted {
+                            port: 8765,
+                            db_path,
+                        })
                         .send()
                         .await
                     {
@@ -4490,7 +5429,7 @@ Some("benchmark") => {
 
     // ── Build engine ──────────────────────────────────────────────────
     let engine = ContextEngine {
-        db:          Arc::clone(&db_arc),
+        db: Arc::clone(&db_arc),
         http_client,
     };
 

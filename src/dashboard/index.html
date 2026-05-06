@@ -179,7 +179,8 @@
       display: none;
       flex-direction: column;
       flex: 1;
-      overflow: hidden;
+      overflow-x: hidden;
+      overflow-y: auto;
       padding: 16px 20px 0;
     }
 
@@ -238,7 +239,8 @@
 
     /* ── Table section ─────────────────────────────────────────────────────── */
     .table-wrap {
-      flex: 1;
+      flex: 1 0 120px;
+      min-height: 120px;
       overflow-y: auto;
       border: 1px solid var(--border);
       border-radius: 4px;
@@ -350,9 +352,9 @@
       font-size: 12px;
       color: var(--text);
       white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      max-width: 340px;
+      overflow: visible;
+      text-overflow: clip;
+      max-width: none;
     }
 
     .tool-label .sym {
@@ -529,6 +531,8 @@
 
     /* ── View Delta button ──────────────────────────────────────────────────── */
     .view-delta-btn {
+      position: relative;
+      z-index: 1;
       background: none;
       border: 1px solid var(--specimen-border-strong);
       color: var(--dim);
@@ -540,6 +544,7 @@
       border-radius: 3px;
       cursor: pointer;
       margin-left: 8px;
+      scroll-margin-top: 44px;
       vertical-align: middle;
       transition: color 0.15s, border-color 0.15s;
     }
@@ -547,6 +552,19 @@
       color: var(--green);
       border-color: var(--green);
       text-shadow: 0 0 6px var(--green-glow);
+    }
+
+    .evidence-tag {
+      display: inline-flex;
+      align-items: center;
+      margin-left: 8px;
+      padding: 2px 6px;
+      border: 1px solid rgba(128, 148, 168, 0.35);
+      border-radius: 4px;
+      color: var(--dim);
+      font-size: 10px;
+      line-height: 1.2;
+      white-space: nowrap;
     }
 
     /* ── Compare Modal ──────────────────────────────────────────────────────── */
@@ -1449,6 +1467,15 @@
       text-shadow: none;
     }
 
+    .evidence-tag {
+      color: var(--specimen-muted);
+      border-color: rgba(185, 198, 212, 0.9);
+      background: rgba(255, 255, 255, 0.7);
+      font-family: var(--font-ui);
+      font-size: 10px;
+      font-weight: 700;
+    }
+
     #compare-overlay {
       background: rgba(23, 37, 53, 0.28);
       backdrop-filter: blur(10px);
@@ -1747,8 +1774,9 @@
           <div class="card-value" id="s-requests">0</div>
         </div>
         <div class="card">
-          <div class="card-label">Full-File Tokens</div>
+          <div class="card-label">Baseline Tokens</div>
           <div class="card-value cyan" id="s-file-tokens">0</div>
+          <div class="card-sub" id="s-file-tokens-sub">estimated unless exact benchmark</div>
         </div>
         <div class="card">
           <div class="card-label">Tokens Saved</div>
@@ -1757,7 +1785,7 @@
         <div class="card">
           <div class="card-label">Reduction %</div>
           <div class="card-value amber" id="s-reduction">0.0%</div>
-          <div class="card-sub" id="s-reduction-sub">capsule vs. full-file</div>
+          <div class="card-sub" id="s-reduction-sub">dashboard estimate; benchmark for exact</div>
         </div>
         <div class="card">
           <div class="card-label">Attached DB Size</div>
@@ -1962,7 +1990,7 @@
     <div id="compare-panes">
       <div class="compare-pane" id="pane-original">
         <div class="compare-pane-header">
-          <span class="pane-label">Original Context</span>
+          <span class="pane-label" id="pane-original-label">Baseline Evidence</span>
           <span class="pane-chars" id="pane-original-chars">— tokens</span>
         </div>
         <div class="compare-pane-body" id="pane-original-body">
@@ -2080,6 +2108,33 @@
     return `<span class="badge ${cls}">${escHtml(label)}</span>`;
   }
 
+  function provenanceOf(data) {
+    return (data && data.provenance) ? data.provenance : {};
+  }
+
+  function proofOf(data) {
+    return (data && data.proof_snapshot) ? data.proof_snapshot : {};
+  }
+
+  function evidenceLabel(data) {
+    const p = provenanceOf(data);
+    const proof = proofOf(data);
+    const source = p.baseline_token_source || proof.token_source || 'estimated';
+    const proofLabel = p.proof_label || proof.proof_label || 'unavailable';
+    if (source === 'exact') return 'exact';
+    if (source === 'full') return 'full';
+    if (source === 'truncated_full') return 'truncated full';
+    if (proofLabel.includes('sampled') && proofLabel.includes('truncated')) return 'sampled + truncated';
+    if (proofLabel.includes('sampled')) return 'sampled';
+    if (proofLabel.includes('truncated')) return 'truncated';
+    if (proofLabel.includes('cached')) return 'cached proof';
+    return source;
+  }
+
+  function evidenceTagHtml(data) {
+    return `<span class="evidence-tag">${escHtml(evidenceLabel(data))}</span>`;
+  }
+
   // ── DOM Updates ────────────────────────────────────────────────────────────
 
   function updateSessionCards() {
@@ -2187,7 +2242,7 @@
 
         const sym  = escHtml(data.symbol || '');
         const repo = escHtml(data.repo   || '');
-        const toolHtml = `<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span>`;
+        const toolHtml = `<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span>${evidenceTagHtml(data)}`;
         const pct = data.file_tokens > 0
           ? (data.tokens_saved / data.file_tokens) * 100
           : null;
@@ -2272,7 +2327,7 @@
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td class="origin-cell">${escHtml(data.origin || '—')}</td>
-          <td class="tool-label">${badgeHtml('capsule')}<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span>${deltaBtn}</td>
+          <td class="tool-label">${badgeHtml('capsule')}<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span>${evidenceTagHtml(data)}${deltaBtn}</td>
           <td class="pct-cell">${pctBarHtml(pct)}</td>
           <td class="ts-cell">${escHtml(tsStr)}</td>
         `;
@@ -2495,17 +2550,28 @@
         const optLen  = data.optimized_length || 0;
         const saved   = origLen - optLen;
         const pct     = origLen > 0 ? ((saved / origLen) * 100).toFixed(1) : '0.0';
+        const p = provenanceOf(data);
+        const proof = proofOf(data);
+        const source = p.baseline_token_source || 'estimated';
+        const sourcePrefix = source === 'exact' ? '' : '~';
+        const proofBits = [];
+        if (proof.sampled) proofBits.push('sampled');
+        if (proof.truncated) proofBits.push('truncated');
+        if (proof.max_bytes) proofBits.push(`${Number(proof.max_bytes).toLocaleString()} byte cap`);
+        if (proof.max_files) proofBits.push(`${Number(proof.max_files).toLocaleString()} file cap`);
+        const proofDetail = proofBits.length ? ` · proof ${proofBits.join(', ')}` : '';
 
         const origToks = Math.ceil(origLen);
         const optToks  = Math.ceil(optLen);
         const savedToks = Math.ceil(saved);
 
         document.getElementById('compare-banner-text').textContent =
-          `Reduced from ~${origToks.toLocaleString()} tokens to ~${optToks.toLocaleString()} tokens`
-          + ` · ~${savedToks.toLocaleString()} tokens saved (${pct}% reduction)`;
+          `${evidenceLabel(data)} baseline: ${sourcePrefix}${origToks.toLocaleString()} tokens to ${sourcePrefix}${optToks.toLocaleString()} tokens`
+          + ` · ${sourcePrefix}${savedToks.toLocaleString()} tokens saved (${pct}% reduction)${proofDetail}`;
 
-        document.getElementById('pane-original-chars').textContent  = `~${origToks.toLocaleString()} tokens`;
-        document.getElementById('pane-optimized-chars').textContent = `~${optToks.toLocaleString()} tokens`;
+        document.getElementById('pane-original-label').textContent = source === 'full' || source === 'truncated_full' ? 'Original Context' : 'Baseline Proof';
+        document.getElementById('pane-original-chars').textContent  = `${sourcePrefix}${origToks.toLocaleString()} tokens · ${source}`;
+        document.getElementById('pane-optimized-chars').textContent = `${sourcePrefix}${optToks.toLocaleString()} tokens`;
 
         const origPre  = document.createElement('pre');
         const origCode = document.createElement('code');
