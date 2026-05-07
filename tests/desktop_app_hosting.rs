@@ -199,8 +199,7 @@ fn ac3_ui_app_open_compiled_in_default_features() {
     }
 
     // Clean up lockfile if created.
-    let lockfile = dirs::home_dir()
-        .map(|h| h.join(".marrow").join("ui-app.lock"));
+    let lockfile = dirs::home_dir().map(|h| h.join(".marrow").join("ui-app.lock"));
     if let Some(path) = lockfile {
         let _ = std::fs::remove_file(path);
     }
@@ -244,7 +243,9 @@ fn ac5_ui_app_disable_is_noop_when_not_registered() {
 
     // Should either say "removed" or "nothing to remove" or "not compiled in" — not crash.
     assert!(
-        output.status.success() || stderr.contains("No registration found") || stderr.contains("removed"),
+        output.status.success()
+            || stderr.contains("No registration found")
+            || stderr.contains("removed"),
         "AC-5: ui-app disable should be safe when not registered. exit={}, stderr: {stderr}",
         output.status
     );
@@ -361,7 +362,9 @@ fn ac9_dashboard_cors_localhost_only() {
     );
 
     // Ensure no other origins are added.
-    let cors_section_start = dashboard_src.find("CorsLayer::new()").expect("find CorsLayer");
+    let cors_section_start = dashboard_src
+        .find("CorsLayer::new()")
+        .expect("find CorsLayer");
     let cors_section = &dashboard_src[cors_section_start..cors_section_start + 300];
     let origin_count = cors_section.matches("allow_origin").count();
     assert_eq!(
@@ -423,8 +426,11 @@ fn ac11_interactive_menu_has_desktop_app() {
 
     // Verify the submenu has the expected options.
     assert!(
-        main_src.contains("Open") && main_src.contains("Enable") && main_src.contains("Disable")
-            && main_src.contains("Status") && main_src.contains("Back"),
+        main_src.contains("Open")
+            && main_src.contains("Enable")
+            && main_src.contains("Disable")
+            && main_src.contains("Status")
+            && main_src.contains("Back"),
         "AC-11: Desktop App submenu must have Open, Enable, Disable, Status, Back options"
     );
 }
@@ -555,7 +561,8 @@ fn daemon_routes_include_dashboard_endpoints() {
 
     // It includes the health, watch, and shutdown routes.
     assert!(
-        routes_src.contains("/api/health") && routes_src.contains("/api/watch")
+        routes_src.contains("/api/health")
+            && routes_src.contains("/api/watch")
             && routes_src.contains("/api/shutdown"),
         "daemon routes must include /api/health, /api/watch, /api/shutdown"
     );

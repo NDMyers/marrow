@@ -1434,6 +1434,40 @@ where
     Ok((total, calls_edges + import_edges))
 }
 
+pub fn run_ingestion_with_arc_and_activity<F>(
+    db: &Arc<Mutex<Connection>>,
+    repo_id: &str,
+    root_path: &Path,
+    progress: F,
+    activity: Option<crate::activity::ActivityTracker>,
+    workspace_id: Option<String>,
+) -> Result<(usize, usize)>
+where
+    F: Fn(u8) + Send + Sync,
+{
+    let activity_id = activity.as_ref().map(|tracker| {
+        tracker.start(
+            crate::activity::ActivityKind::IndexingJob,
+            workspace_id,
+            format!("indexing {}", root_path.display()),
+        )
+    });
+    let result = run_ingestion_with_arc(db, repo_id, root_path, progress);
+    if let (Some(tracker), Some(id)) = (&activity, activity_id.as_deref()) {
+        match &result {
+            Ok((symbols, edges)) => tracker.finish(
+                id,
+                crate::activity::ActivityState::Completed,
+                format!("indexed {symbols} symbols / {edges} edges"),
+            ),
+            Err(error) => {
+                tracker.finish(id, crate::activity::ActivityState::Error, error.to_string())
+            }
+        }
+    }
+    result
+}
+
 /// When set to `1`/`true`/`yes`, `resolve_cross_repo_after_ingest` scans **all** repos as
 /// import sources (legacy behavior). Default (unset): only the repo just ingested is
 /// scanned (MARROW-PERF-012).
