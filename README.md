@@ -162,3 +162,34 @@ cargo install --path .
 ```
 
 This installs the **`marrow`** executable into `~/.cargo/bin` (ensure that directory is on your `PATH`).
+
+## Desktop Autostart And Packages
+
+Daemon autostart is opt-in and separate from desktop app registration.
+
+```bash
+marrow daemon install
+marrow daemon status
+marrow daemon uninstall
+```
+
+`marrow ui-app enable` registers the desktop application entry points only; it does not enable daemon autostart. The temporary compatibility alias below still works for one release and has the same effect as `marrow daemon install`:
+
+```bash
+marrow service install
+```
+
+Native package outputs are repository-defined and additive to the existing npm tarball flow:
+
+- macOS: `Marrow-{version}-aarch64-apple-darwin.dmg` and `Marrow-{version}-x86_64-apple-darwin.dmg`
+- Linux: `marrow_{version}_amd64.deb` and `Marrow-{version}-x86_64.AppImage`
+- Windows: `Marrow-{version}-x86_64-pc-windows-msvc.msi`
+
+Repository packaging helpers:
+
+```bash
+scripts/package-macos-dmg.sh --target aarch64-apple-darwin --out-dir dist
+scripts/package-macos-dmg.sh --target x86_64-apple-darwin --out-dir dist
+scripts/stage-linux-package-assets.sh --target x86_64-unknown-linux-gnu --out-dir target/package-assets/linux
+scripts/package-linux-appimage.sh --target x86_64-unknown-linux-gnu --out-dir dist
+```

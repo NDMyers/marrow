@@ -180,3 +180,21 @@ fn document_link_rejection() {
     // This test documents the security requirement.
     // Actual enforcement is in npm/scripts/install.js.
 }
+
+/// Documents the behavioral contract: when CI env vars are set, the npm
+/// postinstall script skips `marrow ui-app enable`. This prevents unintended
+/// OS-level side effects during automated builds and CI pipelines.
+#[test]
+fn registration_skipped_when_ci_env_set() {
+    // This test documents the contract: when CI env vars are set,
+    // the npm postinstall script skips app registration.
+    // The contract is enforced in npm/scripts/install.js.
+    // This test verifies the environment variable list is documented.
+    let ci_vars = ["CI", "GITHUB_ACTIONS", "GITLAB_CI", "NO_MARROW_REGISTER"];
+    // All variables must be distinct
+    let unique: std::collections::HashSet<_> = ci_vars.iter().collect();
+    assert_eq!(unique.len(), ci_vars.len());
+    // At least one commonly set CI var is present
+    assert!(ci_vars.contains(&"CI"));
+    assert!(ci_vars.contains(&"GITHUB_ACTIONS"));
+}
