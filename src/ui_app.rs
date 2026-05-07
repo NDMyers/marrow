@@ -5,6 +5,9 @@
 
 use anyhow::Result;
 
+#[cfg(feature = "desktop")]
+use crate::packaging;
+
 /// The dashboard URL served by the daemon.
 #[cfg(feature = "desktop")]
 const DASHBOARD_URL: &str = "http://127.0.0.1:8765";
@@ -299,7 +302,11 @@ pub fn status() -> Result<()> {
         println!(
             "App path:     {} [{}]",
             app_path.display(),
-            if app_path.exists() { "exists" } else { "missing" }
+            if app_path.exists() {
+                "exists"
+            } else {
+                "missing"
+            }
         );
 
         // Launcher target: extract exec path from the launcher shell script.
@@ -315,7 +322,11 @@ pub fn status() -> Result<()> {
                     println!(
                         "Launcher target: {} [{}]",
                         target,
-                        if target_path.exists() { "exists" } else { "missing" }
+                        if target_path.exists() {
+                            "exists"
+                        } else {
+                            "missing"
+                        }
                     );
                     printed = true;
                     break;
@@ -331,7 +342,11 @@ pub fn status() -> Result<()> {
 
         // Gatekeeper check (non-fatal).
         let xattr_result = std::process::Command::new("xattr")
-            .args(["-p", "com.apple.quarantine", app_path.to_str().unwrap_or("")])
+            .args([
+                "-p",
+                "com.apple.quarantine",
+                app_path.to_str().unwrap_or(""),
+            ])
             .output();
         match xattr_result {
             Ok(output) if !output.stdout.is_empty() => {
@@ -361,7 +376,11 @@ pub fn status() -> Result<()> {
         println!(
             "App path:     {} [{}]",
             desktop_path.display(),
-            if desktop_path.exists() { "exists" } else { "missing" }
+            if desktop_path.exists() {
+                "exists"
+            } else {
+                "missing"
+            }
         );
 
         // Launcher target: extract Exec= line from .desktop file.
@@ -378,7 +397,11 @@ pub fn status() -> Result<()> {
                     println!(
                         "Launcher target: {} [{}]",
                         exe,
-                        if target_path.exists() { "exists" } else { "missing" }
+                        if target_path.exists() {
+                            "exists"
+                        } else {
+                            "missing"
+                        }
                     );
                     printed = true;
                     break;
@@ -401,7 +424,11 @@ pub fn status() -> Result<()> {
         println!(
             "App path:     {} [{}]",
             lnk_path.display(),
-            if lnk_path.exists() { "exists" } else { "missing" }
+            if lnk_path.exists() {
+                "exists"
+            } else {
+                "missing"
+            }
         );
         println!("Launcher target: (run 'marrow ui-app enable' to configure)");
     }
@@ -464,86 +491,33 @@ fn is_app_running() -> bool {
 
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 fn macos_enable(exe_path: &std::path::Path) -> Result<()> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    let app_dir = home.join("Applications/Marrow.app/Contents/MacOS");
-    std::fs::create_dir_all(&app_dir)?;
-
-    // Create Resources/ dir and generate ICNS icon.
-    let resources_dir = home.join("Applications/Marrow.app/Contents/Resources");
-    std::fs::create_dir_all(&resources_dir)?;
-
-    let icon_img = image::RgbaImage::from_pixel(256, 256, image::Rgba([0x4A, 0xB5, 0x6F, 0xFF]));
-    let dyn_img = image::DynamicImage::ImageRgba8(icon_img);
-    let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
-    dyn_img.write_to(&mut cursor, image::ImageFormat::Png)?;
-    let png_data = cursor.into_inner();
-
-    let block_len = 8u32 + png_data.len() as u32;
-    let total_len = 8u32 + block_len;
-    let mut icns_data: Vec<u8> = Vec::new();
-    icns_data.extend_from_slice(b"icns");
-    icns_data.extend_from_slice(&total_len.to_be_bytes());
-    icns_data.extend_from_slice(b"ic08");
-    icns_data.extend_from_slice(&block_len.to_be_bytes());
-    icns_data.extend_from_slice(&png_data);
-    std::fs::write(resources_dir.join("Marrow.icns"), icns_data)?;
-
-    // Create Info.plist
-    let plist_content = r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key>
-    <string>marrow-launcher</string>
-    <key>CFBundleIdentifier</key>
-    <string>dev.marrow.app</string>
-    <key>CFBundleName</key>
-    <string>Marrow</string>
-    <key>CFBundleVersion</key>
-    <string>0.1.0</string>
-    <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
-    <key>CFBundleIconFile</key>
-    <string>Marrow</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>11.0</string>
-</dict>
-</plist>"#;
-    let plist_path = home.join("Applications/Marrow.app/Contents/Info.plist");
-    std::fs::write(&plist_path, plist_content)?;
-
-    // Create a launcher script that calls the actual binary.
-    let launcher_path = app_dir.join("marrow-launcher");
-    let launcher_content = format!("#!/bin/sh\nexec \"{}\" ui-app open\n", exe_path.display());
-    std::fs::write(&launcher_path, launcher_content)?;
-
-    // Make it executable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&launcher_path, std::fs::Permissions::from_mode(0o755))?;
-    }
+    let staging_override = packaging::staging_root_override();
+    let root = staging_override
+        .clone()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine staging root or home directory"))?;
+    let app_path = packaging::stage_macos_bundle(&root, exe_path)?;
 
     // Register with Launch Services (non-fatal).
-    let app_path = home.join("Applications/Marrow.app");
-    match std::process::Command::new(
-        "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/\
-         LaunchServices.framework/Versions/A/Support/lsregister",
-    )
-    .args(["-R", "-f", app_path.to_str().unwrap_or("")])
-    .status()
-    {
-        Ok(status) if !status.success() => {
-            eprintln!("[marrow] Warning: lsregister returned non-zero status.");
+    if staging_override.is_none() {
+        match std::process::Command::new(
+            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/\
+             LaunchServices.framework/Versions/A/Support/lsregister",
+        )
+        .args(["-R", "-f", app_path.to_str().unwrap_or("")])
+        .status()
+        {
+            Ok(status) if !status.success() => {
+                eprintln!("[marrow] Warning: lsregister returned non-zero status.");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("[marrow] Warning: lsregister not found; Launch Services not updated.");
+            }
+            Err(e) => {
+                eprintln!("[marrow] Warning: lsregister failed: {e}");
+            }
+            Ok(_) => {}
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("[marrow] Warning: lsregister not found; Launch Services not updated.");
-        }
-        Err(e) => {
-            eprintln!("[marrow] Warning: lsregister failed: {e}");
-        }
-        Ok(_) => {}
     }
 
     Ok(())
@@ -575,49 +549,38 @@ fn linux_enable(exe_path: &std::path::Path) -> Result<()> {
         );
     }
 
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    let apps_dir = home.join(".local/share/applications");
-    std::fs::create_dir_all(&apps_dir)?;
-
-    // Create hicolor icon dir and write PNG icon.
-    let icon_dir = home.join(".local/share/icons/hicolor/256x256/apps");
-    std::fs::create_dir_all(&icon_dir)?;
-    let icon_img = image::RgbaImage::from_pixel(256, 256, image::Rgba([0x4A, 0xB5, 0x6F, 0xFF]));
-    icon_img.save(icon_dir.join("marrow.png"))?;
-
-    let desktop_entry = format!(
-        "[Desktop Entry]\n\
-         Version=1.0\n\
-         Type=Application\n\
-         Name=Marrow\n\
-         Comment=AST Context Engine Dashboard\n\
-         Exec=\"{}\" ui-app open\n\
-         Icon=marrow\n\
-         Terminal=false\n\
-         Categories=Development;\n",
-        exe_path.display()
-    );
-
-    std::fs::write(apps_dir.join("marrow.desktop"), desktop_entry)?;
+    let staging_override = packaging::staging_root_override();
+    let root = staging_override
+        .clone()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine staging root or home directory"))?;
+    let assets = packaging::stage_linux_desktop_assets(&root, exe_path)?;
 
     // Update the desktop database (non-fatal).
-    match std::process::Command::new("update-desktop-database")
-        .arg(apps_dir.to_str().unwrap_or(""))
-        .status()
-    {
-        Ok(status) if !status.success() => {
-            eprintln!("[marrow] Warning: update-desktop-database returned non-zero status.");
+    if staging_override.is_none() {
+        match std::process::Command::new("update-desktop-database")
+            .arg(
+                assets
+                    .desktop_path
+                    .parent()
+                    .and_then(|path| path.to_str())
+                    .unwrap_or(""),
+            )
+            .status()
+        {
+            Ok(status) if !status.success() => {
+                eprintln!("[marrow] Warning: update-desktop-database returned non-zero status.");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "[marrow] Warning: update-desktop-database not found; desktop database not updated."
+                );
+            }
+            Err(e) => {
+                eprintln!("[marrow] Warning: update-desktop-database failed: {e}");
+            }
+            Ok(_) => {}
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "[marrow] Warning: update-desktop-database not found; desktop database not updated."
-            );
-        }
-        Err(e) => {
-            eprintln!("[marrow] Warning: update-desktop-database failed: {e}");
-        }
-        Ok(_) => {}
     }
 
     Ok(())

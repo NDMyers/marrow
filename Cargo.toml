@@ -3,6 +3,29 @@ name = "marrow"
 version = "0.1.0"
 edition = "2021"
 
+[package.metadata.deb]
+name = "marrow"
+maintainer = "Marrow Maintainers"
+copyright = "2026, Marrow Maintainers"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+extended-description = "Local deterministic AST context engine and desktop dashboard."
+assets = [
+	["target/x86_64-unknown-linux-gnu/release/marrow", "/usr/bin/marrow", "755"],
+	["target/package-assets/linux/marrow.desktop", "/usr/share/applications/marrow.desktop", "644"],
+	["target/package-assets/linux/marrow.png", "/usr/share/icons/hicolor/256x256/apps/marrow.png", "644"],
+]
+maintainer-scripts = "scripts"
+
+[package.metadata.wix]
+product-name = "Marrow"
+manufacturer = "Marrow Maintainers"
+upgrade-guid = "E5C6E7AA-6DB4-4C15-97EA-2D4B58ED5C70"
+path-guid = "3DB7B0E9-9793-4D75-9486-2B0F824BAF59"
+license = false
+eula = false
+
 [dependencies]
 # Official Anthropic MCP SDK for Rust
 rmcp = { version = "0.16.0", features = ["server", "macros", "transport-io"] }
