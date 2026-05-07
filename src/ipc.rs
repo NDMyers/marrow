@@ -95,6 +95,55 @@ impl IpcClient {
         Ok(())
     }
 
+    pub async fn start_activity(
+        &self,
+        kind: crate::activity::ActivityKind,
+        workspace_id: Option<String>,
+        detail: String,
+    ) -> Result<Option<String>> {
+        let url = format!("{}/api/activity/start", self.base_url);
+        let resp = self
+            .inner
+            .post(&url)
+            .json(&serde_json::json!({
+                "kind": kind,
+                "workspace_id": workspace_id,
+                "detail": detail,
+            }))
+            .send()
+            .await
+            .context("recording activity with daemon")?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        Ok(body
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string))
+    }
+
+    pub async fn finish_activity(
+        &self,
+        id: &str,
+        state: crate::activity::ActivityState,
+        detail: String,
+    ) -> Result<()> {
+        let url = format!("{}/api/activity/finish", self.base_url);
+        let _ = self
+            .inner
+            .post(&url)
+            .json(&serde_json::json!({
+                "id": id,
+                "state": state,
+                "detail": detail,
+            }))
+            .send()
+            .await
+            .context("finishing activity with daemon")?;
+        Ok(())
+    }
+
     /// Send a shutdown signal to the daemon via `POST /api/shutdown`.
     pub async fn shutdown(&self) -> Result<()> {
         let url = format!("{}/api/shutdown", self.base_url);

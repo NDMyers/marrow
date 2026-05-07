@@ -132,6 +132,12 @@ impl RepoPool {
     }
 }
 
+impl Default for RepoPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Spawn a background task that calls `evict_stale` every `interval`.
 ///
 /// Note: `tokio::time::interval` fires immediately at t=0. We skip the first

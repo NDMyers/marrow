@@ -32,6 +32,11 @@ pub async fn run() -> Result<()> {
         dash_tx.clone(),
         Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),
     );
+    state.activity.start(
+        crate::activity::ActivityKind::DaemonJob,
+        None,
+        "daemon running".to_string(),
+    );
 
     // Spawn the global file watcher dispatcher.
     //
@@ -46,6 +51,7 @@ pub async fn run() -> Result<()> {
 
     let pool_for_watcher = Arc::clone(&state.pool);
     let dash_tx_watcher = dash_tx.clone();
+    let activity_for_watcher = state.activity.clone();
     tokio::spawn(async move {
         while let Some(new_path) = watcher_rx.recv().await {
             // M-11 FIX: Canonicalize and deduplicate by canonical repo root.
@@ -59,9 +65,17 @@ pub async fn run() -> Result<()> {
             }
             match pool_for_watcher.get_or_open(&canonical).await {
                 Ok(conn) => {
-                    if let Err(e) =
-                        crate::watcher::spawn_watcher(conn, dash_tx_watcher.clone(), DEBOUNCE_MS)
-                    {
+                    let workspace_id = crate::registry::Registry::open_default()
+                        .ok()
+                        .and_then(|registry| registry.register_workspace(&canonical, None).ok())
+                        .map(|entry| entry.workspace_id);
+                    if let Err(e) = crate::watcher::spawn_watcher_with_activity(
+                        conn,
+                        dash_tx_watcher.clone(),
+                        DEBOUNCE_MS,
+                        Some(activity_for_watcher.clone()),
+                        workspace_id,
+                    ) {
                         eprintln!(
                             "[marrow daemon] watcher error for {}: {e}",
                             canonical.display()
@@ -82,7 +96,8 @@ pub async fn run() -> Result<()> {
     // The daemon now hosts the dashboard routes on a second listener so that
     // the desktop app and browsers can access it at http://127.0.0.1:8765.
     let dashboard_addr = std::net::SocketAddr::from(([127, 0, 0, 1], DASHBOARD_PORT));
-    let dashboard_listener = tokio::net::TcpListener::bind(dashboard_addr).await
+    let dashboard_listener = tokio::net::TcpListener::bind(dashboard_addr)
+        .await
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::AddrInUse {
                 anyhow::anyhow!(
@@ -91,15 +106,17 @@ pub async fn run() -> Result<()> {
                     DASHBOARD_PORT
                 )
             } else {
-                anyhow::anyhow!("Failed to bind dashboard listener on port {}: {e}", DASHBOARD_PORT)
+                anyhow::anyhow!(
+                    "Failed to bind dashboard listener on port {}: {e}",
+                    DASHBOARD_PORT
+                )
             }
         })?;
 
-    // Build the dashboard AppState — uses an in-memory DB connection for stats
-    // since the daemon's actual repos are managed through the pool.
-    let db_path = std::env::var("MARROW_DB_PATH")
-        .unwrap_or_else(|_| ".marrow/graph.db".to_string());
-    let dashboard_db = crate::db::init_db_or_memory(&db_path)?;
+    // Build the dashboard AppState — daemon-hosted dashboards read global
+    // inventory from ~/.marrow/registry.db and keep the local DB only as a
+    // fallback for standalone handlers.
+    let dashboard_db = crate::db::init_db_or_memory(":memory:")?;
     let dashboard_session = Arc::new(std::sync::Mutex::new(
         crate::dashboard::SessionStats::default(),
     ));
@@ -107,6 +124,8 @@ pub async fn run() -> Result<()> {
         tx: dash_tx.clone(),
         session: dashboard_session,
         db: Arc::new(std::sync::Mutex::new(dashboard_db)),
+        registry: state.registry.clone(),
+        activity: Some(state.activity.clone()),
     };
 
     let dashboard_router = routes::build_dashboard_router(state.clone(), dashboard_app_state);

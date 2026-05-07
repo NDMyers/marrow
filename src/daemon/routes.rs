@@ -2,13 +2,14 @@
 
 use crate::daemon::pool::{spawn_eviction_loop, RepoPool};
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -19,6 +20,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 #[derive(Clone)]
 pub struct DaemonState {
     pub pool: Arc<RepoPool>,
+    pub registry: Option<Arc<std::sync::Mutex<crate::registry::Registry>>>,
+    pub activity: crate::activity::ActivityTracker,
     /// Sender used to register new repo paths with the background watcher.
     pub watcher_tx: mpsc::Sender<std::path::PathBuf>,
     /// Dashboard broadcast channel for file-change events.
@@ -43,8 +46,13 @@ impl DaemonState {
             Duration::from_secs(60 * 60),
             Duration::from_secs(5 * 60),
         );
+        let registry = crate::registry::Registry::open_default()
+            .ok()
+            .map(|registry| Arc::new(std::sync::Mutex::new(registry)));
         Self {
             pool,
+            registry,
+            activity: crate::activity::ActivityTracker::default(),
             watcher_tx,
             dash_tx,
             shutdown_tx,
@@ -62,6 +70,10 @@ impl DaemonState {
         let (shutdown_tx, _rx2) = oneshot::channel();
         Self {
             pool: Arc::new(RepoPool::new()),
+            registry: crate::registry::Registry::open(":memory:")
+                .ok()
+                .map(|registry| Arc::new(std::sync::Mutex::new(registry))),
+            activity: crate::activity::ActivityTracker::default(),
             watcher_tx,
             dash_tx,
             shutdown_tx: Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),
@@ -102,48 +114,30 @@ impl DaemonState {
         false
     }
 
-    /// Check if a path has been indexed (exists in the repositories table).
-    /// This provides implicit approval - if a repo was indexed, watching is allowed.
+    /// Check if a path was already registered through a trusted path such as ingest_repo.
     pub async fn is_path_indexed(&self, path: &std::path::Path) -> bool {
         let canonical = match path.canonicalize() {
             Ok(p) => p,
             Err(_) => return false,
         };
-
-        // Get the database connection for this path
-        let conn = match self.pool.get_or_open(&canonical).await {
-            Ok(c) => c,
-            Err(_) => return false,
+        let Some(registry) = &self.registry else {
+            return false;
         };
-
-        // Check if any repository root matches or contains this path
-        let conn_guard = match conn.lock() {
-            Ok(g) => g,
-            Err(_) => return false,
+        let Ok(registry) = registry.lock() else {
+            return false;
         };
-
-        let result: Result<Vec<String>, _> = conn_guard
-            .prepare("SELECT root_path FROM repositories")
-            .and_then(|mut stmt| {
-                stmt.query_map([], |row| row.get::<_, String>(0))
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            });
-
-        match result {
-            Ok(roots) => {
-                for root in roots {
-                    let root_path = std::path::Path::new(&root);
-                    let root_canonical = root_path
-                        .canonicalize()
-                        .unwrap_or_else(|_| root_path.to_path_buf());
-                    if canonical.starts_with(&root_canonical) {
-                        return true;
-                    }
-                }
-                false
+        let Ok(workspaces) = registry.list_workspaces() else {
+            return false;
+        };
+        for workspace in workspaces {
+            let Ok(root) = workspace.workspace_root.canonicalize() else {
+                continue;
+            };
+            if canonical.starts_with(root) {
+                return true;
             }
-            Err(_) => false,
         }
+        false
     }
 }
 
@@ -152,6 +146,16 @@ impl DaemonState {
 pub fn build_router(state: DaemonState) -> Router {
     Router::new()
         .route("/api/health", get(handle_health))
+        .route("/api/workspaces", get(handle_workspaces))
+        .route("/api/dbs", get(handle_dbs))
+        .route("/api/global-stats", get(handle_global_stats))
+        .route("/api/activity", get(handle_activity))
+        .route("/api/activity/start", post(handle_activity_start))
+        .route("/api/activity/finish", post(handle_activity_finish))
+        .route("/api/workspace-graph", get(handle_workspace_graph))
+        .route("/api/cleanup/unregister", post(handle_cleanup_unregister))
+        .route("/api/cleanup/clear-index", post(handle_cleanup_clear_index))
+        .route("/api/cleanup/delete-db", post(handle_cleanup_delete_db))
         .route("/api/watch", post(handle_watch))
         .route("/api/shutdown", post(handle_shutdown))
         .with_state(state)
@@ -166,6 +170,16 @@ pub fn build_dashboard_router(
 ) -> Router {
     let daemon_routes = Router::new()
         .route("/api/health", get(handle_health))
+        .route("/api/workspaces", get(handle_workspaces))
+        .route("/api/dbs", get(handle_dbs))
+        .route("/api/global-stats", get(handle_global_stats))
+        .route("/api/activity", get(handle_activity))
+        .route("/api/activity/start", post(handle_activity_start))
+        .route("/api/activity/finish", post(handle_activity_finish))
+        .route("/api/workspace-graph", get(handle_workspace_graph))
+        .route("/api/cleanup/unregister", post(handle_cleanup_unregister))
+        .route("/api/cleanup/clear-index", post(handle_cleanup_clear_index))
+        .route("/api/cleanup/delete-db", post(handle_cleanup_delete_db))
         .route("/api/watch", post(handle_watch))
         .route("/api/shutdown", post(handle_shutdown))
         .with_state(daemon_state);
@@ -191,9 +205,204 @@ async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
 }
 
+fn registry_unavailable() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "registry unavailable" })),
+    )
+}
+
+async fn handle_workspaces(State(state): State<DaemonState>) -> impl IntoResponse {
+    let Some(registry) = &state.registry else {
+        return registry_unavailable();
+    };
+    let result = registry
+        .lock()
+        .map_err(|_| "registry mutex poisoned".to_string())
+        .and_then(|registry| registry.list_workspaces().map_err(|e| e.to_string()));
+    match result {
+        Ok(workspaces) => (StatusCode::OK, Json(json!({ "workspaces": workspaces }))),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        ),
+    }
+}
+
+async fn handle_dbs(State(state): State<DaemonState>) -> impl IntoResponse {
+    let Some(registry) = &state.registry else {
+        return registry_unavailable();
+    };
+    let result = registry
+        .lock()
+        .map_err(|_| "registry mutex poisoned".to_string())
+        .and_then(|registry| registry.db_inventory().map_err(|e| e.to_string()));
+    match result {
+        Ok(dbs) => (StatusCode::OK, Json(json!({ "dbs": dbs }))),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        ),
+    }
+}
+
+async fn handle_global_stats(State(state): State<DaemonState>) -> impl IntoResponse {
+    let Some(registry) = &state.registry else {
+        return registry_unavailable();
+    };
+    let result = registry
+        .lock()
+        .map_err(|_| "registry mutex poisoned".to_string())
+        .and_then(|registry| registry.global_lifetime_stats().map_err(|e| e.to_string()));
+    match result {
+        Ok(stats) => (StatusCode::OK, Json(json!({ "lifetime": stats }))),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        ),
+    }
+}
+
+async fn handle_activity(State(state): State<DaemonState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({ "activity": state.activity.list() })),
+    )
+}
+
+#[derive(Deserialize)]
+struct ActivityStartRequest {
+    kind: crate::activity::ActivityKind,
+    workspace_id: Option<String>,
+    detail: String,
+}
+
+async fn handle_activity_start(
+    State(state): State<DaemonState>,
+    Json(req): Json<ActivityStartRequest>,
+) -> impl IntoResponse {
+    let id = state.activity.start(req.kind, req.workspace_id, req.detail);
+    (StatusCode::OK, Json(json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+struct ActivityFinishRequest {
+    id: String,
+    state: crate::activity::ActivityState,
+    detail: String,
+}
+
+async fn handle_activity_finish(
+    State(state): State<DaemonState>,
+    Json(req): Json<ActivityFinishRequest>,
+) -> impl IntoResponse {
+    state.activity.finish(&req.id, req.state, req.detail);
+    (StatusCode::OK, Json(json!({ "status": "ok" })))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceGraphQuery {
+    workspace_id: String,
+    repo_id: Option<String>,
+}
+
+async fn handle_workspace_graph(
+    State(state): State<DaemonState>,
+    Query(params): Query<WorkspaceGraphQuery>,
+) -> impl IntoResponse {
+    let Some(registry) = &state.registry else {
+        return registry_unavailable();
+    };
+    let result = registry
+        .lock()
+        .map_err(|_| "registry mutex poisoned".to_string())
+        .and_then(|registry| {
+            registry
+                .graph_snapshot(
+                    &params.workspace_id,
+                    params.repo_id.as_deref(),
+                    crate::registry::default_graph_limit(),
+                )
+                .map_err(|e| e.to_string())
+        });
+    match result {
+        Ok(graph) => (StatusCode::OK, Json(json!(graph))),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+    }
+}
+
+#[derive(Deserialize)]
+struct CleanupRequest {
+    workspace_id: String,
+    confirmed: bool,
+}
+
+async fn cleanup_with_kind(
+    state: DaemonState,
+    req: CleanupRequest,
+    kind: crate::registry::CleanupKind,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(registry) = &state.registry else {
+        return registry_unavailable();
+    };
+    let activity_id = state.activity.start(
+        crate::activity::ActivityKind::CleanupJob,
+        Some(req.workspace_id.clone()),
+        format!("{:?}", kind),
+    );
+    let result = registry
+        .lock()
+        .map_err(|_| "registry mutex poisoned".to_string())
+        .and_then(|registry| {
+            registry
+                .cleanup_workspace(&req.workspace_id, kind, req.confirmed)
+                .map_err(|e| e.to_string())
+        });
+    match result {
+        Ok(()) => {
+            state.activity.finish(
+                &activity_id,
+                crate::activity::ActivityState::Completed,
+                "cleanup complete".to_string(),
+            );
+            (StatusCode::OK, Json(json!({ "status": "ok" })))
+        }
+        Err(error) => {
+            state.activity.finish(
+                &activity_id,
+                crate::activity::ActivityState::Error,
+                error.clone(),
+            );
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": error })))
+        }
+    }
+}
+
+async fn handle_cleanup_unregister(
+    State(state): State<DaemonState>,
+    Json(req): Json<CleanupRequest>,
+) -> impl IntoResponse {
+    cleanup_with_kind(state, req, crate::registry::CleanupKind::Unregister).await
+}
+
+async fn handle_cleanup_clear_index(
+    State(state): State<DaemonState>,
+    Json(req): Json<CleanupRequest>,
+) -> impl IntoResponse {
+    cleanup_with_kind(state, req, crate::registry::CleanupKind::ClearIndex).await
+}
+
+async fn handle_cleanup_delete_db(
+    State(state): State<DaemonState>,
+    Json(req): Json<CleanupRequest>,
+) -> impl IntoResponse {
+    cleanup_with_kind(state, req, crate::registry::CleanupKind::DeleteDb).await
+}
+
 #[derive(Deserialize)]
 struct WatchRequest {
     path: String,
+    workspace_id: Option<String>,
 }
 
 async fn handle_watch(
@@ -208,10 +417,20 @@ async fn handle_watch(
         );
     }
 
-    // Security: validate path is within an approved workspace root.
-    // Canonicalize first to catch symlinks resolving outside workspace.
-    // Check both in-memory approved roots and database-indexed repos.
-    let is_approved = state.is_path_approved(&path) || state.is_path_indexed(&path).await;
+    let canonical_path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("path cannot be resolved: {e}") })),
+            )
+        }
+    };
+
+    // Security: validate path is within an approved workspace root before any
+    // registry, approved-root, pool, or watcher mutation can occur.
+    let is_approved =
+        state.is_path_approved(&canonical_path) || state.is_path_indexed(&canonical_path).await;
     if !is_approved {
         return (
             StatusCode::FORBIDDEN,
@@ -222,20 +441,35 @@ async fn handle_watch(
         );
     }
 
+    let mut registered_workspace_id = req.workspace_id.clone();
+    if let Some(registry) = &state.registry {
+        if let Ok(registry) = registry.lock() {
+            if let Ok(entry) = registry.register_workspace(&canonical_path, None) {
+                registered_workspace_id = Some(entry.workspace_id);
+                state.add_approved_root(entry.workspace_root);
+            }
+        }
+    }
+
     // M-10 FIX: Propagate DB/pool errors through HTTP response.
-    if let Err(e) = state.pool.get_or_open(&path).await {
+    if let Err(e) = state.pool.get_or_open(&canonical_path).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("DB pool error: {e}") })),
         );
     }
     // M-10 FIX: Propagate watcher channel send errors.
-    if let Err(e) = state.watcher_tx.send(path).await {
+    if let Err(e) = state.watcher_tx.send(canonical_path).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("Watcher channel error: {e}") })),
         );
     }
+    state.activity.start(
+        crate::activity::ActivityKind::WatcherJob,
+        registered_workspace_id,
+        format!("watching {}", req.path),
+    );
     (
         StatusCode::OK,
         Json(serde_json::json!({ "watching": req.path })),
@@ -301,5 +535,41 @@ mod tests {
             StatusCode::NOT_FOUND,
             "/rpc/mcp should no longer exist"
         );
+    }
+
+    #[tokio::test]
+    async fn watch_rejects_unapproved_path_without_registry_mutation() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let outside = tmpdir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let state = DaemonState::new_test();
+        let registry = state.registry.clone().unwrap();
+        let approved_roots = state.approved_roots.clone();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/watch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "path": outside.to_string_lossy() }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(registry
+            .lock()
+            .unwrap()
+            .list_workspaces()
+            .unwrap()
+            .is_empty());
+        assert!(approved_roots.lock().unwrap().is_empty());
+        assert!(!outside.join(".marrow").exists());
     }
 }

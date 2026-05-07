@@ -1,8 +1,9 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension as _};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct IndexedRepoSnapshot {
     pub repo_id: String,
     pub root_path: String,
@@ -10,7 +11,7 @@ pub struct IndexedRepoSnapshot {
     pub file_count: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DatabaseScopeSnapshot {
     pub repo_count: i64,
     pub symbol_count: i64,
@@ -467,6 +468,20 @@ pub fn connected_database_path(conn: &Connection) -> Result<String> {
         }
     }
     Ok(":memory:".to_string())
+}
+
+pub fn clear_index_contents(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         DELETE FROM edges;
+         DELETE FROM graph_node_degrees;
+         DELETE FROM graph_degree_cache_meta;
+         DELETE FROM nodes;
+         DELETE FROM files;
+         DELETE FROM file_imports;
+         COMMIT;",
+    )?;
+    Ok(())
 }
 
 /// FNV-1a hash of raw file bytes — used for change detection in the `files` table.
