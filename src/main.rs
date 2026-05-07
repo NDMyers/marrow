@@ -4,6 +4,7 @@ mod dashboard;
 mod db;
 mod ingestion;
 mod ipc;
+mod packaging;
 mod registry;
 mod retrieval;
 mod service;
@@ -5315,13 +5316,13 @@ fn main() -> Result<()> {
             println!("  benchmark       Run token benchmark");
             println!("  query           Query a symbol");
             println!("  maintenance     Checkpoint & vacuum database");
-            println!("  daemon          Start background daemon");
+            println!("  daemon          Start background daemon or manage autostart");
             println!("  status          Show daemon status");
             println!("  stop            Stop daemon");
             println!("  ui              Open dashboard");
             println!("  ui-app          Desktop app (open|enable|disable|status)");
             println!("  perf-harness    Run performance benchmarks");
-            println!("  service install Install as system service");
+            println!("  service install Install daemon autostart (compatibility alias)");
             println!("\nOptions:");
             println!("  --help, -h      Show this help");
             return Ok(());
@@ -5446,9 +5447,16 @@ async fn async_main(args: Vec<String>) -> Result<()> {
             }
             return Ok(());
         }
-        Some("daemon") => {
-            return daemon::run().await;
-        }
+        Some("daemon") => match args.get(2).map(|s| s.as_str()) {
+            None => return daemon::run().await,
+            Some("install") => return service::install(),
+            Some("uninstall") => return service::uninstall(),
+            Some("status") => return service::status().await,
+            _ => {
+                eprintln!("Usage: marrow daemon [install|uninstall|status]");
+                return Ok(());
+            }
+        },
         Some("status") => return cmd_status().await,
         Some("stop") => return cmd_stop().await,
         Some("watch") => {

@@ -20,7 +20,7 @@ jobs:
         with:
           generate_release_notes: true
 
-  upload-assets:
+  upload-binaries:
     needs: create-release
     strategy:
       matrix:
@@ -61,8 +61,96 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           build_args: --locked
 
+  package-macos:
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build DMG
+        run: |
+          chmod +x scripts/package-macos-dmg.sh
+          scripts/package-macos-dmg.sh --target "${{ matrix.target }}" --out-dir dist
+      - name: Upload DMG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" dist/*.dmg --repo "${{ github.repository }}"
+
+  package-linux:
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Install cargo-deb and AppImage tooling
+        run: |
+          cargo install cargo-deb --locked
+          sudo apt-get update
+          sudo apt-get install -y desktop-file-utils libfuse2
+          curl -L https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -o /tmp/appimagetool
+          chmod +x /tmp/appimagetool
+      - name: Stage Linux package assets
+        run: |
+          chmod +x scripts/stage-linux-package-assets.sh scripts/package-linux-appimage.sh
+          scripts/stage-linux-package-assets.sh --target x86_64-unknown-linux-gnu --out-dir target/package-assets/linux
+      - name: Build DEB
+        run: cargo deb --target x86_64-unknown-linux-gnu --no-build --output dist/marrow_${{ github.ref_name }}_amd64.deb
+      - name: Build AppImage
+        env:
+          APPIMAGETOOL_BIN: /tmp/appimagetool
+        run: scripts/package-linux-appimage.sh --target x86_64-unknown-linux-gnu --out-dir dist
+      - name: Upload Linux packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" dist/*.deb dist/*.AppImage --repo "${{ github.repository }}"
+
+  package-windows:
+    needs: create-release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install packaging tools
+        shell: pwsh
+        run: |
+          cargo install cargo-wix --locked
+          choco install wixtoolset --no-progress -y
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc --locked
+          cargo wix --no-build --target x86_64-pc-windows-msvc --output dist/Marrow-${{ github.ref_name }}-x86_64-pc-windows-msvc.msi
+      - name: Upload MSI
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" dist/*.msi --repo "${{ github.repository }}"
+
   generate-checksums:
-    needs: upload-assets
+    needs:
+      - upload-binaries
+      - package-macos
+      - package-linux
+      - package-windows
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -74,6 +162,10 @@ jobs:
           mkdir -p assets
           gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.tar.gz"
           gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.zip" || true
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.dmg" || true
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.deb" || true
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.AppImage" || true
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.msi" || true
       
       - name: Generate SHA256 checksums
         run: |

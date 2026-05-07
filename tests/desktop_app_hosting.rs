@@ -662,7 +662,11 @@ fn enable_creates_valid_icns() {
 
     let bytes = std::fs::read(&icns_path).expect("read Marrow.icns");
     assert!(bytes.len() >= 4, "Marrow.icns must have at least 4 bytes");
-    assert_eq!(&bytes[..4], b"icns", "Marrow.icns must start with 'icns' magic");
+    assert_eq!(
+        &bytes[..4],
+        b"icns",
+        "Marrow.icns must start with 'icns' magic"
+    );
 
     // Cleanup.
     let _ = std::process::Command::new(marrow_bin())
