@@ -268,6 +268,39 @@ pub struct AppState {
     pub tx: broadcast::Sender<DashboardEvent>,
     pub session: Arc<Mutex<SessionStats>>,
     pub db: Arc<Mutex<rusqlite::Connection>>,
+    pub registry: Option<Arc<Mutex<crate::registry::Registry>>>,
+    pub activity: Option<crate::activity::ActivityTracker>,
+}
+
+struct ActivityLifecycleGuard {
+    tracker: crate::activity::ActivityTracker,
+    id: String,
+    stop_detail: String,
+}
+
+impl ActivityLifecycleGuard {
+    fn dashboard_client(tracker: crate::activity::ActivityTracker) -> Self {
+        let id = tracker.start(
+            crate::activity::ActivityKind::DashboardClient,
+            None,
+            "dashboard stream connected".to_string(),
+        );
+        Self {
+            tracker,
+            id,
+            stop_detail: "dashboard stream disconnected".to_string(),
+        }
+    }
+}
+
+impl Drop for ActivityLifecycleGuard {
+    fn drop(&mut self) {
+        self.tracker.finish(
+            &self.id,
+            crate::activity::ActivityState::Stopped,
+            self.stop_detail.clone(),
+        );
+    }
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
@@ -287,6 +320,10 @@ async fn sse_handler(
     State(state): State<AppState>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.tx.subscribe();
+    let activity_guard = state
+        .activity
+        .clone()
+        .map(ActivityLifecycleGuard::dashboard_client);
     let stream = tokio_stream::StreamExt::filter_map(
         BroadcastStream::new(rx),
         |msg: Result<DashboardEvent, _>| {
@@ -295,6 +332,12 @@ async fn sse_handler(
             Some(Ok::<Event, Infallible>(Event::default().data(json)))
         },
     );
+    let stream = tokio_stream::StreamExt::map(stream, move |event| {
+        if let Some(guard) = activity_guard.as_ref() {
+            let _id = &guard.id;
+        }
+        event
+    });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -303,6 +346,9 @@ struct StatsResponse {
     session: SessionSnapshot,
     lifetime: LifetimeSnapshot,
     database: DatabaseSnapshot,
+    workspaces: Vec<crate::registry::WorkspaceEntry>,
+    dbs: Vec<crate::registry::DbInventoryRow>,
+    activity: Vec<crate::activity::ActivityRecord>,
 }
 
 #[derive(Serialize)]
@@ -366,6 +412,88 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
         recent_events: sess.recent_events.iter().cloned().collect(),
     };
     drop(sess);
+
+    if let Some(registry) = &state.registry {
+        let (lifetime_stats, dbs, workspaces) = match registry.lock() {
+            Ok(registry) => {
+                let lifetime_stats = match registry.global_lifetime_stats() {
+                    Ok(stats) => stats,
+                    Err(e) => {
+                        return axum::Json(serde_json::json!({
+                            "error": format!("Could not aggregate global lifetime stats: {e}")
+                        }))
+                        .into_response()
+                    }
+                };
+                let dbs = lifetime_stats.workspace_statuses.clone();
+                let workspaces = match registry.list_workspaces() {
+                    Ok(workspaces) => workspaces,
+                    Err(e) => {
+                        return axum::Json(serde_json::json!({
+                            "error": format!("Could not list registered workspaces: {e}")
+                        }))
+                        .into_response()
+                    }
+                };
+                (lifetime_stats, dbs, workspaces)
+            }
+            Err(_) => {
+                return axum::Json(serde_json::json!({"error": "registry lock poisoned"}))
+                    .into_response()
+            }
+        };
+
+        let lifetime = LifetimeSnapshot {
+            total_requests: lifetime_stats.total_requests,
+            total_tokens_saved: lifetime_stats.total_tokens_saved,
+            total_file_tokens: lifetime_stats.total_file_tokens,
+            reduction_pct: lifetime_stats.reduction_pct,
+            pipeline_requests: lifetime_stats.pipeline_requests,
+            direct_low_level_autorouted: lifetime_stats.direct_low_level_autorouted,
+            direct_low_level_rejected: lifetime_stats.direct_low_level_rejected,
+            ambiguous_symbol_requests: lifetime_stats.ambiguous_symbol_requests,
+            stale_capsule_prevented: lifetime_stats.stale_capsule_prevented,
+            pipeline_compliance_pct: lifetime_stats.pipeline_compliance_pct,
+        };
+        let size_mb = dbs.iter().map(|row| row.size_mb).sum();
+        let repo_count = dbs.iter().map(|row| row.repo_count).sum();
+        let symbol_count = dbs.iter().map(|row| row.symbol_count).sum();
+        let file_count = dbs.iter().map(|row| row.file_count).sum();
+        let repos = dbs
+            .iter()
+            .flat_map(|row| row.repos.iter())
+            .map(|repo| IndexedRepoSnapshot {
+                repo_id: repo.repo_id.clone(),
+                root_path: repo.root_path.clone(),
+                symbol_count: repo.symbol_count,
+                file_count: repo.file_count,
+            })
+            .collect();
+        let database = DatabaseSnapshot {
+            path: crate::registry::default_registry_path()
+                .to_string_lossy()
+                .to_string(),
+            size_mb,
+            repo_count,
+            symbol_count,
+            file_count,
+            repos,
+        };
+        let activity = state
+            .activity
+            .as_ref()
+            .map(crate::activity::ActivityTracker::list)
+            .unwrap_or_default();
+        return axum::Json(StatsResponse {
+            session,
+            lifetime,
+            database,
+            workspaces,
+            dbs,
+            activity,
+        })
+        .into_response();
+    }
 
     let lifetime = {
         let conn = match state.db.lock() {
@@ -459,6 +587,9 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
         session,
         lifetime,
         database,
+        workspaces: Vec::new(),
+        dbs: Vec::new(),
+        activity: Vec::new(),
     })
     .into_response()
 }
@@ -699,7 +830,8 @@ async fn emit_handler(
 
 #[derive(Deserialize)]
 struct GraphQuery {
-    repo_id: String,
+    repo_id: Option<String>,
+    workspace_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -749,6 +881,27 @@ async fn graph_handler(
     State(state): State<AppState>,
     Query(params): Query<GraphQuery>,
 ) -> axum::response::Response {
+    if let (Some(registry), Some(workspace_id)) = (&state.registry, params.workspace_id.as_deref())
+    {
+        let graph = match registry.lock() {
+            Ok(registry) => registry.graph_snapshot(
+                workspace_id,
+                params.repo_id.as_deref(),
+                GRAPH_INITIAL_NODE_CAP,
+            ),
+            Err(_) => Err(anyhow::anyhow!("registry lock poisoned")),
+        };
+        return match graph {
+            Ok(graph) => axum::Json(serde_json::json!(graph)).into_response(),
+            Err(e) => axum::Json(serde_json::json!({ "error": format!("{e}") })).into_response(),
+        };
+    }
+
+    let Some(repo_id) = params.repo_id else {
+        return axum::Json(serde_json::json!({"error": "missing repo_id or workspace_id"}))
+            .into_response();
+    };
+
     let conn = match state.db.lock() {
         Ok(g) => g,
         Err(_) => {
@@ -759,12 +912,12 @@ async fn graph_handler(
     let total_node_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
-            rusqlite::params![params.repo_id],
+            rusqlite::params![repo_id],
             |r| r.get(0),
         )
         .unwrap_or(0);
 
-    let degree_cache_rebuilt = match crate::db::ensure_graph_degrees(&conn, &params.repo_id) {
+    let degree_cache_rebuilt = match crate::db::ensure_graph_degrees(&conn, &repo_id) {
         Ok(rebuilt) => rebuilt,
         Err(e) => return axum::Json(serde_json::json!({"error": format!("{e}")})).into_response(),
     };
@@ -777,7 +930,7 @@ async fn graph_handler(
             }
         };
         let result: Vec<GraphNodeDto> = match stmt.query_map(
-            rusqlite::params![params.repo_id, GRAPH_INITIAL_NODE_CAP as i64],
+            rusqlite::params![repo_id, GRAPH_INITIAL_NODE_CAP as i64],
             |row| {
                 Ok(GraphNodeDto {
                     id: row.get(0)?,
@@ -804,7 +957,7 @@ async fn graph_handler(
             }
         };
         let result: Vec<GraphEdgeDto> = match stmt.query_map(
-            rusqlite::params![params.repo_id, GRAPH_INITIAL_NODE_CAP as i64],
+            rusqlite::params![repo_id, GRAPH_INITIAL_NODE_CAP as i64],
             |row| {
                 Ok(GraphEdgeDto {
                     source: row.get(0)?,
@@ -980,7 +1133,13 @@ pub async fn start(
         Err(e) => return Err(e.into()),
     };
 
-    let state = AppState { tx, session, db };
+    let state = AppState {
+        tx,
+        session,
+        db,
+        registry: None,
+        activity: None,
+    };
     let router = build_dashboard_router(state);
 
     tokio::spawn(async move {
@@ -1004,6 +1163,35 @@ pub async fn start(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn stream_records_dashboard_client_lifecycle() {
+        use axum::extract::State;
+
+        let (tx, _rx) = broadcast::channel(4);
+        let tracker = crate::activity::ActivityTracker::default();
+        let state = AppState {
+            tx,
+            session: Arc::new(Mutex::new(SessionStats::default())),
+            db: Arc::new(Mutex::new(crate::db::init_db(":memory:").unwrap())),
+            registry: None,
+            activity: Some(tracker.clone()),
+        };
+
+        let stream = sse_handler(State(state)).await;
+        let active = tracker.list();
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            active[0].kind,
+            crate::activity::ActivityKind::DashboardClient
+        );
+        assert_eq!(active[0].state, crate::activity::ActivityState::Active);
+
+        drop(stream);
+        let stopped = tracker.list();
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].state, crate::activity::ActivityState::Stopped);
+    }
+
     /// /api/emit must reject payloads larger than 1 MiB.
     #[tokio::test]
     async fn emit_rejects_oversized_payload() {
@@ -1016,6 +1204,8 @@ mod tests {
             tx,
             session: Arc::new(Mutex::new(SessionStats::default())),
             db: Arc::new(Mutex::new(conn)),
+            registry: None,
+            activity: None,
         };
 
         // 1 MiB + 1 byte should be rejected
@@ -1046,6 +1236,8 @@ mod tests {
             tx,
             session: Arc::new(Mutex::new(SessionStats::default())),
             db: Arc::new(Mutex::new(conn)),
+            registry: None,
+            activity: None,
         };
 
         let event = serde_json::json!({
@@ -1117,6 +1309,8 @@ mod tests {
             tx,
             session: Arc::new(Mutex::new(SessionStats::default())),
             db: Arc::new(Mutex::new(conn)),
+            registry: None,
+            activity: None,
         };
 
         let event = serde_json::json!({
@@ -1152,6 +1346,8 @@ mod tests {
             tx,
             session: Arc::new(Mutex::new(SessionStats::default())),
             db: Arc::new(Mutex::new(conn)),
+            registry: None,
+            activity: None,
         };
 
         let params = CompareQuery {
@@ -1352,6 +1548,8 @@ mod tests {
             tx,
             session: Arc::new(Mutex::new(SessionStats::default())),
             db: Arc::new(Mutex::new(conn)),
+            registry: None,
+            activity: None,
         }
     }
 
@@ -1379,7 +1577,8 @@ mod tests {
         let response = graph_handler(
             State(state),
             Query(GraphQuery {
-                repo_id: repo_id.to_string(),
+                repo_id: Some(repo_id.to_string()),
+                workspace_id: None,
             }),
         )
         .await;

@@ -517,6 +517,113 @@
       margin: 0 0 12px;
     }
 
+    .inventory-grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .inventory-panel {
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid rgba(216, 225, 236, 0.96);
+      border-radius: var(--specimen-radius);
+      box-shadow: var(--specimen-shadow-tight);
+      overflow: hidden;
+    }
+
+    .inventory-header {
+      align-items: center;
+      background: var(--specimen-surface-subtle);
+      border-bottom: 1px solid rgba(216, 225, 236, 0.96);
+      display: flex;
+      justify-content: space-between;
+      min-height: 40px;
+      padding: 8px 12px;
+    }
+
+    .inventory-title {
+      color: var(--specimen-ink-soft);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.01em;
+    }
+
+    .inventory-body {
+      overflow-x: auto;
+    }
+
+    .inventory-body table {
+      min-width: 760px;
+    }
+
+    .path-cell {
+      color: var(--specimen-muted);
+      font-family: var(--font-data);
+      font-size: 11px;
+      max-width: 340px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .status-pill {
+      border: 1px solid rgba(185, 198, 212, 0.96);
+      border-radius: 999px;
+      color: var(--specimen-ink-soft);
+      display: inline-flex;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 7px;
+    }
+
+    .status-pill.available,
+    .status-pill.active,
+    .status-pill.completed {
+      background: var(--specimen-mint-soft);
+      border-color: rgba(47, 143, 99, 0.34);
+      color: #266f4f;
+    }
+
+    .status-pill.error,
+    .status-pill.corrupt,
+    .status-pill.inaccessible_db {
+      background: var(--specimen-danger-soft);
+      border-color: rgba(191, 91, 74, 0.34);
+      color: #8a3f34;
+    }
+
+    .action-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+
+    .action-btn {
+      background: rgba(255, 255, 255, 0.96);
+      border: 1px solid rgba(185, 198, 212, 0.96);
+      border-radius: var(--specimen-radius-sm);
+      color: var(--specimen-ink-soft);
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-size: 10px;
+      font-weight: 800;
+      min-height: 28px;
+      padding: 4px 8px;
+    }
+
+    .action-btn:hover {
+      background: var(--specimen-tissue-soft);
+      border-color: rgba(61, 111, 224, 0.34);
+      color: var(--specimen-tissue-ink);
+    }
+
+    .action-btn.danger:hover {
+      background: var(--specimen-danger-soft);
+      border-color: rgba(191, 91, 74, 0.36);
+      color: #8a3f34;
+    }
+
     /* ── Privacy footer ─────────────────────────────────────────────────────── */
     #privacy {
       flex-shrink: 0;
@@ -1899,6 +2006,78 @@
         </div>
       </div>
 
+      <div class="inventory-grid">
+        <section class="inventory-panel" aria-labelledby="workspace-inventory-title">
+          <div class="inventory-header">
+            <div class="inventory-title" id="workspace-inventory-title">Workspace Inventory</div>
+            <div class="card-sub" id="workspace-inventory-count">0 workspaces</div>
+          </div>
+          <div class="inventory-body">
+            <table>
+              <thead>
+                <tr>
+                  <th>Workspace</th>
+                  <th>Status</th>
+                  <th>Path</th>
+                  <th>Last Seen</th>
+                  <th style="text-align:right">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="workspace-inventory-body">
+                <tr><td colspan="5">No registered workspaces</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="inventory-panel" aria-labelledby="db-inventory-title">
+          <div class="inventory-header">
+            <div class="inventory-title" id="db-inventory-title">DB / Index Inventory</div>
+            <div class="card-sub" id="db-inventory-count">0 databases</div>
+          </div>
+          <div class="inventory-body">
+            <table>
+              <thead>
+                <tr>
+                  <th>Workspace</th>
+                  <th>Status</th>
+                  <th>DB</th>
+                  <th>Repos</th>
+                  <th>Files</th>
+                  <th style="text-align:right">Symbols</th>
+                </tr>
+              </thead>
+              <tbody id="db-inventory-body">
+                <tr><td colspan="6">No graph databases found</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="inventory-panel" aria-labelledby="activity-title">
+          <div class="inventory-header">
+            <div class="inventory-title" id="activity-title">Runtime Activity</div>
+            <div class="card-sub" id="activity-count">0 active</div>
+          </div>
+          <div class="inventory-body">
+            <table>
+              <thead>
+                <tr>
+                  <th>Kind</th>
+                  <th>State</th>
+                  <th>Workspace</th>
+                  <th>Detail</th>
+                  <th style="text-align:right">Updated</th>
+                </tr>
+              </thead>
+              <tbody id="activity-body">
+                <tr><td colspan="5">No runtime activity</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
       <footer id="privacy-lt">
         Marrow operates entirely offline. No telemetry. All data remains strictly on your local machine (127.0.0.1).
       </footer>
@@ -1908,7 +2087,7 @@
     <!-- TREE VISUALIZATION panel -->
     <section id="panel-tree" class="panel">
       <div id="tree-toolbar">
-        <label class="tree-label" for="workspace-selector-btn">Repo</label>
+        <label class="tree-label" for="workspace-selector-btn">Workspace</label>
         <div class="workspace-selector">
           <button
             id="workspace-selector-btn"
@@ -2079,6 +2258,24 @@
     return `${hh}:${mm}:${ss}`;
   }
 
+  function fmtRelativeTs(ts) {
+    const n = Number(ts || 0);
+    if (!n) return '—';
+    return fmtTs(n);
+  }
+
+  function workspaceName(row) {
+    if (!row) return '—';
+    if (row.display_name) return row.display_name;
+    const root = String(row.workspace_root || '');
+    return root.split('/').filter(Boolean).pop() || row.workspace_id || 'workspace';
+  }
+
+  function statusPill(value) {
+    const status = String(value || 'unknown');
+    return `<span class="status-pill ${escHtml(status)}">${escHtml(status.replace(/_/g, ' '))}</span>`;
+  }
+
   function nowTs() {
     return Math.floor(Date.now() / 1000);
   }
@@ -2163,6 +2360,99 @@
     document.getElementById('db-repos').textContent = fmtNum(database.repo_count || 0);
     document.getElementById('db-symbols').textContent = fmtNum(database.symbol_count || 0);
     document.getElementById('scope-db-path').textContent = database.path || '—';
+  }
+
+  function cleanupWorkspace(action, workspaceId) {
+    const labels = {
+      unregister: 'Unregister',
+      'clear-index': 'Clear index',
+      'delete-db': 'Delete DB',
+    };
+    const label = labels[action] || action;
+    if (!window.confirm(`${label} ${workspaceId}?`)) return;
+    fetch('/api/cleanup/' + encodeURIComponent(action), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workspace_id: workspaceId, confirmed: true }),
+    })
+      .then(r => r.json().then(body => ({ ok: r.ok, body })))
+      .then(result => {
+        if (!result.ok || result.body.error) window.alert(result.body.error || 'Action failed');
+        fetchStats(false);
+      })
+      .catch(err => window.alert(err.message));
+  }
+
+  function updateWorkspaceInventory(workspaces) {
+    const rows = Array.isArray(workspaces) ? workspaces : [];
+    document.getElementById('workspace-inventory-count').textContent = rows.length.toLocaleString() + ' workspaces';
+    const tbody = document.getElementById('workspace-inventory-body');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="5">No registered workspaces</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(row => `
+      <tr>
+        <td>${escHtml(workspaceName(row))}</td>
+        <td>${statusPill(row.status)}</td>
+        <td class="path-cell" title="${escHtml(row.workspace_root || '')}">${escHtml(row.workspace_root || '')}</td>
+        <td>${escHtml(fmtRelativeTs(row.last_seen_at))}</td>
+        <td>
+          <div class="action-row">
+            <button class="action-btn" type="button" onclick="cleanupWorkspace('unregister', '${escHtml(row.workspace_id)}')">Unregister</button>
+            <button class="action-btn" type="button" onclick="cleanupWorkspace('clear-index', '${escHtml(row.workspace_id)}')">Clear Index</button>
+            <button class="action-btn danger" type="button" onclick="cleanupWorkspace('delete-db', '${escHtml(row.workspace_id)}')">Delete DB</button>
+          </div>
+        </td>
+      </tr>
+    `).join('');
+  }
+
+  function updateDbInventory(dbs) {
+    const rows = Array.isArray(dbs) ? dbs : [];
+    document.getElementById('db-inventory-count').textContent = rows.length.toLocaleString() + ' databases';
+    const tbody = document.getElementById('db-inventory-body');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="6">No graph databases found</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(row => `
+      <tr>
+        <td>${escHtml(workspaceName(row))}</td>
+        <td>${statusPill(row.status)}</td>
+        <td class="path-cell" title="${escHtml(row.graph_db_path || '')}">${escHtml(row.graph_db_path || '')}</td>
+        <td>${fmtNum(row.repo_count || 0)}</td>
+        <td>${fmtNum(row.file_count || 0)}</td>
+        <td style="text-align:right">${fmtNum(row.symbol_count || 0)}</td>
+      </tr>
+    `).join('');
+  }
+
+  function updateActivityPanel(activity) {
+    const rows = Array.isArray(activity) ? activity : [];
+    const active = rows.filter(row => row.state === 'active').length;
+    document.getElementById('activity-count').textContent = active.toLocaleString() + ' active';
+    const tbody = document.getElementById('activity-body');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="5">No runtime activity</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.slice().reverse().map(row => `
+      <tr>
+        <td>${escHtml(String(row.kind || '').replace(/_/g, ' '))}</td>
+        <td>${statusPill(row.state)}</td>
+        <td>${escHtml(row.workspace_id || '—')}</td>
+        <td class="path-cell" title="${escHtml(row.detail || '')}">${escHtml(row.detail || '')}</td>
+        <td style="text-align:right">${escHtml(fmtRelativeTs(row.updated_at))}</td>
+      </tr>
+    `).join('');
+  }
+
+  function updateGlobalInventory(body) {
+    updateWorkspaceInventory(body.workspaces || []);
+    updateDbInventory(body.dbs || []);
+    updateActivityPanel(body.activity || []);
+    workspaceSelectorPopulateFromStats(body);
   }
 
   function setStatus(state) {
@@ -2422,6 +2712,7 @@
         if (body.database) {
           updateDatabaseScope(body.database);
         }
+        updateGlobalInventory(body);
       })
       .catch(() => {
         // Server not yet ready; silently ignore
@@ -3472,8 +3763,12 @@
 
   // ── Fetch & load ───────────────────────────────────────────────────────────
 
-  function treeSelectRepo(repoId) {
-    if (!repoId) return;
+  function treeSelectRepo(selectionKey) {
+    if (!selectionKey) return;
+    const selected = workspaceSelectorRepos.find(item => item.key === selectionKey);
+    const repoId = selected ? selected.repo_id : selectionKey;
+    const workspaceId = selected ? selected.workspace_id : '';
+    const requestLabel = selected ? selected.label : repoId;
     const loadId = ++treeLoadSeq;
     if (treeLoadAbort) treeLoadAbort.abort();
     treeLoadAbort = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -3486,15 +3781,19 @@
     }
 
     document.getElementById('tree-empty').style.display = 'none';
-    treeSetLoadState('fetching', repoId);
+    treeSetLoadState('fetching', requestLabel);
     document.getElementById('tree-info').textContent = '';
     treeResetGraphView();
 
-    fetch('/api/graph?repo_id=' + encodeURIComponent(repoId), treeLoadAbort ? { signal: treeLoadAbort.signal } : undefined)
+    const url = workspaceId
+      ? '/api/graph?workspace_id=' + encodeURIComponent(workspaceId) + '&repo_id=' + encodeURIComponent(repoId || '')
+      : '/api/graph?repo_id=' + encodeURIComponent(repoId);
+
+    fetch(url, treeLoadAbort ? { signal: treeLoadAbort.signal } : undefined)
       .then(r => r.json())
       .then(data => {
         if (loadId !== treeLoadSeq) return;
-        treeSetLoadState('preparing', repoId);
+        treeSetLoadState('preparing', requestLabel);
 
         if (data.error) {
           treeShowLoadError(loadId, 'Error: ' + data.error);
@@ -3541,8 +3840,7 @@
     fetch('/stats')
       .then(r => r.json())
       .then(data => {
-        const repos = (data.database && data.database.repos) ? data.database.repos : [];
-        workspaceSelectorPopulate(repos);
+        workspaceSelectorPopulateFromStats(data);
       })
       .catch(() => {});
 
@@ -3558,36 +3856,81 @@
   let workspaceSelectorCurrent = '';
   let workspaceSelectorFocusedIndex = -1;
 
-  function workspaceSelectorPopulate(repos) {
-    workspaceSelectorRepos = repos;
+  function workspaceSelectorItemsFromStats(data) {
+    const dbs = Array.isArray(data.dbs) ? data.dbs : [];
+    if (dbs.length) {
+      const items = [];
+      dbs.forEach(db => {
+        const repos = Array.isArray(db.repos) ? db.repos : [];
+        if (repos.length) {
+          repos.forEach(repo => {
+            items.push({
+              key: db.workspace_id + '::' + repo.repo_id,
+              workspace_id: db.workspace_id,
+              repo_id: repo.repo_id,
+              label: workspaceName(db) + ' / ' + repo.repo_id,
+              count: repo.symbol_count || 0,
+              status: db.status,
+            });
+          });
+        } else {
+          items.push({
+            key: db.workspace_id,
+            workspace_id: db.workspace_id,
+            repo_id: '',
+            label: workspaceName(db),
+            count: db.symbol_count || 0,
+            status: db.status,
+          });
+        }
+      });
+      return items;
+    }
+    const repos = (data.database && data.database.repos) ? data.database.repos : [];
+    return repos.map(repo => ({
+      key: repo.repo_id,
+      workspace_id: '',
+      repo_id: repo.repo_id,
+      label: repo.repo_id,
+      count: repo.symbol_count || 0,
+      status: 'available',
+    }));
+  }
+
+  function workspaceSelectorPopulateFromStats(data) {
+    workspaceSelectorPopulate(workspaceSelectorItemsFromStats(data || {}));
+  }
+
+  function workspaceSelectorPopulate(items) {
+    workspaceSelectorRepos = items;
     const dropdown = document.getElementById('workspace-selector-dropdown');
     const sel = document.getElementById('tree-repo-select');
 
     // Sync hidden native select
     sel.innerHTML = '<option value="">Select workspace</option>';
-    repos.forEach(repo => {
+    items.forEach(item => {
       const opt = document.createElement('option');
-      opt.value = repo.repo_id;
-      opt.textContent = repo.repo_id + ' (' + (repo.symbol_count || 0).toLocaleString() + ' symbols)';
+      opt.value = item.key;
+      opt.textContent = item.label + ' (' + (item.count || 0).toLocaleString() + ' symbols)';
       sel.appendChild(opt);
     });
 
     // Populate custom dropdown
-    if (repos.length === 0) {
+    if (items.length === 0) {
       dropdown.innerHTML = '<div class="workspace-selector-empty">No indexed workspaces found</div>';
     } else {
       dropdown.innerHTML = '';
-      repos.forEach((repo, idx) => {
+      items.forEach((item, idx) => {
         const option = document.createElement('div');
         option.className = 'workspace-selector-option';
         option.setAttribute('role', 'option');
-        option.setAttribute('data-repo-id', repo.repo_id);
+        option.setAttribute('data-repo-id', item.key);
         option.setAttribute('data-index', idx);
         option.innerHTML = `
-          <span class="workspace-selector-option-name">${escHtml(repo.repo_id)}</span>
-          <span class="workspace-selector-option-count">${(repo.symbol_count || 0).toLocaleString()} symbols</span>
+          <span class="workspace-selector-option-name">${escHtml(item.label)}</span>
+          <span class="workspace-selector-option-count">${(item.count || 0).toLocaleString()} symbols</span>
         `;
-        option.addEventListener('click', () => workspaceSelectorSelect(repo.repo_id));
+        option.addEventListener('click', () => workspaceSelectorSelect(item.key));
         dropdown.appendChild(option);
       });
     }
@@ -3596,30 +3939,30 @@
     if (workspaceSelectorCurrent) {
       workspaceSelectorUpdateDisplay(workspaceSelectorCurrent);
       sel.value = workspaceSelectorCurrent;
-    } else if (repos.length === 1) {
-      workspaceSelectorSelect(repos[0].repo_id);
+    } else if (items.length === 1 && document.getElementById('panel-tree').classList.contains('active')) {
+      workspaceSelectorSelect(items[0].key);
     }
   }
 
-  function workspaceSelectorSelect(repoId) {
-    workspaceSelectorCurrent = repoId;
-    workspaceSelectorUpdateDisplay(repoId);
+  function workspaceSelectorSelect(selectionKey) {
+    workspaceSelectorCurrent = selectionKey;
+    workspaceSelectorUpdateDisplay(selectionKey);
     workspaceSelectorClose();
-    document.getElementById('tree-repo-select').value = repoId;
-    treeSelectRepo(repoId);
+    document.getElementById('tree-repo-select').value = selectionKey;
+    treeSelectRepo(selectionKey);
     // Return focus to button for consistent focus state
     document.getElementById('workspace-selector-btn').focus();
   }
 
-  function workspaceSelectorUpdateDisplay(repoId) {
+  function workspaceSelectorUpdateDisplay(selectionKey) {
     const label = document.getElementById('workspace-selector-label');
     const count = document.getElementById('workspace-selector-count');
-    const repo = workspaceSelectorRepos.find(r => r.repo_id === repoId);
+    const item = workspaceSelectorRepos.find(r => r.key === selectionKey);
 
-    if (repo) {
-      label.textContent = repo.repo_id;
+    if (item) {
+      label.textContent = item.label;
       label.classList.remove('empty');
-      count.textContent = (repo.symbol_count || 0).toLocaleString() + ' symbols';
+      count.textContent = (item.count || 0).toLocaleString() + ' symbols';
     } else {
       label.textContent = 'Select workspace';
       label.classList.add('empty');
@@ -3628,7 +3971,7 @@
 
     // Update selected state
     document.querySelectorAll('.workspace-selector-option').forEach(opt => {
-      if (opt.getAttribute('data-repo-id') === repoId) {
+      if (opt.getAttribute('data-repo-id') === selectionKey) {
         opt.classList.add('selected');
         opt.setAttribute('aria-selected', 'true');
       } else {

@@ -139,7 +139,8 @@ fn run_webview() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         // Check for WebView2 runtime on Windows.
-        let webview2_key = "SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BEF-AE91B6C6C5CF}";
+        let webview2_key =
+            "SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BEF-AE91B6C6C5CF}";
         if winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
             .open_subkey(webview2_key)
             .is_err()
@@ -277,8 +278,18 @@ pub fn status() -> Result<()> {
     let registered = is_registered();
     let app_running = is_app_running();
 
-    println!("Registration: {}", if registered { "enabled" } else { "disabled" });
-    println!("App process:  {}", if app_running { "running" } else { "not running" });
+    println!(
+        "Registration: {}",
+        if registered { "enabled" } else { "disabled" }
+    );
+    println!(
+        "App process:  {}",
+        if app_running {
+            "running"
+        } else {
+            "not running"
+        }
+    );
     Ok(())
 }
 
@@ -330,8 +341,8 @@ fn is_app_running() -> bool {
 
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 fn macos_enable(exe_path: &std::path::Path) -> Result<()> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let app_dir = home.join("Applications/Marrow.app/Contents/MacOS");
     std::fs::create_dir_all(&app_dir)?;
 
@@ -357,10 +368,7 @@ fn macos_enable(exe_path: &std::path::Path) -> Result<()> {
 
     // Create a launcher script that calls the actual binary.
     let launcher_path = app_dir.join("marrow-launcher");
-    let launcher_content = format!(
-        "#!/bin/sh\nexec \"{}\" ui-app open\n",
-        exe_path.display()
-    );
+    let launcher_content = format!("#!/bin/sh\nexec \"{}\" ui-app open\n", exe_path.display());
     std::fs::write(&launcher_path, launcher_content)?;
 
     // Make it executable.
@@ -375,8 +383,8 @@ fn macos_enable(exe_path: &std::path::Path) -> Result<()> {
 
 #[cfg(all(feature = "desktop", target_os = "macos"))]
 fn macos_disable() -> Result<()> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let app_path = home.join("Applications/Marrow.app");
     if app_path.exists() {
         std::fs::remove_dir_all(&app_path)?;
@@ -390,8 +398,8 @@ fn macos_disable() -> Result<()> {
 
 #[cfg(all(feature = "desktop", target_os = "linux"))]
 fn linux_enable(exe_path: &std::path::Path) -> Result<()> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let apps_dir = home.join(".local/share/applications");
     std::fs::create_dir_all(&apps_dir)?;
 
@@ -412,8 +420,8 @@ fn linux_enable(exe_path: &std::path::Path) -> Result<()> {
 
 #[cfg(all(feature = "desktop", target_os = "linux"))]
 fn linux_disable() -> Result<()> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let desktop_path = home.join(".local/share/applications/marrow.desktop");
     if desktop_path.exists() {
         std::fs::remove_file(&desktop_path)?;
@@ -434,10 +442,7 @@ fn windows_enable(exe_path: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(&start_menu)?;
 
     // Write a .bat file that launches the binary (simpler than COM shell link)
-    let bat_content = format!(
-        "@echo off\r\n\"{}\" ui-app open\r\n",
-        exe_path.display()
-    );
+    let bat_content = format!("@echo off\r\n\"{}\" ui-app open\r\n", exe_path.display());
     std::fs::write(start_menu.join("Marrow.bat"), bat_content)?;
 
     // Also write a marker .lnk placeholder for status detection

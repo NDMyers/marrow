@@ -1,8 +1,10 @@
+mod activity;
 mod daemon;
 mod dashboard;
 mod db;
 mod ingestion;
 mod ipc;
+mod registry;
 mod retrieval;
 mod service;
 mod skills;
@@ -1957,15 +1959,82 @@ impl ServerHandler for ContextEngine {
                         return Ok(CallToolResult::success(vec![Content::text(msg)]));
                     }
 
+                    let mut registered_workspace_id = None;
+                    let db_for_ingestion =
+                        match registry::Registry::open_default().and_then(|registry| {
+                            registry.register_workspace_with_boundary(
+                                &root_path,
+                                Some(&workspace_root),
+                                user_confirmed,
+                                None,
+                            )
+                        }) {
+                            Ok(entry) => {
+                                registered_workspace_id = Some(entry.workspace_id.clone());
+                                let graph_db_path =
+                                    entry.graph_db_path.to_string_lossy().to_string();
+                                match db::init_db_or_memory(&graph_db_path) {
+                                    Ok(conn) => Arc::new(Mutex::new(conn)),
+                                    Err(e) => {
+                                        return Err(rmcp::ErrorData::internal_error(
+                                            format!("failed to open registered workspace DB: {e}"),
+                                            None,
+                                        ))
+                                    }
+                                }
+                            }
+                            Err(_) => Arc::clone(&db),
+                        };
+
                     // Rule 1 (inside workspace) or Rule 4 (outside + confirmed): proceed
                     let repo_id_for_event = repo_id.clone();
+                    let activity_client = ipc::default_client();
+                    let activity_id = activity_client
+                        .start_activity(
+                            activity::ActivityKind::IndexingJob,
+                            registered_workspace_id.clone(),
+                            format!("indexing {}", root_path.display()),
+                        )
+                        .await
+                        .ok()
+                        .flatten();
 
-                    let (symbols, edges) = tokio::task::spawn_blocking(move || {
-                        ingestion::run_ingestion_with_arc(&db, &repo_id, &root_path, |_| {})
+                    let ingest_result = tokio::task::spawn_blocking(move || {
+                        ingestion::run_ingestion_with_arc_and_activity(
+                            &db_for_ingestion,
+                            &repo_id,
+                            &root_path,
+                            |_| {},
+                            None,
+                            registered_workspace_id,
+                        )
                     })
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None));
+                    if let Some(activity_id) = activity_id.as_deref() {
+                        match &ingest_result {
+                            Ok((symbols, edges)) => {
+                                let _ = activity_client
+                                    .finish_activity(
+                                        activity_id,
+                                        activity::ActivityState::Completed,
+                                        format!("indexed {symbols} symbols / {edges} edges"),
+                                    )
+                                    .await;
+                            }
+                            Err(error) => {
+                                let _ = activity_client
+                                    .finish_activity(
+                                        activity_id,
+                                        activity::ActivityState::Error,
+                                        format!("{error:?}"),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    let (symbols, edges) = ingest_result?;
 
                     let event = DashboardEvent::RepoIndexed {
                         repo_id: repo_id_for_event,
@@ -2716,6 +2785,21 @@ mod tests {
     fn count_tokens_empty_returns_zero() {
         let n = count_tokens("").unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn mcp_session_finish_state_marks_disconnect_and_error() {
+        let ok: Result<()> = Ok(());
+        assert_eq!(
+            mcp_session_finish_state(&ok),
+            activity::ActivityState::Stopped
+        );
+
+        let err: Result<()> = Err(anyhow::anyhow!("stdio failed"));
+        assert_eq!(
+            mcp_session_finish_state(&err),
+            activity::ActivityState::Error
+        );
     }
 
     #[test]
@@ -4761,6 +4845,7 @@ fn cmd_index() -> Result<()> {
     let t0 = Instant::now();
     let cwd = std::env::current_dir()?;
     let root = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+    registry::register_workspace_best_effort(&root);
     let repo_id = root
         .file_name()
         .and_then(|n| n.to_str())
@@ -4919,6 +5004,7 @@ pub fn run_index_command(workspace_root: &Path) -> Result<()> {
     let root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
+    registry::register_workspace_best_effort(&root);
     let repo_id = root
         .file_name()
         .and_then(|n| n.to_str())
@@ -4979,6 +5065,7 @@ pub fn run_watch_command(workspace_root: &Path) -> Result<()> {
     use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
     use std::time::Duration;
 
+    registry::register_workspace_best_effort(workspace_root);
     eprintln!("{}", style("[Marrow] Building baseline index...").cyan());
     run_index_command(workspace_root)?;
 
@@ -5367,6 +5454,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
         Some("watch") => {
             ipc::ensure_daemon_running().await?;
             let cwd = std::env::current_dir()?;
+            registry::register_workspace_best_effort(&cwd);
             ipc::default_client().register_watch(&cwd).await?;
             println!("[marrow] watching {}", cwd.display());
             return Ok(());
@@ -5397,6 +5485,18 @@ async fn async_main(args: Vec<String>) -> Result<()> {
     // ── Default: start MCP stdio server ──────────────────────────────
     let db_path =
         std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
+    let workspace_root = current_workspace_root();
+    let workspace_entry = registry::register_workspace_best_effort(&workspace_root);
+    let activity_client = ipc::default_client();
+    let mcp_activity_id = activity_client
+        .start_activity(
+            activity::ActivityKind::McpSession,
+            workspace_entry.map(|entry| entry.workspace_id),
+            format!("stdio {}", workspace_root.display()),
+        )
+        .await
+        .ok()
+        .flatten();
 
     // ── Read config flags in one pass ───────────────────────────────
     // Config read is always best-effort; a missing/unreadable file is not fatal.
@@ -5458,8 +5558,32 @@ async fn async_main(args: Vec<String>) -> Result<()> {
     set_index_state(IndexState::Ready);
 
     eprintln!("Marrow MCP server ready — listening on stdio.");
-    let server = engine.serve(stdio()).await?;
-    server.waiting().await?;
+    let server_result: Result<()> = async {
+        let server = engine.serve(stdio()).await?;
+        server.waiting().await?;
+        Ok(())
+    }
+    .await;
 
-    Ok(())
+    if let Some(activity_id) = mcp_activity_id.as_deref() {
+        let state = mcp_session_finish_state(&server_result);
+        let detail = if server_result.is_ok() {
+            "stdio session disconnected"
+        } else {
+            "stdio session error"
+        };
+        let _ = activity_client
+            .finish_activity(activity_id, state, detail.to_string())
+            .await;
+    }
+
+    server_result
+}
+
+fn mcp_session_finish_state(server_result: &Result<()>) -> activity::ActivityState {
+    if server_result.is_ok() {
+        activity::ActivityState::Stopped
+    } else {
+        activity::ActivityState::Error
+    }
 }
