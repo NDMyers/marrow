@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod db;
 pub mod ingestion;
 pub mod ipc;
+pub mod packaging;
 pub mod registry;
 pub mod retrieval;
 pub mod service;

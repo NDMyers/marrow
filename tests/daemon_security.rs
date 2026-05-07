@@ -86,6 +86,34 @@ fn path_validation_allows_nested_paths() {
     );
 }
 
+#[test]
+fn daemon_cli_exposes_autostart_management_without_replacing_runtime_status() {
+    let main_src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+    )
+    .unwrap();
+
+    assert!(
+        main_src.contains(
+            "println!(\"  daemon          Start background daemon or manage autostart\");"
+        ),
+        "daemon help text should advertise runtime + autostart management"
+    );
+    assert!(
+        main_src.contains("eprintln!(\"Usage: marrow daemon [install|uninstall|status]\");"),
+        "daemon usage text should list install/uninstall/status"
+    );
+    assert!(
+        main_src.contains("Some(\"status\") => return cmd_status().await"),
+        "top-level status must remain wired to runtime-only cmd_status"
+    );
+    assert!(
+        main_src.contains("Some(\"service\") => {")
+            && main_src.contains("\"install\" => return service::install()"),
+        "legacy service install alias must remain available"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn path_validation_handles_symlink_within_workspace() {
