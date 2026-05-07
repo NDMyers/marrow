@@ -77,10 +77,11 @@ image = { version = "0.25", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winreg = { version = "0.55", optional = true }
+mslnk = { version = "0.1", optional = true }
 
 [features]
 default = ["desktop"]
-desktop = ["dep:wry", "dep:tray-icon", "dep:tao", "dep:image", "dep:winreg"]
+desktop = ["dep:wry", "dep:tray-icon", "dep:tao", "dep:image", "dep:winreg", "dep:mslnk"]
 
 [dev-dependencies]
 hyper            = { version = "1", features = ["client", "http1"] }

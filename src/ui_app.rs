@@ -290,6 +290,122 @@ pub fn status() -> Result<()> {
             "not running"
         }
     );
+
+    #[cfg(target_os = "macos")]
+    {
+        let app_path = dirs::home_dir()
+            .map(|h| h.join("Applications/Marrow.app"))
+            .unwrap_or_default();
+        println!(
+            "App path:     {} [{}]",
+            app_path.display(),
+            if app_path.exists() { "exists" } else { "missing" }
+        );
+
+        // Launcher target: extract exec path from the launcher shell script.
+        let launcher_path = dirs::home_dir()
+            .map(|h| h.join("Applications/Marrow.app/Contents/MacOS/marrow-launcher"))
+            .unwrap_or_default();
+        let launcher_target_printed = if let Ok(content) = std::fs::read_to_string(&launcher_path) {
+            let mut printed = false;
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("exec ") {
+                    let target = rest.trim().trim_matches('"');
+                    let target_path = std::path::PathBuf::from(target);
+                    println!(
+                        "Launcher target: {} [{}]",
+                        target,
+                        if target_path.exists() { "exists" } else { "missing" }
+                    );
+                    printed = true;
+                    break;
+                }
+            }
+            printed
+        } else {
+            false
+        };
+        if !launcher_target_printed {
+            println!("Launcher target: {} [missing]", launcher_path.display());
+        }
+
+        // Gatekeeper check (non-fatal).
+        let xattr_result = std::process::Command::new("xattr")
+            .args(["-p", "com.apple.quarantine", app_path.to_str().unwrap_or("")])
+            .output();
+        match xattr_result {
+            Ok(output) if !output.stdout.is_empty() => {
+                println!("Gatekeeper: quarantined");
+                eprintln!(
+                    "[marrow] Advisory: run `xattr -dr com.apple.quarantine {}` to clear.",
+                    app_path.display()
+                );
+            }
+            Ok(_) => {
+                println!("Gatekeeper: clear");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // xattr not available; omit the line.
+            }
+            Err(_) => {
+                // Other error; omit the line.
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let desktop_path = dirs::home_dir()
+            .map(|h| h.join(".local/share/applications/marrow.desktop"))
+            .unwrap_or_default();
+        println!(
+            "App path:     {} [{}]",
+            desktop_path.display(),
+            if desktop_path.exists() { "exists" } else { "missing" }
+        );
+
+        // Launcher target: extract Exec= line from .desktop file.
+        let launcher_target_printed = if let Ok(content) = std::fs::read_to_string(&desktop_path) {
+            let mut printed = false;
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("Exec=") {
+                    // The Exec= value may be quoted: `"<path>" ui-app open`.
+                    // Extract the binary path (first token, unquoted).
+                    let exe = rest.trim_start_matches('"');
+                    let exe = exe.split_whitespace().next().unwrap_or(rest);
+                    let exe = exe.trim_matches('"');
+                    let target_path = std::path::PathBuf::from(exe);
+                    println!(
+                        "Launcher target: {} [{}]",
+                        exe,
+                        if target_path.exists() { "exists" } else { "missing" }
+                    );
+                    printed = true;
+                    break;
+                }
+            }
+            printed
+        } else {
+            false
+        };
+        if !launcher_target_printed {
+            println!("Launcher target: {} [missing]", desktop_path.display());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let lnk_path = dirs::data_dir()
+            .map(|d| d.join("Microsoft\\Windows\\Start Menu\\Programs\\Marrow.lnk"))
+            .unwrap_or_default();
+        println!(
+            "App path:     {} [{}]",
+            lnk_path.display(),
+            if lnk_path.exists() { "exists" } else { "missing" }
+        );
+        println!("Launcher target: (run 'marrow ui-app enable' to configure)");
+    }
+
     Ok(())
 }
 
@@ -314,7 +430,14 @@ fn is_registered() -> bool {
         let start_menu = dirs::data_dir()
             .map(|d| d.join("Microsoft\\Windows\\Start Menu\\Programs\\Marrow.lnk"))
             .unwrap_or_default();
-        start_menu.exists()
+        if !start_menu.exists() {
+            return false;
+        }
+        // Validate the Shell Link magic bytes [0x4C, 0x00, 0x00, 0x00].
+        match std::fs::read(&start_menu) {
+            Ok(bytes) if bytes.len() >= 4 => bytes[..4] == [0x4C, 0x00, 0x00, 0x00],
+            _ => false,
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -346,6 +469,26 @@ fn macos_enable(exe_path: &std::path::Path) -> Result<()> {
     let app_dir = home.join("Applications/Marrow.app/Contents/MacOS");
     std::fs::create_dir_all(&app_dir)?;
 
+    // Create Resources/ dir and generate ICNS icon.
+    let resources_dir = home.join("Applications/Marrow.app/Contents/Resources");
+    std::fs::create_dir_all(&resources_dir)?;
+
+    let icon_img = image::RgbaImage::from_pixel(256, 256, image::Rgba([0x4A, 0xB5, 0x6F, 0xFF]));
+    let dyn_img = image::DynamicImage::ImageRgba8(icon_img);
+    let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+    dyn_img.write_to(&mut cursor, image::ImageFormat::Png)?;
+    let png_data = cursor.into_inner();
+
+    let block_len = 8u32 + png_data.len() as u32;
+    let total_len = 8u32 + block_len;
+    let mut icns_data: Vec<u8> = Vec::new();
+    icns_data.extend_from_slice(b"icns");
+    icns_data.extend_from_slice(&total_len.to_be_bytes());
+    icns_data.extend_from_slice(b"ic08");
+    icns_data.extend_from_slice(&block_len.to_be_bytes());
+    icns_data.extend_from_slice(&png_data);
+    std::fs::write(resources_dir.join("Marrow.icns"), icns_data)?;
+
     // Create Info.plist
     let plist_content = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -359,6 +502,10 @@ fn macos_enable(exe_path: &std::path::Path) -> Result<()> {
     <string>Marrow</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleIconFile</key>
+    <string>Marrow</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
 </dict>
@@ -376,6 +523,27 @@ fn macos_enable(exe_path: &std::path::Path) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&launcher_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Register with Launch Services (non-fatal).
+    let app_path = home.join("Applications/Marrow.app");
+    match std::process::Command::new(
+        "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/\
+         LaunchServices.framework/Versions/A/Support/lsregister",
+    )
+    .args(["-R", "-f", app_path.to_str().unwrap_or("")])
+    .status()
+    {
+        Ok(status) if !status.success() => {
+            eprintln!("[marrow] Warning: lsregister returned non-zero status.");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("[marrow] Warning: lsregister not found; Launch Services not updated.");
+        }
+        Err(e) => {
+            eprintln!("[marrow] Warning: lsregister failed: {e}");
+        }
+        Ok(_) => {}
     }
 
     Ok(())
@@ -398,23 +566,60 @@ fn macos_disable() -> Result<()> {
 
 #[cfg(all(feature = "desktop", target_os = "linux"))]
 fn linux_enable(exe_path: &std::path::Path) -> Result<()> {
+    // Warn if running as root — registration will land in /root/.local/ and
+    // be invisible to other users.
+    if unsafe { libc::getuid() } == 0 {
+        eprintln!(
+            "[marrow] Warning: Running as root. Desktop registration will be scoped to \
+/root/.local/. Use a non-root user or install system-wide manually."
+        );
+    }
+
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let apps_dir = home.join(".local/share/applications");
     std::fs::create_dir_all(&apps_dir)?;
 
+    // Create hicolor icon dir and write PNG icon.
+    let icon_dir = home.join(".local/share/icons/hicolor/256x256/apps");
+    std::fs::create_dir_all(&icon_dir)?;
+    let icon_img = image::RgbaImage::from_pixel(256, 256, image::Rgba([0x4A, 0xB5, 0x6F, 0xFF]));
+    icon_img.save(icon_dir.join("marrow.png"))?;
+
     let desktop_entry = format!(
         "[Desktop Entry]\n\
+         Version=1.0\n\
          Type=Application\n\
          Name=Marrow\n\
          Comment=AST Context Engine Dashboard\n\
          Exec=\"{}\" ui-app open\n\
+         Icon=marrow\n\
          Terminal=false\n\
          Categories=Development;\n",
         exe_path.display()
     );
 
     std::fs::write(apps_dir.join("marrow.desktop"), desktop_entry)?;
+
+    // Update the desktop database (non-fatal).
+    match std::process::Command::new("update-desktop-database")
+        .arg(apps_dir.to_str().unwrap_or(""))
+        .status()
+    {
+        Ok(status) if !status.success() => {
+            eprintln!("[marrow] Warning: update-desktop-database returned non-zero status.");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "[marrow] Warning: update-desktop-database not found; desktop database not updated."
+            );
+        }
+        Err(e) => {
+            eprintln!("[marrow] Warning: update-desktop-database failed: {e}");
+        }
+        Ok(_) => {}
+    }
+
     Ok(())
 }
 
@@ -435,18 +640,23 @@ fn linux_disable() -> Result<()> {
 
 #[cfg(all(feature = "desktop", target_os = "windows"))]
 fn windows_enable(exe_path: &std::path::Path) -> Result<()> {
-    // Create a .bat launcher in the Start Menu Programs folder.
+    // Creates a Shell Link (.lnk) in the Start Menu Programs folder using the
+    // `mslnk` crate. The .lnk file is indexed by Windows Search and appears in
+    // the Start Menu correctly. The icon is pulled from the exe at index 0.
+    //
+    // Fallback note: if `mslnk` is found to be unmaintained or non-functional,
+    // embed a minimal `marrow-launcher.exe` binary that calls the Rust binary
+    // with `ui-app open` arguments and place it in the Start Menu folder.
     let start_menu = dirs::data_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine data directory"))?
         .join("Microsoft\\Windows\\Start Menu\\Programs");
     std::fs::create_dir_all(&start_menu)?;
 
-    // Write a .bat file that launches the binary (simpler than COM shell link)
-    let bat_content = format!("@echo off\r\n\"{}\" ui-app open\r\n", exe_path.display());
-    std::fs::write(start_menu.join("Marrow.bat"), bat_content)?;
-
-    // Also write a marker .lnk placeholder for status detection
-    std::fs::write(start_menu.join("Marrow.lnk"), "placeholder")?;
+    let lnk_path = start_menu.join("Marrow.lnk");
+    let mut lnk = mslnk::ShellLink::new(exe_path)?;
+    lnk.set_name(Some("Marrow".to_string()));
+    lnk.set_arguments(Some("ui-app open".to_string()));
+    lnk.create_lnk(&lnk_path)?;
     Ok(())
 }
 

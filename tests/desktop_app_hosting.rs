@@ -635,3 +635,147 @@ fn single_instance_lockfile_mechanism_exists() {
         "ui_app.rs must report when app is already running"
     );
 }
+
+// ─── Cross-platform icon, .desktop fields, .lnk magic, status output ──────────
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore] // requires writable ~/Applications
+fn enable_creates_valid_icns() {
+    let output = std::process::Command::new(marrow_bin())
+        .args(["ui-app", "enable"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run ui-app enable");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("ui-app enable failed: {stderr}");
+    }
+
+    let icns_path = dirs::home_dir()
+        .unwrap()
+        .join("Applications/Marrow.app/Contents/Resources/Marrow.icns");
+    assert!(icns_path.exists(), "Marrow.icns should be created");
+
+    let bytes = std::fs::read(&icns_path).expect("read Marrow.icns");
+    assert!(bytes.len() >= 4, "Marrow.icns must have at least 4 bytes");
+    assert_eq!(&bytes[..4], b"icns", "Marrow.icns must start with 'icns' magic");
+
+    // Cleanup.
+    let _ = std::process::Command::new(marrow_bin())
+        .args(["ui-app", "disable"])
+        .output();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore]
+fn enable_desktop_entry_has_icon_and_version() {
+    let output = std::process::Command::new(marrow_bin())
+        .args(["ui-app", "enable"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run ui-app enable");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("ui-app enable failed: {stderr}");
+    }
+
+    let desktop_path = dirs::home_dir()
+        .unwrap()
+        .join(".local/share/applications/marrow.desktop");
+    assert!(desktop_path.exists(), "marrow.desktop should be created");
+
+    let content = std::fs::read_to_string(&desktop_path).expect("read marrow.desktop");
+    assert!(
+        content.contains("Icon=marrow"),
+        "marrow.desktop must contain 'Icon=marrow'"
+    );
+    assert!(
+        content.contains("Version=1.0"),
+        "marrow.desktop must contain 'Version=1.0'"
+    );
+
+    // Cleanup.
+    let _ = std::process::Command::new(marrow_bin())
+        .args(["ui-app", "disable"])
+        .output();
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore]
+fn enable_creates_valid_lnk() {
+    let output = std::process::Command::new(marrow_bin())
+        .args(["ui-app", "enable"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run ui-app enable");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("ui-app enable failed: {stderr}");
+    }
+
+    let lnk_path = dirs::data_dir()
+        .unwrap()
+        .join("Microsoft\\Windows\\Start Menu\\Programs\\Marrow.lnk");
+    assert!(lnk_path.exists(), "Marrow.lnk should be created");
+
+    let bytes = std::fs::read(&lnk_path).expect("read Marrow.lnk");
+    assert!(bytes.len() >= 4, "Marrow.lnk must have at least 4 bytes");
+    assert_eq!(
+        &bytes[..4],
+        &[0x4C, 0x00, 0x00, 0x00],
+        "Marrow.lnk must start with Shell Link magic bytes"
+    );
+
+    // Cleanup.
+    let _ = std::process::Command::new(marrow_bin())
+        .args(["ui-app", "disable"])
+        .output();
+}
+
+#[test]
+fn status_reports_app_path_and_launcher_target() {
+    let output = std::process::Command::new(marrow_bin())
+        .args(["ui-app", "status"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run ui-app status");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+
+    #[cfg(feature = "desktop")]
+    {
+        // On desktop builds, both lines must be present.
+        assert!(
+            combined.contains("App path:"),
+            "ui-app status should report 'App path:'. got: {combined}"
+        );
+        assert!(
+            combined.contains("Launcher target:"),
+            "ui-app status should report 'Launcher target:'. got: {combined}"
+        );
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    {
+        assert!(
+            combined.contains("not compiled in"),
+            "ui-app status should report 'not compiled in' without desktop feature. got: {combined}"
+        );
+    }
+}
