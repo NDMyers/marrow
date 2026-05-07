@@ -40,6 +40,16 @@ pub fn spawn_watcher(
     tx: broadcast::Sender<DashboardEvent>,
     debounce_ms: u64,
 ) -> Result<tokio::task::JoinHandle<()>> {
+    spawn_watcher_with_activity(db, tx, debounce_ms, None, None)
+}
+
+pub fn spawn_watcher_with_activity(
+    db: Arc<Mutex<rusqlite::Connection>>,
+    tx: broadcast::Sender<DashboardEvent>,
+    debounce_ms: u64,
+    activity: Option<crate::activity::ActivityTracker>,
+    workspace_id: Option<String>,
+) -> Result<tokio::task::JoinHandle<()>> {
     let repos = indexed_repos(&db)?;
 
     let (fs_tx, mut fs_rx) = tokio::sync::mpsc::channel::<Vec<PathBuf>>(64);
@@ -139,8 +149,33 @@ pub fn spawn_watcher(
                         let _ = watch_tx_task.send(root.clone());
                     }
                 }
-                if let Err(e) = handle_file_change(&path, &db, &repos, &tx).await {
-                    eprintln!("Marrow watcher: error handling {}: {e}", path.display());
+                let activity_id = activity.as_ref().map(|tracker| {
+                    tracker.start(
+                        crate::activity::ActivityKind::WatcherEvent,
+                        workspace_id.clone(),
+                        format!("reindex {}", path.display()),
+                    )
+                });
+                match handle_file_change(&path, &db, &repos, &tx).await {
+                    Ok(()) => {
+                        if let (Some(tracker), Some(id)) = (&activity, activity_id.as_deref()) {
+                            tracker.finish(
+                                id,
+                                crate::activity::ActivityState::Completed,
+                                "watch event indexed".to_string(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if let (Some(tracker), Some(id)) = (&activity, activity_id.as_deref()) {
+                            tracker.finish(
+                                id,
+                                crate::activity::ActivityState::Error,
+                                e.to_string(),
+                            );
+                        }
+                        eprintln!("Marrow watcher: error handling {}: {e}", path.display());
+                    }
                 }
             }
         }
