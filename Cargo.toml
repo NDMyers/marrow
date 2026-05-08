@@ -67,7 +67,7 @@ tiktoken-rs = "0.5.9"
 ignore = "0.4"
 
 # Interactive terminal UI for the integrate installer
-dialoguer = "0.11"
+dialoguer = "0.12"
 indicatif = "0.17"
 console = "0.15"
 
