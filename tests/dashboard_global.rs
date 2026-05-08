@@ -17,6 +17,227 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tower::ServiceExt as _;
 
+// ── New tests for stats_aggregate and /stats endpoint ────────────────────────
+
+#[test]
+fn stats_aggregate_sums_total_requests_across_workspaces() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Registry::open(temp.path().join("registry.db")).unwrap();
+    for i in 0..10u32 {
+        let ws = temp.path().join(format!("workspace-{i}"));
+        std::fs::create_dir_all(ws.join(".marrow")).unwrap();
+        registry.register_workspace(&ws, None).unwrap();
+        let db = ws.join(".marrow").join("graph.db");
+        let conn = marrow::db::init_db(db.to_str().unwrap()).unwrap();
+        marrow::db::increment_stat(&conn, "total_requests", 7).unwrap();
+    }
+
+    let agg = registry.stats_aggregate().unwrap();
+    assert_eq!(
+        agg.lifetime.total_requests, 70,
+        "should sum across all 10 workspaces"
+    );
+    assert_eq!(
+        agg.workspaces.len(),
+        10,
+        "should return all registered workspaces"
+    );
+}
+
+#[tokio::test]
+async fn stats_endpoint_returns_workspaces_array_matching_registered_count() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Registry::open(temp.path().join("registry.db")).unwrap();
+    for i in 0..3usize {
+        let ws = temp.path().join(format!("ws-{i}"));
+        std::fs::create_dir_all(ws.join(".marrow")).unwrap();
+        registry.register_workspace(&ws, None).unwrap();
+    }
+
+    let (tx, _) = broadcast::channel(4);
+    let state = marrow::dashboard::AppState {
+        tx,
+        session: Arc::new(Mutex::new(marrow::dashboard::SessionStats::default())),
+        db: Arc::new(Mutex::new(marrow::db::init_db(":memory:").unwrap())),
+        registry: Some(Arc::new(Mutex::new(registry))),
+        activity: None,
+        stats_cache: Arc::new(Mutex::new(None)),
+    };
+    let app = marrow::dashboard::build_dashboard_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["workspaces"].as_array().unwrap().len(),
+        3,
+        "workspaces array must match registered workspace count"
+    );
+}
+
+#[tokio::test]
+async fn stats_cache_returns_identical_lifetime_within_ttl_window() {
+    // AC#3: Two /stats requests within 5 s must return identical lifetime.total_requests.
+    // We write 11 requests, populate the cache, then increment the DB by 999 before the
+    // second request. If the cache is working, the second response still returns 11 (not 1010).
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Registry::open(temp.path().join("registry.db")).unwrap();
+    let ws = temp.path().join("ws-cache");
+    std::fs::create_dir_all(ws.join(".marrow")).unwrap();
+    registry.register_workspace(&ws, None).unwrap();
+    let db = ws.join(".marrow").join("graph.db");
+    let conn = marrow::db::init_db(db.to_str().unwrap()).unwrap();
+    marrow::db::increment_stat(&conn, "total_requests", 11).unwrap();
+    drop(conn);
+
+    let (tx, _) = broadcast::channel(4);
+    let state = marrow::dashboard::AppState {
+        tx,
+        session: Arc::new(Mutex::new(marrow::dashboard::SessionStats::default())),
+        db: Arc::new(Mutex::new(marrow::db::init_db(":memory:").unwrap())),
+        registry: Some(Arc::new(Mutex::new(registry))),
+        activity: None,
+        stats_cache: Arc::new(Mutex::new(None)),
+    };
+    let app = marrow::dashboard::build_dashboard_router(state);
+
+    // First request — populates cache.
+    let resp1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let bytes1 = resp1.into_body().collect().await.unwrap().to_bytes();
+    let body1: serde_json::Value = serde_json::from_slice(&bytes1).unwrap();
+    let lifetime1 = body1["lifetime"]["total_requests"].as_i64().unwrap();
+    assert_eq!(
+        lifetime1, 11,
+        "first request should reflect the 11 seeded requests"
+    );
+
+    // Mutate the workspace DB directly — a fresh registry query would now return 1010.
+    let conn2 = marrow::db::init_db(db.to_str().unwrap()).unwrap();
+    marrow::db::increment_stat(&conn2, "total_requests", 999).unwrap();
+    drop(conn2);
+
+    // Second request — must hit cache (still < 5 s elapsed) and return the same 11.
+    let resp2 = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let bytes2 = resp2.into_body().collect().await.unwrap().to_bytes();
+    let body2: serde_json::Value = serde_json::from_slice(&bytes2).unwrap();
+    let lifetime2 = body2["lifetime"]["total_requests"].as_i64().unwrap();
+
+    assert_eq!(
+        lifetime1, lifetime2,
+        "second /stats request within TTL must serve cached lifetime (11), not recomputed value (1010)"
+    );
+}
+
+#[tokio::test]
+async fn stats_endpoint_returns_200_with_corrupt_db_alongside_eligible_workspace() {
+    // AC#6: One corrupt workspace DB coexists with one eligible workspace;
+    // GET /stats must return HTTP 200, include both in dbs[], and sum only the eligible stats.
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Registry::open(temp.path().join("registry.db")).unwrap();
+
+    // Eligible workspace with 9 recorded requests.
+    let ws_good = temp.path().join("ws-good");
+    std::fs::create_dir_all(ws_good.join(".marrow")).unwrap();
+    registry.register_workspace(&ws_good, None).unwrap();
+    let db_good = ws_good.join(".marrow").join("graph.db");
+    let conn = marrow::db::init_db(db_good.to_str().unwrap()).unwrap();
+    marrow::db::increment_stat(&conn, "total_requests", 9).unwrap();
+    drop(conn);
+
+    // Corrupt workspace (non-SQLite bytes written to graph.db).
+    let ws_bad = temp.path().join("ws-bad");
+    std::fs::create_dir_all(ws_bad.join(".marrow")).unwrap();
+    std::fs::write(ws_bad.join(".marrow").join("graph.db"), b"not sqlite").unwrap();
+    registry.register_workspace(&ws_bad, None).unwrap();
+
+    let (tx, _) = broadcast::channel(4);
+    let state = marrow::dashboard::AppState {
+        tx,
+        session: Arc::new(Mutex::new(marrow::dashboard::SessionStats::default())),
+        db: Arc::new(Mutex::new(marrow::db::init_db(":memory:").unwrap())),
+        registry: Some(Arc::new(Mutex::new(registry))),
+        activity: None,
+        stats_cache: Arc::new(Mutex::new(None)),
+    };
+    let app = marrow::dashboard::build_dashboard_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "/stats must return 200 even when one DB is corrupt"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    // Eligible workspace stats must be included in lifetime aggregate.
+    assert_eq!(
+        body["lifetime"]["total_requests"].as_i64().unwrap(),
+        9,
+        "lifetime must include stats from the eligible workspace"
+    );
+
+    // Both workspaces must appear in dbs[].
+    let dbs = body["dbs"].as_array().unwrap();
+    assert_eq!(dbs.len(), 2, "dbs array must contain both workspaces");
+
+    let has_corrupt = dbs.iter().any(|d| d["status"] == "corrupt");
+    assert!(
+        has_corrupt,
+        "corrupt workspace must appear in dbs with corrupt status"
+    );
+
+    let has_eligible = dbs.iter().any(|d| {
+        let s = d["status"].as_str().unwrap_or("");
+        s == "available" || s == "empty"
+    });
+    assert!(
+        has_eligible,
+        "eligible workspace must appear in dbs with available/empty status"
+    );
+}
+
 async fn json_request(
     app: Router,
     method: Method,

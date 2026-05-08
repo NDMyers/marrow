@@ -97,6 +97,16 @@ pub struct GlobalLifetimeStats {
     pub workspace_statuses: Vec<DbInventoryRow>,
 }
 
+/// Combined result of a single registry scan: lifetime aggregates plus the
+/// workspace list that produced them. Returned by [`Registry::stats_aggregate`]
+/// to avoid the duplicate `list_workspaces()` call present in the old
+/// `global_lifetime_stats()` + `list_workspaces()` pattern.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct StatsAggregate {
+    pub lifetime: GlobalLifetimeStats,
+    pub workspaces: Vec<WorkspaceEntry>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GraphNodeDto {
     pub id: String,
@@ -297,16 +307,37 @@ impl Registry {
 
     pub fn global_lifetime_stats(&self) -> Result<GlobalLifetimeStats> {
         let inventory = self.db_inventory()?;
-        let mut total_requests = 0;
-        let mut total_tokens_saved = 0;
-        let mut total_file_tokens = 0;
-        let mut pipeline_requests = 0;
-        let mut direct_low_level_autorouted = 0;
-        let mut direct_low_level_rejected = 0;
-        let mut ambiguous_symbol_requests = 0;
-        let mut stale_capsule_prevented = 0;
+        let lifetime = Self::sum_lifetime_stats_from_inventory(&inventory);
+        Ok(GlobalLifetimeStats {
+            workspace_statuses: inventory,
+            ..lifetime
+        })
+    }
 
-        for row in &inventory {
+    /// Accumulate lifetime stat counters from a pre-built inventory slice,
+    /// using a single batched DB query per workspace instead of 8 sequential reads.
+    fn sum_lifetime_stats_from_inventory(inventory: &[DbInventoryRow]) -> GlobalLifetimeStats {
+        const STAT_KEYS: &[&str] = &[
+            "total_requests",
+            "total_tokens_saved",
+            "total_file_tokens",
+            "pipeline_requests",
+            "direct_low_level_autorouted",
+            "direct_low_level_rejected",
+            "ambiguous_symbol_requests",
+            "stale_capsule_prevented",
+        ];
+
+        let mut total_requests = 0i64;
+        let mut total_tokens_saved = 0i64;
+        let mut total_file_tokens = 0i64;
+        let mut pipeline_requests = 0i64;
+        let mut direct_low_level_autorouted = 0i64;
+        let mut direct_low_level_rejected = 0i64;
+        let mut ambiguous_symbol_requests = 0i64;
+        let mut stale_capsule_prevented = 0i64;
+
+        for row in inventory {
             if !matches!(
                 row.status,
                 WorkspaceStatus::Available | WorkspaceStatus::Empty
@@ -316,15 +347,20 @@ impl Registry {
             let Ok(conn) = open_graph_readonly(&row.graph_db_path) else {
                 continue;
             };
-            total_requests += crate::db::read_stat(&conn, "total_requests");
-            total_tokens_saved += crate::db::read_stat(&conn, "total_tokens_saved");
-            total_file_tokens += crate::db::read_stat(&conn, "total_file_tokens");
-            pipeline_requests += crate::db::read_stat(&conn, "pipeline_requests");
-            direct_low_level_autorouted +=
-                crate::db::read_stat(&conn, "direct_low_level_autorouted");
-            direct_low_level_rejected += crate::db::read_stat(&conn, "direct_low_level_rejected");
-            ambiguous_symbol_requests += crate::db::read_stat(&conn, "ambiguous_symbol_requests");
-            stale_capsule_prevented += crate::db::read_stat(&conn, "stale_capsule_prevented");
+            let batch = crate::db::read_stats_batch(&conn, STAT_KEYS);
+            total_requests += batch.get("total_requests").copied().unwrap_or(0);
+            total_tokens_saved += batch.get("total_tokens_saved").copied().unwrap_or(0);
+            total_file_tokens += batch.get("total_file_tokens").copied().unwrap_or(0);
+            pipeline_requests += batch.get("pipeline_requests").copied().unwrap_or(0);
+            direct_low_level_autorouted += batch
+                .get("direct_low_level_autorouted")
+                .copied()
+                .unwrap_or(0);
+            direct_low_level_rejected +=
+                batch.get("direct_low_level_rejected").copied().unwrap_or(0);
+            ambiguous_symbol_requests +=
+                batch.get("ambiguous_symbol_requests").copied().unwrap_or(0);
+            stale_capsule_prevented += batch.get("stale_capsule_prevented").copied().unwrap_or(0);
         }
 
         let reduction_pct = if total_file_tokens == 0 {
@@ -340,7 +376,148 @@ impl Registry {
             (pipeline_requests as f64 / compliance_total as f64) * 100.0
         };
 
-        Ok(GlobalLifetimeStats {
+        GlobalLifetimeStats {
+            total_requests,
+            total_tokens_saved,
+            total_file_tokens,
+            pipeline_requests,
+            direct_low_level_autorouted,
+            direct_low_level_rejected,
+            ambiguous_symbol_requests,
+            stale_capsule_prevented,
+            reduction_pct,
+            pipeline_compliance_pct,
+            workspace_statuses: Vec::new(),
+        }
+    }
+
+    /// Returns aggregate lifetime stats and the workspace list in a single call,
+    /// invoking `list_workspaces()` only once. Use this in performance-sensitive
+    /// paths (e.g. `/stats` handler) in place of separate `global_lifetime_stats()`
+    /// + `list_workspaces()` calls.
+    ///
+    /// Each eligible workspace graph DB is opened exactly once: scope inventory
+    /// and stat batch reads share the same connection, avoiding the double-open
+    /// that would occur when chaining `inventory_for_entry` → `sum_lifetime_stats_from_inventory`.
+    pub fn stats_aggregate(&self) -> Result<StatsAggregate> {
+        const STAT_KEYS: &[&str] = &[
+            "total_requests",
+            "total_tokens_saved",
+            "total_file_tokens",
+            "pipeline_requests",
+            "direct_low_level_autorouted",
+            "direct_low_level_rejected",
+            "ambiguous_symbol_requests",
+            "stale_capsule_prevented",
+        ];
+
+        let workspaces = self.list_workspaces()?;
+
+        let mut total_requests = 0i64;
+        let mut total_tokens_saved = 0i64;
+        let mut total_file_tokens = 0i64;
+        let mut pipeline_requests = 0i64;
+        let mut direct_low_level_autorouted = 0i64;
+        let mut direct_low_level_rejected = 0i64;
+        let mut ambiguous_symbol_requests = 0i64;
+        let mut stale_capsule_prevented = 0i64;
+
+        let mut inventory = Vec::with_capacity(workspaces.len());
+
+        for entry in &workspaces {
+            let size_mb = std::fs::metadata(&entry.graph_db_path)
+                .map(|meta| meta.len() as f64 / 1_048_576.0)
+                .unwrap_or(0.0);
+            // Reuse status/error already computed by list_workspaces(); no second
+            // classify_workspace_db() call here.
+            let mut row = DbInventoryRow {
+                workspace_id: entry.workspace_id.clone(),
+                workspace_root: entry.workspace_root.clone(),
+                graph_db_path: entry.graph_db_path.clone(),
+                display_name: entry.display_name.clone(),
+                status: entry.status.clone(),
+                size_mb,
+                repo_count: 0,
+                symbol_count: 0,
+                file_count: 0,
+                repos: Vec::new(),
+                error: entry.error.clone(),
+            };
+
+            if matches!(
+                row.status,
+                WorkspaceStatus::Available | WorkspaceStatus::Empty
+            ) {
+                match open_graph_readonly(&row.graph_db_path) {
+                    Ok(conn) => {
+                        match crate::db::database_scope_snapshot(&conn) {
+                            Ok(scope) => {
+                                row.repo_count = scope.repo_count;
+                                row.symbol_count = scope.symbol_count;
+                                row.file_count = scope.file_count;
+                                row.repos = scope.repos;
+                                if row.symbol_count == 0 && row.file_count == 0 {
+                                    row.status = WorkspaceStatus::Empty;
+                                } else {
+                                    row.status = WorkspaceStatus::Available;
+                                }
+                            }
+                            Err(e) => {
+                                let (status, _) = classify_error(&e.to_string());
+                                row.status = status;
+                                row.error = Some(e.to_string());
+                            }
+                        }
+                        // Read stats on the same open connection — no second open.
+                        if matches!(
+                            row.status,
+                            WorkspaceStatus::Available | WorkspaceStatus::Empty
+                        ) {
+                            let batch = crate::db::read_stats_batch(&conn, STAT_KEYS);
+                            total_requests += batch.get("total_requests").copied().unwrap_or(0);
+                            total_tokens_saved +=
+                                batch.get("total_tokens_saved").copied().unwrap_or(0);
+                            total_file_tokens +=
+                                batch.get("total_file_tokens").copied().unwrap_or(0);
+                            pipeline_requests +=
+                                batch.get("pipeline_requests").copied().unwrap_or(0);
+                            direct_low_level_autorouted += batch
+                                .get("direct_low_level_autorouted")
+                                .copied()
+                                .unwrap_or(0);
+                            direct_low_level_rejected +=
+                                batch.get("direct_low_level_rejected").copied().unwrap_or(0);
+                            ambiguous_symbol_requests +=
+                                batch.get("ambiguous_symbol_requests").copied().unwrap_or(0);
+                            stale_capsule_prevented +=
+                                batch.get("stale_capsule_prevented").copied().unwrap_or(0);
+                        }
+                    }
+                    Err(e) => {
+                        let (status, error) = classify_error(&e.to_string());
+                        row.status = status;
+                        row.error = error;
+                    }
+                }
+            }
+
+            inventory.push(row);
+        }
+
+        let reduction_pct = if total_file_tokens == 0 {
+            0.0
+        } else {
+            (total_tokens_saved as f64 / total_file_tokens as f64) * 100.0
+        };
+        let compliance_total =
+            pipeline_requests + direct_low_level_autorouted + direct_low_level_rejected;
+        let pipeline_compliance_pct = if compliance_total == 0 {
+            0.0
+        } else {
+            (pipeline_requests as f64 / compliance_total as f64) * 100.0
+        };
+
+        let lifetime = GlobalLifetimeStats {
             total_requests,
             total_tokens_saved,
             total_file_tokens,
@@ -352,6 +529,11 @@ impl Registry {
             reduction_pct,
             pipeline_compliance_pct,
             workspace_statuses: inventory,
+        };
+
+        Ok(StatsAggregate {
+            lifetime,
+            workspaces,
         })
     }
 
