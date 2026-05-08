@@ -11,14 +11,29 @@
     "context"
   ],
   "license": "MIT",
+  "author": "Marrow Maintainers",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NDMyers/marrow.git"
+  },
+  "homepage": "https://github.com/NDMyers/marrow#readme",
+  "bugs": {
+    "url": "https://github.com/NDMyers/marrow/issues"
+  },
   "bin": {
     "marrow": "bin/marrow.js"
   },
   "files": [
     "bin/",
     "scripts/",
+    "README.md",
+    "LICENSE",
     "package.json"
   ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "alpha"
+  },
   "scripts": {
     "postinstall": "node scripts/install.js"
   },

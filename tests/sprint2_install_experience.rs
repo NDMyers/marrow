@@ -231,6 +231,7 @@ fn sprint2_packaging_metadata_and_release_workflow_cover_native_artifacts() {
     let release = read_repo_file(".github/workflows/release.yml");
     let ci = read_repo_file(".github/workflows/ci.yml");
 
+    assert!(cargo_toml.contains("license = \"MIT\""));
     assert!(cargo_toml.contains("maintainer-scripts = \"scripts\""));
     assert!(cargo_toml.contains("/usr/bin/marrow"));
     assert!(cargo_toml.contains("/usr/share/applications/marrow.desktop"));
@@ -253,9 +254,47 @@ fn sprint2_packaging_metadata_and_release_workflow_cover_native_artifacts() {
     assert!(release.contains("--pattern \"*.AppImage\""));
     assert!(release.contains("--pattern \"*.msi\""));
     assert!(release.contains("shasum -a 256 * > checksums.sha256"));
+    assert!(release.contains("permissions:\n  contents: read"));
+    assert!(release.contains("contents: write"));
+    assert!(release.contains("publish-npm:"));
+    assert!(release.contains("id-token: write"));
+    assert!(release.contains("npm audit --omit=dev --audit-level=moderate"));
+    assert!(release.contains("npm pack --dry-run --json"));
+    assert!(release.contains("npm publish --access public --tag alpha --provenance"));
+    assert!(release.contains("marrow-x86_64-unknown-linux-gnu.tar.gz"));
+    assert!(release.contains("marrow-x86_64-apple-darwin.tar.gz"));
+    assert!(release.contains("marrow-aarch64-apple-darwin.tar.gz"));
+    assert!(release.contains("marrow-x86_64-pc-windows-msvc.tar.gz"));
+    assert!(release.contains("appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"));
+    assert!(release.contains("ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"));
 
+    assert!(ci.contains("permissions:\n  contents: read"));
     assert!(ci.contains("Validate packaging metadata and scripts"));
     assert!(ci.contains("bash -n scripts/postinst scripts/deb-postinst.sh scripts/stage-linux-package-assets.sh scripts/package-linux-appimage.sh scripts/package-macos-dmg.sh"));
+}
+
+#[test]
+fn sprint2_npm_package_metadata_is_release_ready_and_lean() {
+    let package_json = read_repo_file("npm/package.json");
+    let package_lock = read_repo_file("npm/package-lock.json");
+
+    for text in [&package_json, &package_lock] {
+        assert!(text.contains("\"repository\""));
+        assert!(text.contains("\"homepage\""));
+        assert!(text.contains("\"bugs\""));
+        assert!(text.contains("\"author\""));
+        assert!(text.contains("\"publishConfig\""));
+        assert!(text.contains("\"access\": \"public\""));
+    }
+
+    assert!(package_json.contains("\"license\": \"MIT\""));
+    assert!(package_json.contains("\"README.md\""));
+    assert!(package_json.contains("\"LICENSE\""));
+    assert!(!package_json.contains("\"docs"));
+    assert!(!package_json.contains("\"target"));
+    assert!(!package_json.contains("\"node_modules"));
+    assert!(!package_json.contains("\"dist"));
+    assert!(!package_json.contains("10x-squad-artifacts"));
 }
 
 #[test]
@@ -294,5 +333,20 @@ fn sprint2_scripts_use_staging_helpers_and_avoid_daemon_side_effects() {
 
     assert!(!install_js.contains("daemon install"));
     assert!(!install_js.contains("service install"));
-    assert!(install_js.contains("spawnSync(binaryPath, ['ui-app', 'enable']"));
+    assert!(!install_js.contains("spawnSync(binaryPath, ['ui-app', 'enable']"));
+    assert!(install_js.contains("Run `marrow ui-app enable`"));
+}
+
+#[test]
+fn sprint2_docs_describe_explicit_desktop_registration() {
+    let readme = read_repo_file("README.md");
+    let security = read_repo_file("SECURITY.md");
+    let release = read_repo_file("RELEASE.md");
+
+    assert!(readme.contains("npm install"));
+    assert!(readme.contains("marrow ui-app enable"));
+    assert!(security.contains("release workflow"));
+    assert!(security.contains("checksums.sha256"));
+    assert!(security.contains("AppImage"));
+    assert!(release.contains("Public Release Checklist"));
 }

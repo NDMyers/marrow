@@ -163,6 +163,8 @@ cargo install --path .
 
 This installs the **`marrow`** executable into `~/.cargo/bin` (ensure that directory is on your `PATH`).
 
+The npm package (`npm install -g @nickm-swe/marrow`) downloads a verified GitHub release binary and does not register desktop app entries by default. Run `marrow ui-app enable` explicitly if you want desktop app registration.
+
 ## Desktop Autostart And Packages
 
 Daemon autostart is opt-in and separate from desktop app registration.

@@ -181,20 +181,20 @@ fn document_link_rejection() {
     // Actual enforcement is in npm/scripts/install.js.
 }
 
-/// Documents the behavioral contract: when CI env vars are set, the npm
-/// postinstall script skips `marrow ui-app enable`. This prevents unintended
-/// OS-level side effects during automated builds and CI pipelines.
+/// Documents the behavioral contract: npm postinstall installs only the
+/// verified binary. Desktop registration is an explicit user action.
 #[test]
-fn registration_skipped_when_ci_env_set() {
-    // This test documents the contract: when CI env vars are set,
-    // the npm postinstall script skips app registration.
-    // The contract is enforced in npm/scripts/install.js.
-    // This test verifies the environment variable list is documented.
-    let ci_vars = ["CI", "GITHUB_ACTIONS", "GITLAB_CI", "NO_MARROW_REGISTER"];
-    // All variables must be distinct
-    let unique: std::collections::HashSet<_> = ci_vars.iter().collect();
-    assert_eq!(unique.len(), ci_vars.len());
-    // At least one commonly set CI var is present
-    assert!(ci_vars.contains(&"CI"));
-    assert!(ci_vars.contains(&"GITHUB_ACTIONS"));
+fn npm_install_has_no_default_registration_side_effect() {
+    let install_js = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("npm/scripts/install.js"),
+    )
+    .expect("read npm/scripts/install.js");
+
+    assert!(install_js.contains("downloadChecksums"));
+    assert!(install_js.contains("verifyChecksum"));
+    assert!(install_js.contains("extractSecurely"));
+    assert!(install_js.contains("fs.chmodSync(binaryPath, 0o755)"));
+    assert!(install_js.contains("Installed successfully"));
+    assert!(!install_js.contains("spawnSync(binaryPath, ['ui-app', 'enable']"));
+    assert!(!install_js.contains("Registering app with OS"));
 }

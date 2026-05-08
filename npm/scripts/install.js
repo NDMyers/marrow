@@ -264,20 +264,8 @@ async function main() {
 
   fs.chmodSync(binaryPath, 0o755);
 
-  const CI_ENV_VARS = ['CI', 'GITHUB_ACTIONS', 'GITLAB_CI', 'NO_MARROW_REGISTER'];
-  const isCI = CI_ENV_VARS.some(v => process.env[v]);
-  if (isCI) {
-    console.log('[marrow] CI environment detected — skipping app registration. Run `marrow ui-app enable` manually.');
-  } else {
-    console.log('[marrow] Registering app with OS...');
-    const { spawnSync } = require('child_process');
-    const reg = spawnSync(binaryPath, ['ui-app', 'enable'], { stdio: 'inherit' });
-    if (reg.error || (reg.status !== null && reg.status !== 0)) {
-      console.warn('[marrow] App registration failed — run `marrow ui-app enable` manually to register the app.');
-    }
-  }
-
   console.log(`[marrow] Installed successfully: ${binaryPath}`);
+  console.log('[marrow] Run `marrow ui-app enable` to register the desktop app.');
 }
 
 main().catch((err) => {

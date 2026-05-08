@@ -24,6 +24,8 @@ When installing Marrow via npm, the installer automatically verifies binary inte
 1. **Checksum verification**: The installer fetches `checksums.sha256` from the GitHub release and verifies the archive SHA256 hash before extraction.
 2. **Secure extraction**: The tar extraction rejects path traversal attempts, symlinks, and hardlinks.
 
+The release workflow fails closed before npm publish unless every installer-required archive is present in the GitHub release and listed in `checksums.sha256`. Linux AppImage packaging downloads the pinned `appimagetool` release and verifies its SHA256 before use.
+
 ### Manual Verification
 
 To manually verify a downloaded binary:
@@ -39,6 +41,7 @@ shasum -a 256 -c checksums.sha256 --ignore-missing
 ## Security Practices
 
 - **Supply chain**: Release binaries include SHA256 checksums; npm installer verifies before extraction.
+- **Release gating**: npm publishing runs only after release assets and checksums are verified.
 - **Dependencies**: Cargo.lock is tracked for reproducible builds; Dependabot monitors for advisories.
 - **CI gates**: `cargo audit` and `npm audit` run on every PR; failures block merge.
 - **Socket permissions**: Unix daemon sockets use restrictive permissions (directory 0700, socket 0600).

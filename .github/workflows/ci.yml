@@ -5,6 +5,9 @@ on:
     branches: [main, master, alpha]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   rust:
     runs-on: ubuntu-latest

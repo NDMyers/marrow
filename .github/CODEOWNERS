@@ -1,15 +1,15 @@
-# Security-critical paths require nickswe approval
+# Security-critical paths require NDMyers approval
 
 # Core ingestion and retrieval logic
-/src/ingestion.rs @nickswe
-/src/retrieval.rs @nickswe
+/src/ingestion.rs @NDMyers
+/src/retrieval.rs @NDMyers
 
 # Daemon and IPC layer
-/src/daemon/ @nickswe
-/src/ipc.rs @nickswe
+/src/daemon/ @NDMyers
+/src/ipc.rs @NDMyers
 
 # NPM installer and distribution
-/npm/ @nickswe
+/npm/ @NDMyers
 
 # CI/CD workflows
-/.github/workflows/ @nickswe
+/.github/workflows/ @NDMyers
