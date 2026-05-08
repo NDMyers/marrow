@@ -84,7 +84,7 @@ futures-util    = "0.3"
 
 # Background file watching for live graph updates
 notify              = "7"
-notify-debouncer-mini = "0.5"
+notify-debouncer-mini = "0.7"
 
 # `getrusage` for perf-harness RSS hint (MARROW-PERF-002)
 libc = "0.2"
