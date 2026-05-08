@@ -11,7 +11,7 @@ const binaryPath = path.resolve(__dirname, "..", "dist", BINARY_NAME);
 
 if (!fs.existsSync(binaryPath)) {
   console.error("[marrow] Binary not found at:", binaryPath);
-  console.error("[marrow] Try reinstalling: npm install -g marrow-mcp");
+  console.error("[marrow] Try reinstalling: npm install -g @nickm-swe/marrow");
   process.exit(1);
 }
 
