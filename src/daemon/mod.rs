@@ -126,6 +126,7 @@ pub async fn run() -> Result<()> {
         db: Arc::new(std::sync::Mutex::new(dashboard_db)),
         registry: state.registry.clone(),
         activity: Some(state.activity.clone()),
+        stats_cache: Arc::new(std::sync::Mutex::new(None)),
     };
 
     let dashboard_router = routes::build_dashboard_router(state.clone(), dashboard_app_state);
