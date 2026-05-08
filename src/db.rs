@@ -412,6 +412,35 @@ pub fn read_stat(conn: &Connection, key: &str) -> i64 {
     .unwrap_or(0)
 }
 
+/// Reads multiple stats keys in a single `SELECT … IN (…)` query.
+/// Keys absent from the stats table are omitted from the returned map;
+/// callers should use `.get(key).copied().unwrap_or(0)`.
+pub fn read_stats_batch(
+    conn: &Connection,
+    keys: &[&str],
+) -> std::collections::HashMap<String, i64> {
+    let mut result = std::collections::HashMap::with_capacity(keys.len());
+    if keys.is_empty() {
+        return result;
+    }
+    let placeholders = (1..=keys.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT key, value FROM stats WHERE key IN ({placeholders})");
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        let params = rusqlite::params_from_iter(keys.iter().copied());
+        if let Ok(rows) = stmt.query_map(params, |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }) {
+            for row in rows.flatten() {
+                result.insert(row.0, row.1);
+            }
+        }
+    }
+    result
+}
+
 pub fn database_scope_snapshot(conn: &Connection) -> Result<DatabaseScopeSnapshot> {
     let symbol_count = conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?;
     let file_count = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;

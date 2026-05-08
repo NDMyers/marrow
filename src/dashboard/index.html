@@ -2688,9 +2688,28 @@
 
   // ── fetchStats ─────────────────────────────────────────────────────────────
 
+  let _statsFetchPromise = null;
+
+  const _LIFETIME_CARD_IDS = [
+    'l-requests', 'l-tokens-saved', 'l-reduction',
+    'l-pipeline-compliance', 'l-autorouted', 'l-rejected', 'l-ambiguous', 'l-stale',
+  ];
+
+  function _setLifetimeCardsText(text) {
+    _LIFETIME_CARD_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = text;
+    });
+  }
+
   function fetchStats(replaySession) {
-    fetch('/stats')
-      .then(r => r.json())
+    if (_statsFetchPromise) return _statsFetchPromise;
+    _setLifetimeCardsText('…');
+    _statsFetchPromise = fetch('/stats')
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
       .then(body => {
         if (replaySession && body.session) {
           const s = body.session;
@@ -2714,9 +2733,14 @@
         }
         updateGlobalInventory(body);
       })
-      .catch(() => {
-        // Server not yet ready; silently ignore
+      .catch(err => {
+        _setLifetimeCardsText('Err');
+        console.error('[marrow] /stats fetch failed:', err);
+      })
+      .finally(() => {
+        _statsFetchPromise = null;
       });
+    return _statsFetchPromise;
   }
 
   // ── SSE ────────────────────────────────────────────────────────────────────
@@ -3837,12 +3861,7 @@
   }
 
   function treeOnTabActivate() {
-    fetch('/stats')
-      .then(r => r.json())
-      .then(data => {
-        workspaceSelectorPopulateFromStats(data);
-      })
-      .catch(() => {});
+    fetchStats(false);
 
     // Fit canvas to current bounds if already initialized
     if (treeInitDone && treeCanvas) {
