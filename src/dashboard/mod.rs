@@ -261,6 +261,18 @@ impl SessionStats {
     }
 }
 
+// ── Stats cache ───────────────────────────────────────────────────────────────
+
+/// TTL for the `/stats` registry response cache.
+const STATS_CACHE_TTL_SECS: u64 = 5;
+
+/// Cached result of a full registry stats scan. Stored inside `AppState` and
+/// invalidated after [`STATS_CACHE_TTL_SECS`] seconds.
+pub struct CachedStatsEntry {
+    response: StatsResponse,
+    filled_at: std::time::Instant,
+}
+
 // ── Axum shared state ─────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -270,6 +282,8 @@ pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub registry: Option<Arc<Mutex<crate::registry::Registry>>>,
     pub activity: Option<crate::activity::ActivityTracker>,
+    /// Short-TTL cache for the expensive registry portion of `/stats`.
+    pub stats_cache: Arc<Mutex<Option<CachedStatsEntry>>>,
 }
 
 struct ActivityLifecycleGuard {
@@ -341,7 +355,7 @@ async fn sse_handler(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct StatsResponse {
     session: SessionSnapshot,
     lifetime: LifetimeSnapshot,
@@ -351,7 +365,7 @@ struct StatsResponse {
     activity: Vec<crate::activity::ActivityRecord>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SessionSnapshot {
     total_requests: usize,
     total_capsule_tokens: usize,
@@ -361,7 +375,7 @@ struct SessionSnapshot {
     recent_events: Vec<DashboardEvent>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct LifetimeSnapshot {
     total_requests: i64,
     total_tokens_saved: i64,
@@ -375,7 +389,7 @@ struct LifetimeSnapshot {
     pipeline_compliance_pct: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct DatabaseSnapshot {
     path: String,
     size_mb: f64,
@@ -385,7 +399,7 @@ struct DatabaseSnapshot {
     repos: Vec<IndexedRepoSnapshot>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct IndexedRepoSnapshot {
     repo_id: String,
     root_path: String,
@@ -394,54 +408,143 @@ struct IndexedRepoSnapshot {
 }
 
 async fn stats_handler(State(state): State<AppState>) -> axum::response::Response {
-    let sess = match state.session.lock() {
-        Ok(g) => g,
-        Err(_) => return axum::Json(serde_json::json!({"error": "lock poisoned"})).into_response(),
+    // Session stats are always computed fresh (cheap in-memory read).
+    let session = {
+        let sess = match state.session.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return axum::Json(serde_json::json!({"error": "lock poisoned"})).into_response()
+            }
+        };
+        let reduction_pct = if sess.total_file_tokens == 0 {
+            0.0
+        } else {
+            (sess.total_tokens_saved as f64 / sess.total_file_tokens as f64) * 100.0
+        };
+        SessionSnapshot {
+            total_requests: sess.total_requests,
+            total_capsule_tokens: sess.total_capsule_tokens,
+            total_file_tokens: sess.total_file_tokens,
+            total_tokens_saved: sess.total_tokens_saved,
+            reduction_pct,
+            recent_events: sess.recent_events.iter().cloned().collect(),
+        }
     };
-    let reduction_pct = if sess.total_file_tokens == 0 {
-        0.0
-    } else {
-        (sess.total_tokens_saved as f64 / sess.total_file_tokens as f64) * 100.0
-    };
-    let session = SessionSnapshot {
-        total_requests: sess.total_requests,
-        total_capsule_tokens: sess.total_capsule_tokens,
-        total_file_tokens: sess.total_file_tokens,
-        total_tokens_saved: sess.total_tokens_saved,
-        reduction_pct,
-        recent_events: sess.recent_events.iter().cloned().collect(),
-    };
-    drop(sess);
 
     if let Some(registry) = &state.registry {
-        let (lifetime_stats, dbs, workspaces) = match registry.lock() {
-            Ok(registry) => {
-                let lifetime_stats = match registry.global_lifetime_stats() {
-                    Ok(stats) => stats,
+        // Check cache first; on hit within TTL, return cached registry data
+        // combined with the freshly computed session snapshot.
+        if let Ok(mut cache_guard) = state.stats_cache.lock() {
+            if let Some(ref cached) = *cache_guard {
+                let age = cached.filled_at.elapsed().as_secs();
+                if age < STATS_CACHE_TTL_SECS {
+                    let mut response = cached.response.clone();
+                    response.session = session;
+                    return axum::Json(response).into_response();
+                }
+            }
+
+            // Cache miss or TTL expired — acquire registry lock, compute, store.
+            let agg = match registry.lock() {
+                Ok(reg) => match reg.stats_aggregate() {
+                    Ok(a) => a,
                     Err(e) => {
                         return axum::Json(serde_json::json!({
                             "error": format!("Could not aggregate global lifetime stats: {e}")
                         }))
                         .into_response()
                     }
-                };
-                let dbs = lifetime_stats.workspace_statuses.clone();
-                let workspaces = match registry.list_workspaces() {
-                    Ok(workspaces) => workspaces,
-                    Err(e) => {
-                        return axum::Json(serde_json::json!({
-                            "error": format!("Could not list registered workspaces: {e}")
-                        }))
+                },
+                Err(_) => {
+                    return axum::Json(serde_json::json!({"error": "registry lock poisoned"}))
                         .into_response()
-                    }
-                };
-                (lifetime_stats, dbs, workspaces)
-            }
+                }
+            };
+
+            let lifetime_stats = &agg.lifetime;
+            let dbs = lifetime_stats.workspace_statuses.clone();
+            let workspaces = agg.workspaces;
+
+            let lifetime = LifetimeSnapshot {
+                total_requests: lifetime_stats.total_requests,
+                total_tokens_saved: lifetime_stats.total_tokens_saved,
+                total_file_tokens: lifetime_stats.total_file_tokens,
+                reduction_pct: lifetime_stats.reduction_pct,
+                pipeline_requests: lifetime_stats.pipeline_requests,
+                direct_low_level_autorouted: lifetime_stats.direct_low_level_autorouted,
+                direct_low_level_rejected: lifetime_stats.direct_low_level_rejected,
+                ambiguous_symbol_requests: lifetime_stats.ambiguous_symbol_requests,
+                stale_capsule_prevented: lifetime_stats.stale_capsule_prevented,
+                pipeline_compliance_pct: lifetime_stats.pipeline_compliance_pct,
+            };
+            let size_mb: f64 = dbs.iter().map(|row| row.size_mb).sum();
+            let repo_count: i64 = dbs.iter().map(|row| row.repo_count).sum();
+            let symbol_count: i64 = dbs.iter().map(|row| row.symbol_count).sum();
+            let file_count: i64 = dbs.iter().map(|row| row.file_count).sum();
+            let repos = dbs
+                .iter()
+                .flat_map(|row| row.repos.iter())
+                .map(|repo| IndexedRepoSnapshot {
+                    repo_id: repo.repo_id.clone(),
+                    root_path: repo.root_path.clone(),
+                    symbol_count: repo.symbol_count,
+                    file_count: repo.file_count,
+                })
+                .collect();
+            let database = DatabaseSnapshot {
+                path: crate::registry::default_registry_path()
+                    .to_string_lossy()
+                    .to_string(),
+                size_mb,
+                repo_count,
+                symbol_count,
+                file_count,
+                repos,
+            };
+            let activity = state
+                .activity
+                .as_ref()
+                .map(crate::activity::ActivityTracker::list)
+                .unwrap_or_default();
+
+            let response = StatsResponse {
+                session,
+                lifetime,
+                database,
+                workspaces,
+                dbs,
+                activity,
+            };
+
+            // Store in cache (ignore poisoned mutex — cache is best-effort).
+            *cache_guard = Some(CachedStatsEntry {
+                response: response.clone(),
+                filled_at: std::time::Instant::now(),
+            });
+
+            return axum::Json(response).into_response();
+        }
+
+        // stats_cache mutex was poisoned — treat as miss and query without caching.
+        let agg = match registry.lock() {
+            Ok(reg) => match reg.stats_aggregate() {
+                Ok(a) => a,
+                Err(e) => {
+                    return axum::Json(serde_json::json!({
+                        "error": format!("Could not aggregate global lifetime stats: {e}")
+                    }))
+                    .into_response()
+                }
+            },
             Err(_) => {
                 return axum::Json(serde_json::json!({"error": "registry lock poisoned"}))
                     .into_response()
             }
         };
+
+        let lifetime_stats = &agg.lifetime;
+        let dbs = lifetime_stats.workspace_statuses.clone();
+        let workspaces = agg.workspaces;
 
         let lifetime = LifetimeSnapshot {
             total_requests: lifetime_stats.total_requests,
@@ -455,10 +558,10 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
             stale_capsule_prevented: lifetime_stats.stale_capsule_prevented,
             pipeline_compliance_pct: lifetime_stats.pipeline_compliance_pct,
         };
-        let size_mb = dbs.iter().map(|row| row.size_mb).sum();
-        let repo_count = dbs.iter().map(|row| row.repo_count).sum();
-        let symbol_count = dbs.iter().map(|row| row.symbol_count).sum();
-        let file_count = dbs.iter().map(|row| row.file_count).sum();
+        let size_mb: f64 = dbs.iter().map(|row| row.size_mb).sum();
+        let repo_count: i64 = dbs.iter().map(|row| row.repo_count).sum();
+        let symbol_count: i64 = dbs.iter().map(|row| row.symbol_count).sum();
+        let file_count: i64 = dbs.iter().map(|row| row.file_count).sum();
         let repos = dbs
             .iter()
             .flat_map(|row| row.repos.iter())
@@ -484,6 +587,7 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
             .as_ref()
             .map(crate::activity::ActivityTracker::list)
             .unwrap_or_default();
+
         return axum::Json(StatsResponse {
             session,
             lifetime,
@@ -495,6 +599,7 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
         .into_response();
     }
 
+    // No registry — fall back to the local DB.
     let lifetime = {
         let conn = match state.db.lock() {
             Ok(g) => g,
@@ -1139,6 +1244,7 @@ pub async fn start(
         db,
         registry: None,
         activity: None,
+        stats_cache: Arc::new(Mutex::new(None)),
     };
     let router = build_dashboard_router(state);
 
@@ -1175,6 +1281,7 @@ mod tests {
             db: Arc::new(Mutex::new(crate::db::init_db(":memory:").unwrap())),
             registry: None,
             activity: Some(tracker.clone()),
+            stats_cache: Arc::new(Mutex::new(None)),
         };
 
         let stream = sse_handler(State(state)).await;
@@ -1206,6 +1313,7 @@ mod tests {
             db: Arc::new(Mutex::new(conn)),
             registry: None,
             activity: None,
+            stats_cache: Arc::new(Mutex::new(None)),
         };
 
         // 1 MiB + 1 byte should be rejected
@@ -1238,6 +1346,7 @@ mod tests {
             db: Arc::new(Mutex::new(conn)),
             registry: None,
             activity: None,
+            stats_cache: Arc::new(Mutex::new(None)),
         };
 
         let event = serde_json::json!({
@@ -1311,6 +1420,7 @@ mod tests {
             db: Arc::new(Mutex::new(conn)),
             registry: None,
             activity: None,
+            stats_cache: Arc::new(Mutex::new(None)),
         };
 
         let event = serde_json::json!({
@@ -1348,6 +1458,7 @@ mod tests {
             db: Arc::new(Mutex::new(conn)),
             registry: None,
             activity: None,
+            stats_cache: Arc::new(Mutex::new(None)),
         };
 
         let params = CompareQuery {
@@ -1550,6 +1661,7 @@ mod tests {
             db: Arc::new(Mutex::new(conn)),
             registry: None,
             activity: None,
+            stats_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1946,5 +2058,28 @@ mod tests {
 
         let tool_label_style = html_between(".tool-label {", ".tool-label .sym");
         assert!(tool_label_style.contains("overflow: visible;"));
+    }
+
+    #[test]
+    fn dashboard_html_fetch_stats_has_inflight_guard_and_error_display() {
+        let fetch_stats_section = html_between("// ── fetchStats", "// ── SSE");
+        // In-flight guard
+        assert!(fetch_stats_section.contains("_statsFetchPromise"));
+        assert!(fetch_stats_section.contains("if (_statsFetchPromise) return _statsFetchPromise"));
+        // Loading skeleton while fetch is in progress
+        assert!(fetch_stats_section.contains("_setLifetimeCardsText('…')"));
+        // Explicit error display on failure
+        assert!(fetch_stats_section.contains("_setLifetimeCardsText('Err')"));
+        // Non-2xx check
+        assert!(fetch_stats_section.contains("if (!r.ok) throw new Error"));
+    }
+
+    #[test]
+    fn dashboard_html_tree_tab_activate_routes_through_fetch_stats() {
+        let tree_activate = html_between("function treeOnTabActivate", "// ── Workspace Selector");
+        // Must not open an independent /stats request
+        assert!(!tree_activate.contains("fetch('/stats')"));
+        // Must route through the guarded fetchStats
+        assert!(tree_activate.contains("fetchStats(false)"));
     }
 }
