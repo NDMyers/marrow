@@ -5180,14 +5180,13 @@ fn cmd_interactive() -> Result<()> {
     let items = [
         "1. Integrate Agents   (Generate rules & Copilot config)",
         "2. Index Workspace    (Build the AST graph once)",
-        "3. Watch Workspace    (Index & listen for file changes)",
-        "4. Start MCP Server   (Run stdio server manually)",
+        "3. Start MCP Server   (Run stdio server manually)",
         #[cfg(feature = "desktop")]
-        "5. Desktop App        (Open native dashboard window)",
+        "4. Desktop App        (Open native dashboard window)",
         #[cfg(feature = "desktop")]
-        "6. Exit",
-        #[cfg(not(feature = "desktop"))]
         "5. Exit",
+        #[cfg(not(feature = "desktop"))]
+        "4. Exit",
     ];
 
     let selection = Select::with_theme(&ColorfulTheme::default())
@@ -5201,8 +5200,7 @@ fn cmd_interactive() -> Result<()> {
     match selection {
         0 => run_integrate_command(&workspace_root)?,
         1 => run_index_command(&workspace_root)?,
-        2 => run_watch_command(&workspace_root)?,
-        3 => {
+        2 => {
             eprintln!(
                 "{}",
                 style("[Marrow] Starting MCP server... (tip: run 'marrow mcp' to bypass the menu)")
@@ -5215,7 +5213,7 @@ fn cmd_interactive() -> Result<()> {
                 .wait()?;
         }
         #[cfg(feature = "desktop")]
-        4 => cmd_desktop_submenu()?,
+            3 => cmd_desktop_submenu()?,
         _ => eprintln!("{}", style("Goodbye.").dim()),
     }
 

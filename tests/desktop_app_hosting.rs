@@ -486,6 +486,29 @@ fn ac12_no_desktop_feature_omits_menu_item() {
     );
 }
 
+#[test]
+fn interactive_menu_omits_watch_workspace_and_dispatch() {
+    let main_src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+    )
+    .expect("read src/main.rs");
+
+    assert!(
+        !main_src.contains("Watch Workspace"),
+        "interactive menu must not contain 'Watch Workspace'"
+    );
+
+    assert!(
+        !main_src.contains("2 => run_watch_command(&workspace_root)?"),
+        "interactive mode must not dispatch run_watch_command from the menu"
+    );
+
+    assert!(
+        main_src.contains("3. Start MCP Server") || main_src.contains("2. Start MCP Server"),
+        "interactive menu must still include Start MCP Server after renumbering"
+    );
+}
+
 // ─── AC-4: Closing window hides; Quit exits app only ──────────────────────────
 // RUNTIME LIMITATION: Cannot test window behavior in headless CI.
 // Verify the code path exists in source.
