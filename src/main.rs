@@ -5180,13 +5180,12 @@ fn cmd_interactive() -> Result<()> {
     let items = [
         "1. Integrate Agents   (Generate rules & Copilot config)",
         "2. Index Workspace    (Build the AST graph once)",
-        "3. Start MCP Server   (Run stdio server manually)",
         #[cfg(feature = "desktop")]
-        "4. Desktop App        (Open native dashboard window)",
+            "3. Desktop App        (Open native dashboard window)",
         #[cfg(feature = "desktop")]
-        "5. Exit",
+            "4. Exit",
         #[cfg(not(feature = "desktop"))]
-        "4. Exit",
+            "3. Exit",
     ];
 
     let selection = Select::with_theme(&ColorfulTheme::default())
@@ -5200,20 +5199,8 @@ fn cmd_interactive() -> Result<()> {
     match selection {
         0 => run_integrate_command(&workspace_root)?,
         1 => run_index_command(&workspace_root)?,
-        2 => {
-            eprintln!(
-                "{}",
-                style("[Marrow] Starting MCP server... (tip: run 'marrow mcp' to bypass the menu)")
-                    .yellow()
-            );
-            let current_exe = std::env::current_exe()?;
-            std::process::Command::new(current_exe)
-                .arg("mcp")
-                .spawn()?
-                .wait()?;
-        }
         #[cfg(feature = "desktop")]
-            3 => cmd_desktop_submenu()?,
+            2 => cmd_desktop_submenu()?,
         _ => eprintln!("{}", style("Goodbye.").dim()),
     }
 

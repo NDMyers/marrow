@@ -504,8 +504,28 @@ fn interactive_menu_omits_watch_workspace_and_dispatch() {
     );
 
     assert!(
-        main_src.contains("3. Start MCP Server") || main_src.contains("2. Start MCP Server"),
-        "interactive menu must still include Start MCP Server after renumbering"
+        !main_src.contains("Start MCP Server"),
+        "interactive menu must not include Start MCP Server"
+    );
+
+    assert!(
+        main_src.contains("\"3. Desktop App        (Open native dashboard window)\""),
+        "interactive menu must renumber Desktop App to slot 3"
+    );
+
+    assert!(
+        main_src.contains("\"4. Exit\"") && main_src.contains("\"3. Exit\""),
+        "interactive menu must renumber Exit consistently for desktop and non-desktop builds"
+    );
+
+    assert!(
+        main_src.contains("2 => cmd_desktop_submenu()?"),
+        "interactive menu must dispatch the desktop submenu from selection 2"
+    );
+
+    assert!(
+        !main_src.contains("3 => cmd_desktop_submenu()?"),
+        "interactive menu must not retain the old desktop submenu selection"
     );
 }
 
