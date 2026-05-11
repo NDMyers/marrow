@@ -54,17 +54,26 @@ Do **not** add a "Made-with: Cursor" tag (or similar editor or tool attribution)
 
 // ── Domain types ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
     ClaudeCode,
     Antigravity,
     Cursor,
     GitHubCopilot,
     Cline,
+    Windsurf,
+    RooCode,
     Zed,
 }
 
 impl Agent {
+    pub fn supports_scope(self, scope: Scope) -> bool {
+        !matches!(
+            (self, scope),
+            (Agent::Windsurf | Agent::RooCode, Scope::Global)
+        )
+    }
+
     /// Resolve the target installation path from the spec's path matrix.
     pub fn target_path(self, scope: Scope, home: &Path) -> PathBuf {
         match (self, scope) {
@@ -98,6 +107,12 @@ impl Agent {
             (Agent::Cline, Scope::Project) => PathBuf::from(".clinerules"),
             (Agent::Cline, Scope::Global) => home.join(".cline/rules/marrow-optimization.md"),
 
+            (Agent::Windsurf, Scope::Project) => PathBuf::from(".windsurfrules"),
+            (Agent::Windsurf, Scope::Global) => home.join(".windsurfrules"),
+
+            (Agent::RooCode, Scope::Project) => PathBuf::from(".roomrules"),
+            (Agent::RooCode, Scope::Global) => home.join(".roomrules"),
+
             // Zed project target is a bare file at the repo root — no subdirectory.
             (Agent::Zed, Scope::Project) => PathBuf::from(".rules"),
             (Agent::Zed, Scope::Global) => home.join(".config/zed/rules/marrow-optimization.rules"),
@@ -105,7 +120,7 @@ impl Agent {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     Project,
     Global,
@@ -133,6 +148,10 @@ pub fn install_skill(
     method: Method,
     home: &Path,
 ) -> Result<InstallStatus> {
+    if !agent.supports_scope(scope) {
+        anyhow::bail!("agent does not have a verified rule target for this scope");
+    }
+
     let target = agent.target_path(scope, home);
     let central = install_source_path(method, home)
         .unwrap_or_else(|| home.join(".marrow/marrow-optimization.md"));
@@ -140,6 +159,40 @@ pub fn install_skill(
     // Respect any existing user-managed instruction file or symlink target.
     // A dangling symlink (symlink_metadata ok but exists false) is not usable —
     // remove it so we can recreate a valid one rather than silently leaving it broken.
+    if target.symlink_metadata().is_ok() && !target.exists() {
+        fs::remove_file(&target)?;
+    } else if target.exists() {
+        return Ok(InstallStatus::PreservedExisting);
+    }
+
+    if matches!(method, Method::Symlink) {
+        if let Some(parent) = central.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if !central.exists() {
+            fs::write(&central, MARROW_CORE_SKILL_MD)?;
+        }
+    }
+
+    install(&target, method, &central)
+}
+
+/// Install the Marrow optimization skill to a generic skills directory.
+/// Used by `AgentSkillTarget` entries that don't need custom `Agent` enum logic.
+pub fn install_skill_to_dir(
+    skills_dir: &str,
+    scope: Scope,
+    method: Method,
+    home: &Path,
+) -> Result<InstallStatus> {
+    let target = match scope {
+        Scope::Project => PathBuf::from(skills_dir).join("marrow-optimization.md"),
+        Scope::Global => home.join(skills_dir).join("marrow-optimization.md"),
+    };
+    let central = install_source_path(method, home)
+        .unwrap_or_else(|| home.join(".marrow/marrow-optimization.md"));
+
+    // Dangling symlink cleanup + existence check (reuse same logic as install_skill).
     if target.symlink_metadata().is_ok() && !target.exists() {
         fs::remove_file(&target)?;
     } else if target.exists() {
@@ -234,6 +287,26 @@ mod tests {
     }
 
     #[test]
+    fn windsurf_project_skill_uses_existing_workspace_rule_file() {
+        let path = Agent::Windsurf.target_path(Scope::Project, Path::new("/tmp/home"));
+
+        assert_eq!(path, Path::new(".windsurfrules"));
+    }
+
+    #[test]
+    fn roo_project_skill_uses_existing_workspace_rule_file() {
+        let path = Agent::RooCode.target_path(Scope::Project, Path::new("/tmp/home"));
+
+        assert_eq!(path, Path::new(".roomrules"));
+    }
+
+    #[test]
+    fn windsurf_and_roo_do_not_claim_global_rule_support() {
+        assert!(!Agent::Windsurf.supports_scope(Scope::Global));
+        assert!(!Agent::RooCode.supports_scope(Scope::Global));
+    }
+
+    #[test]
     fn write_file_install_preserves_existing_instruction_file() {
         let tmp = tempdir().unwrap();
         let target = tmp.path().join("existing.instructions.md");
@@ -306,5 +379,116 @@ mod tests {
             description.contains("edit/remove the target file directly"),
             "expected direct-management guidance: {description}"
         );
+    }
+
+    #[test]
+    fn install_skill_to_dir_writes_to_project_path() {
+        let original_dir = std::env::current_dir().unwrap();
+        let tmp = tempdir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let result = std::panic::catch_unwind(|| {
+            let home = tmp.path().join("fake_home");
+            fs::create_dir_all(&home).unwrap();
+
+            let status = super::install_skill_to_dir(
+                ".goose/skills",
+                Scope::Project,
+                Method::WriteFile,
+                &home,
+            )
+            .unwrap();
+
+            assert_eq!(status, InstallStatus::Written);
+            let target = tmp.path().join(".goose/skills/marrow-optimization.md");
+            assert!(target.exists(), "project-scope skill file should exist");
+            assert!(fs::read_to_string(&target)
+                .unwrap()
+                .to_lowercase()
+                .contains("marrow"));
+        });
+
+        std::env::set_current_dir(original_dir).unwrap();
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn install_skill_to_dir_preserves_existing() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        fs::create_dir_all(&home).unwrap();
+
+        let dir = home.join(".goose/skills");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("marrow-optimization.md"), "custom content").unwrap();
+
+        let status =
+            super::install_skill_to_dir(".goose/skills", Scope::Global, Method::WriteFile, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::PreservedExisting);
+        assert_eq!(
+            fs::read_to_string(dir.join("marrow-optimization.md")).unwrap(),
+            "custom content"
+        );
+    }
+
+    #[test]
+    fn install_skill_to_dir_symlink_creates_central_and_link() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        fs::create_dir_all(&home).unwrap();
+
+        let status =
+            super::install_skill_to_dir(".forge/skills", Scope::Global, Method::Symlink, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::Written);
+        let central = home.join(".marrow/marrow-optimization.md");
+        assert!(central.exists(), "central file should exist");
+        let target = home.join(".forge/skills/marrow-optimization.md");
+        assert!(
+            target.symlink_metadata().is_ok(),
+            "symlink should exist at target"
+        );
+    }
+
+    #[test]
+    fn install_skill_to_dir_global_scope_uses_home_prefix() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        fs::create_dir_all(&home).unwrap();
+
+        let status =
+            super::install_skill_to_dir(".trae/skills", Scope::Global, Method::WriteFile, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::Written);
+        let target = home.join(".trae/skills/marrow-optimization.md");
+        assert!(target.exists(), "global-scope skill file should exist");
+    }
+
+    #[test]
+    fn install_skill_to_dir_cleans_dangling_symlink() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        fs::create_dir_all(&home).unwrap();
+
+        let dir = home.join(".crush/skills");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("marrow-optimization.md");
+        let ghost = tmp.path().join("ghost.md");
+        std::os::unix::fs::symlink(&ghost, &target).unwrap();
+        assert!(target.symlink_metadata().is_ok());
+        assert!(!target.exists());
+
+        let status =
+            super::install_skill_to_dir(".crush/skills", Scope::Global, Method::WriteFile, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::Written);
+        assert!(target.exists());
     }
 }

@@ -529,6 +529,29 @@ fn interactive_menu_omits_watch_workspace_and_dispatch() {
     );
 }
 
+#[test]
+fn interactive_integrate_menu_uses_registry_backed_command() {
+    let main_src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+    )
+    .expect("read src/main.rs");
+
+    assert!(
+        main_src.contains("Some(\"integrate\") => return cmd_integrate(&args[2..])"),
+        "marrow integrate must dispatch through cmd_integrate"
+    );
+
+    assert!(
+        main_src.contains("0 => cmd_integrate(&[])?"),
+        "interactive Integrate Agents menu item must dispatch through cmd_integrate"
+    );
+
+    assert!(
+        !main_src.contains("0 => run_integrate_command(&workspace_root)?"),
+        "interactive Integrate Agents menu item must not dispatch the legacy integrate flow"
+    );
+}
+
 // ─── AC-4: Closing window hides; Quit exits app only ──────────────────────────
 // RUNTIME LIMITATION: Cannot test window behavior in headless CI.
 // Verify the code path exists in source.

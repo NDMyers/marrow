@@ -994,13 +994,983 @@ fn path_contains_marrow_marker(path: &Path) -> bool {
         || lowercase.contains("\"marrow\"")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntegrationSupportTier {
+    FirstClass,
+    Secondary,
+    CompatibilityOnly,
+}
+
+impl IntegrationSupportTier {
+    #[allow(dead_code)]
+    fn label(self) -> &'static str {
+        match self {
+            Self::FirstClass => "first-class",
+            Self::Secondary => "secondary",
+            Self::CompatibilityOnly => "compatibility-only",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntegrationTargetKind {
+    Agent,
+    Client,
+    Host,
+    RuntimeBackend,
+}
+
+impl IntegrationTargetKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Client => "MCP client",
+            Self::Host => "MCP host",
+            Self::RuntimeBackend => "model/runtime backend",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntegrationSetupMode {
+    Automatic,
+    Guided,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuleFileSupport {
+    None,
+    ProjectOnly,
+    ProjectAndGlobal,
+}
+
+impl RuleFileSupport {
+    fn supports(self, scope: skills::Scope) -> bool {
+        matches!(
+            (self, scope),
+            (Self::ProjectAndGlobal, _) | (Self::ProjectOnly, skills::Scope::Project)
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IntegrationTarget {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    support_tier: IntegrationSupportTier,
+    kind: IntegrationTargetKind,
+    setup_mode: IntegrationSetupMode,
+    rule_support: RuleFileSupport,
+    rule_agent: Option<skills::Agent>,
+    workspace_rule_files: &'static [&'static str],
+    baseline_workspace_required: bool,
+    allow_config_write: bool,
+    writer: Option<fn(&IntegrationCtx) -> Result<AgentOutcome>>,
+}
+
+const INTEGRATION_TARGETS: &[IntegrationTarget] = &[
+    IntegrationTarget {
+        name: "Claude Code",
+        aliases: &["claude", "claude-code"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Agent,
+        setup_mode: IntegrationSetupMode::Automatic,
+        rule_support: RuleFileSupport::ProjectAndGlobal,
+        rule_agent: Some(skills::Agent::ClaudeCode),
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: true,
+        writer: Some(integrate_claude),
+    },
+    IntegrationTarget {
+        name: "Antigravity",
+        aliases: &["antigravity", "antigravity-gemini", "gemini-antigravity"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Agent,
+        setup_mode: IntegrationSetupMode::Automatic,
+        rule_support: RuleFileSupport::ProjectAndGlobal,
+        rule_agent: Some(skills::Agent::Antigravity),
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: true,
+        writer: Some(integrate_antigravity),
+    },
+    IntegrationTarget {
+        name: "Cursor",
+        aliases: &["cursor"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Client,
+        setup_mode: IntegrationSetupMode::Automatic,
+        rule_support: RuleFileSupport::ProjectAndGlobal,
+        rule_agent: Some(skills::Agent::Cursor),
+        workspace_rule_files: &[".cursorrules"],
+        baseline_workspace_required: true,
+        allow_config_write: true,
+        writer: Some(integrate_cursor),
+    },
+    IntegrationTarget {
+        name: "GitHub Copilot",
+        aliases: &["copilot", "github-copilot"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Client,
+        setup_mode: IntegrationSetupMode::Automatic,
+        rule_support: RuleFileSupport::ProjectAndGlobal,
+        rule_agent: Some(skills::Agent::GitHubCopilot),
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: true,
+        writer: Some(integrate_copilot),
+    },
+    IntegrationTarget {
+        name: "Cline",
+        aliases: &["cline"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Client,
+        setup_mode: IntegrationSetupMode::Automatic,
+        rule_support: RuleFileSupport::ProjectAndGlobal,
+        rule_agent: Some(skills::Agent::Cline),
+        workspace_rule_files: &[".clinerules"],
+        baseline_workspace_required: true,
+        allow_config_write: true,
+        writer: Some(integrate_cline),
+    },
+    IntegrationTarget {
+        name: "Zed",
+        aliases: &["zed"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Client,
+        setup_mode: IntegrationSetupMode::Automatic,
+        rule_support: RuleFileSupport::ProjectAndGlobal,
+        rule_agent: Some(skills::Agent::Zed),
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: true,
+        writer: Some(integrate_zed),
+    },
+    IntegrationTarget {
+        name: "Windsurf",
+        aliases: &["windsurf", "codeium", "codeium-windsurf", ".windsurfrules"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Client,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::ProjectOnly,
+        rule_agent: Some(skills::Agent::Windsurf),
+        workspace_rule_files: &[".windsurfrules"],
+        baseline_workspace_required: true,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "Continue",
+        aliases: &["continue", "continue-dev"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Client,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "Roo Code",
+        aliases: &["roo", "roo-code", "roocode", ".roomrules"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Client,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::ProjectOnly,
+        rule_agent: Some(skills::Agent::RooCode),
+        workspace_rule_files: &[".roomrules"],
+        baseline_workspace_required: true,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "Goose",
+        aliases: &["goose"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Agent,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "OpenHands",
+        aliases: &["openhands", "open-hands"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Host,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "OpenClaw",
+        aliases: &["openclaw", "open-claw"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Host,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "Codex CLI",
+        aliases: &["codex", "codex-cli", "openai-codex"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Agent,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "Gemini CLI",
+        aliases: &["gemini", "gemini-cli"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Agent,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "JetBrains AI Assistant",
+        aliases: &["jetbrains-ai", "jetbrains-ai-assistant"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Client,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "JetBrains Junie",
+        aliases: &["junie", "jetbrains-junie"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Agent,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "LM Studio",
+        aliases: &["lmstudio", "lm-studio"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Host,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "Kilo Code",
+        aliases: &["kilo", "kilo-code", "kilocode"],
+        support_tier: IntegrationSupportTier::Secondary,
+        kind: IntegrationTargetKind::Client,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "Sourcegraph Amp",
+        aliases: &["amp", "sourcegraph-amp"],
+        support_tier: IntegrationSupportTier::Secondary,
+        kind: IntegrationTargetKind::Agent,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "Augment Code",
+        aliases: &["augment", "augment-code"],
+        support_tier: IntegrationSupportTier::Secondary,
+        kind: IntegrationTargetKind::Client,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "Ollama",
+        aliases: &["ollama"],
+        support_tier: IntegrationSupportTier::CompatibilityOnly,
+        kind: IntegrationTargetKind::RuntimeBackend,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "llama.cpp",
+        aliases: &["llamacpp", "llama-cpp"],
+        support_tier: IntegrationSupportTier::CompatibilityOnly,
+        kind: IntegrationTargetKind::RuntimeBackend,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "vLLM",
+        aliases: &["vllm"],
+        support_tier: IntegrationSupportTier::CompatibilityOnly,
+        kind: IntegrationTargetKind::RuntimeBackend,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "SGLang",
+        aliases: &["sglang"],
+        support_tier: IntegrationSupportTier::CompatibilityOnly,
+        kind: IntegrationTargetKind::RuntimeBackend,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "LiteLLM",
+        aliases: &["litellm", "lite-llm"],
+        support_tier: IntegrationSupportTier::CompatibilityOnly,
+        kind: IntegrationTargetKind::RuntimeBackend,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "Ramalama",
+        aliases: &["ramalama"],
+        support_tier: IntegrationSupportTier::CompatibilityOnly,
+        kind: IntegrationTargetKind::RuntimeBackend,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+    IntegrationTarget {
+        name: "Docker Model Runner",
+        aliases: &["docker-model-runner", "docker-models"],
+        support_tier: IntegrationSupportTier::CompatibilityOnly,
+        kind: IntegrationTargetKind::RuntimeBackend,
+        setup_mode: IntegrationSetupMode::Guided,
+        rule_support: RuleFileSupport::None,
+        rule_agent: None,
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: false,
+        writer: None,
+    },
+];
+
+fn normalize_integration_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn integration_target_by_name(name: &str) -> Option<&'static IntegrationTarget> {
+    let normalized = normalize_integration_name(name);
+    INTEGRATION_TARGETS.iter().find(|target| {
+        normalize_integration_name(target.name) == normalized
+            || target
+                .aliases
+                .iter()
+                .any(|alias| normalize_integration_name(alias) == normalized)
+    })
+}
+
+fn integration_target_for_agent(agent: skills::Agent) -> Option<&'static IntegrationTarget> {
+    INTEGRATION_TARGETS
+        .iter()
+        .find(|target| target.rule_agent == Some(agent))
+}
+
+fn integration_setup_targets() -> Vec<&'static IntegrationTarget> {
+    let non_compat: Vec<&'static IntegrationTarget> = INTEGRATION_TARGETS
+        .iter()
+        .filter(|t| t.support_tier != IntegrationSupportTier::CompatibilityOnly)
+        .collect();
+    let mut result: Vec<&'static IntegrationTarget> = non_compat
+        .iter()
+        .copied()
+        .filter(|t| t.setup_mode == IntegrationSetupMode::Automatic)
+        .collect();
+    result.extend(
+        non_compat
+            .iter()
+            .copied()
+            .filter(|t| t.setup_mode == IntegrationSetupMode::Guided),
+    );
+    result
+}
+
+fn integration_uses_universal_skills_dir(target: &IntegrationTarget) -> bool {
+    integration_skill_directory(target) == UNIVERSAL_SKILLS_DIR
+}
+
+fn interactive_universal_mcp_targets() -> Vec<&'static IntegrationTarget> {
+    integration_setup_targets()
+        .into_iter()
+        .filter(|target| integration_uses_universal_skills_dir(target))
+        .collect()
+}
+
+fn interactive_additional_mcp_targets() -> Vec<&'static IntegrationTarget> {
+    integration_setup_targets()
+        .into_iter()
+        .filter(|target| !integration_uses_universal_skills_dir(target))
+        .collect()
+}
+
+#[allow(dead_code)] // Used in tests only after unified menu refactor
+fn interactive_mcp_targets() -> Vec<&'static IntegrationTarget> {
+    interactive_universal_mcp_targets()
+        .into_iter()
+        .chain(interactive_additional_mcp_targets())
+        .collect()
+}
+
+fn agent_skill_target_has_mcp_integration(target: &AgentSkillTarget) -> bool {
+    integration_target_by_name(target.name).is_some()
+}
+
+fn interactive_skill_only_agent_target_indices() -> Vec<usize> {
+    AGENT_SKILL_TARGETS
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| !agent_skill_target_has_mcp_integration(target))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+// ── Universal agents (visible upstream agents sharing .agents/skills) ─────────
+
+/// Agents that read skills from `.agents/skills/` and are always included in
+/// `marrow integrate`. These correspond to the visible (non-hidden) universal
+/// entries from the Skills CLI upstream registry.
+const UNIVERSAL_AGENTS: &[&str] = &[
+    "Amp",
+    "Antigravity",
+    "Cline",
+    "Codex",
+    "Cursor",
+    "Deep Agents",
+    "Dexto",
+    "Firebender",
+    "Gemini CLI",
+    "GitHub Copilot",
+    "Kimi Code CLI",
+    "OpenCode",
+    "Warp",
+];
+
+const UNIVERSAL_SKILLS_DIR: &str = ".agents/skills";
+const UNIVERSAL_GROUP_LABEL: &str = "Universal (.agents/skills)";
+const ADDITIONAL_AGENTS_LABEL: &str = "Additional agents";
+
+// ── Unified agent selection (for interactive flow) ────────────────────────────
+
+enum AgentMenuEntry {
+    Mcp(&'static IntegrationTarget),
+    UniversalNoMcpTarget,
+    SkillOnly(usize),
+}
+
+fn universal_agent_menu() -> (Vec<AgentMenuEntry>, Vec<String>) {
+    let mut entries = Vec::new();
+    let mut labels = Vec::new();
+
+    for &name in UNIVERSAL_AGENTS {
+        if let Some(target) = integration_target_by_name(name) {
+            entries.push(AgentMenuEntry::Mcp(target));
+        } else {
+            entries.push(AgentMenuEntry::UniversalNoMcpTarget);
+        }
+        labels.push(name.to_string());
+    }
+
+    (entries, labels)
+}
+
+fn additional_agent_menu() -> (Vec<AgentMenuEntry>, Vec<String>) {
+    let mut entries = Vec::new();
+    let mut labels = Vec::new();
+
+    for target in interactive_additional_mcp_targets() {
+        labels.push(format_integration_menu_label(target));
+        entries.push(AgentMenuEntry::Mcp(target));
+    }
+
+    for idx in interactive_skill_only_agent_target_indices() {
+        let target = &AGENT_SKILL_TARGETS[idx];
+        labels.push(format_skill_menu_label(target));
+        entries.push(AgentMenuEntry::SkillOnly(idx));
+    }
+
+    (entries, labels)
+}
+
+fn partition_agent_menu_entries(
+    selected_entries: &[&AgentMenuEntry],
+) -> (Vec<&'static IntegrationTarget>, Vec<usize>, bool) {
+    let mut mcp_selections = Vec::new();
+    let mut skill_selections = Vec::new();
+    let mut has_universal_no_mcp_target = false;
+
+    for entry in selected_entries {
+        match entry {
+            AgentMenuEntry::Mcp(target) => mcp_selections.push(*target),
+            AgentMenuEntry::UniversalNoMcpTarget => has_universal_no_mcp_target = true,
+            AgentMenuEntry::SkillOnly(idx) => skill_selections.push(*idx),
+        }
+    }
+
+    (
+        mcp_selections,
+        skill_selections,
+        has_universal_no_mcp_target,
+    )
+}
+
+// ── Agent skill targets (path-based, no MCP registration) ─────────────────────
+
+struct AgentSkillTarget {
+    /// Display name (e.g. "Aider Desk")
+    name: &'static str,
+    /// Aliases for direct-arg lookup (e.g. &["aider-desk"])
+    aliases: &'static [&'static str],
+    /// The skills directory relative to project root (e.g. ".aider-desk/skills").
+    /// The installed file will be `<skills_dir>/marrow-optimization.md`.
+    skills_dir: &'static str,
+    /// Whether global scope is supported. Most skill-only targets are project-only.
+    scope_support: RuleFileSupport,
+}
+
+const AGENT_SKILL_TARGETS: &[AgentSkillTarget] = &[
+    AgentSkillTarget {
+        name: "AiderDesk",
+        aliases: &["aider-desk"],
+        skills_dir: ".aider-desk/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Augment",
+        aliases: &["augment", "augment-code"],
+        skills_dir: ".augment/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "IBM Bob",
+        aliases: &["bob", "ibm-bob"],
+        skills_dir: ".bob/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "OpenClaw",
+        aliases: &["openclaw", "open-claw"],
+        skills_dir: "skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "CodeArts Agent",
+        aliases: &["codearts-agent"],
+        skills_dir: ".codeartsdoer/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "CodeBuddy",
+        aliases: &["codebuddy"],
+        skills_dir: ".codebuddy/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Codemaker",
+        aliases: &["codemaker"],
+        skills_dir: ".codemaker/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Code Studio",
+        aliases: &["codestudio", "code-studio"],
+        skills_dir: ".codestudio/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Command Code",
+        aliases: &["command-code", "commandcode"],
+        skills_dir: ".commandcode/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Continue",
+        aliases: &["continue", "continue-dev"],
+        skills_dir: ".continue/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Cortex Code",
+        aliases: &["cortex", "cortex-code"],
+        skills_dir: ".cortex/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Crush",
+        aliases: &["crush"],
+        skills_dir: ".crush/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Devin for Terminal",
+        aliases: &["devin"],
+        skills_dir: ".devin/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Droid",
+        aliases: &["droid"],
+        skills_dir: ".factory/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "ForgeCode",
+        aliases: &["forgecode", "forge"],
+        skills_dir: ".forge/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Goose",
+        aliases: &["goose"],
+        skills_dir: ".goose/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Hermes Agent",
+        aliases: &["hermes-agent"],
+        skills_dir: ".hermes/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Junie",
+        aliases: &["junie", "jetbrains-junie"],
+        skills_dir: ".junie/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "iFlow CLI",
+        aliases: &["iflow-cli", "iflow"],
+        skills_dir: ".iflow/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Kilo Code",
+        aliases: &["kilo", "kilo-code", "kilocode"],
+        skills_dir: ".kilocode/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Kiro CLI",
+        aliases: &["kiro-cli", "kiro"],
+        skills_dir: ".kiro/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Kode",
+        aliases: &["kode"],
+        skills_dir: ".kode/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "MCPJam",
+        aliases: &["mcpjam"],
+        skills_dir: ".mcpjam/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Mistral Vibe",
+        aliases: &["mistral-vibe", "vibe"],
+        skills_dir: ".vibe/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Mux",
+        aliases: &["mux"],
+        skills_dir: ".mux/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "OpenHands",
+        aliases: &["openhands", "open-hands"],
+        skills_dir: ".openhands/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Pi",
+        aliases: &["pi"],
+        skills_dir: ".pi/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Qoder",
+        aliases: &["qoder"],
+        skills_dir: ".qoder/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Qwen Code",
+        aliases: &["qwen-code", "qwen"],
+        skills_dir: ".qwen/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Tabnine CLI",
+        aliases: &["tabnine-cli", "tabnine"],
+        skills_dir: ".tabnine/agent/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    // ── Upstream non-universal targets with intentional MCP overlap ────────
+    AgentSkillTarget {
+        name: "Claude Code",
+        aliases: &["claude-code"],
+        skills_dir: ".claude/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Roo Code",
+        aliases: &["roo-code", "roo"],
+        skills_dir: ".roo/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Windsurf",
+        aliases: &["windsurf"],
+        skills_dir: ".windsurf/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    // ── Remaining upstream non-universal targets ──────────────────────────
+    AgentSkillTarget {
+        name: "Rovo Dev",
+        aliases: &["rovodev", "rovo-dev"],
+        skills_dir: ".rovodev/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Trae",
+        aliases: &["trae"],
+        skills_dir: ".trae/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Trae CN",
+        aliases: &["trae-cn"],
+        skills_dir: ".trae/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Zencoder",
+        aliases: &["zencoder"],
+        skills_dir: ".zencoder/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Neovate",
+        aliases: &["neovate"],
+        skills_dir: ".neovate/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "Pochi",
+        aliases: &["pochi"],
+        skills_dir: ".pochi/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+    AgentSkillTarget {
+        name: "AdaL",
+        aliases: &["adal"],
+        skills_dir: ".adal/skills",
+        scope_support: RuleFileSupport::ProjectOnly,
+    },
+];
+
+fn agent_skill_target_by_name(name: &str) -> Option<&'static AgentSkillTarget> {
+    let normalized = normalize_integration_name(name);
+    AGENT_SKILL_TARGETS.iter().find(|target| {
+        normalize_integration_name(target.name) == normalized
+            || target
+                .aliases
+                .iter()
+                .any(|alias| normalize_integration_name(alias) == normalized)
+    })
+}
+
+fn combined_target_lookup(
+    name: &str,
+) -> (
+    Option<&'static IntegrationTarget>,
+    Option<&'static AgentSkillTarget>,
+) {
+    (
+        integration_target_by_name(name),
+        agent_skill_target_by_name(name),
+    )
+}
+
+fn format_menu_label(name: &str, skills_dir: &str) -> String {
+    format!("{name} ({skills_dir})")
+}
+
+fn is_universal_agent_name(name: &str) -> bool {
+    let normalized = normalize_integration_name(name);
+    UNIVERSAL_AGENTS
+        .iter()
+        .any(|candidate| normalize_integration_name(candidate) == normalized)
+}
+
+fn agent_skill_target_for_integration_target(
+    target: &IntegrationTarget,
+) -> Option<&'static AgentSkillTarget> {
+    let target_names: Vec<String> = std::iter::once(target.name)
+        .chain(target.aliases.iter().copied())
+        .map(normalize_integration_name)
+        .collect();
+
+    AGENT_SKILL_TARGETS.iter().find(|candidate| {
+        std::iter::once(candidate.name)
+            .chain(candidate.aliases.iter().copied())
+            .map(normalize_integration_name)
+            .any(|name| target_names.contains(&name))
+    })
+}
+
+fn integration_skill_directory(target: &IntegrationTarget) -> String {
+    if let Some(skill_target) = agent_skill_target_for_integration_target(target) {
+        return skill_target.skills_dir.to_string();
+    }
+
+    if std::iter::once(target.name)
+        .chain(target.aliases.iter().copied())
+        .any(is_universal_agent_name)
+    {
+        return UNIVERSAL_SKILLS_DIR.to_string();
+    }
+
+    let slug = target
+        .aliases
+        .iter()
+        .copied()
+        .find(|alias| !alias.starts_with('.') && !alias.contains('/'))
+        .unwrap_or(target.name)
+        .trim()
+        .replace(' ', "-");
+
+    format!(".{slug}/skills")
+}
+
+#[allow(dead_code)] // Used in tests only after unified menu refactor
+fn universal_agent_menu_labels() -> Vec<String> {
+    UNIVERSAL_AGENTS
+        .iter()
+        .map(|name| format_menu_label(name, UNIVERSAL_SKILLS_DIR))
+        .collect()
+}
+
+fn format_skill_menu_label(target: &AgentSkillTarget) -> String {
+    format_menu_label(target.name, target.skills_dir)
+}
+
+fn workspace_rule_targets() -> Vec<&'static IntegrationTarget> {
+    INTEGRATION_TARGETS
+        .iter()
+        .filter(|target| !target.workspace_rule_files.is_empty())
+        .collect()
+}
+
+const LEGACY_WORKSPACE_RULE_FILES_BY_INDEX: &[&[&str]] = &[
+    &[".cursorrules"],
+    &[".windsurfrules"],
+    &[".clinerules", ".roomrules"],
+];
+
+fn workspace_rule_target_indices() -> Vec<usize> {
+    (0..LEGACY_WORKSPACE_RULE_FILES_BY_INDEX.len()).collect()
+}
+
+fn baseline_workspace_rule_files() -> Vec<&'static str> {
+    INTEGRATION_TARGETS
+        .iter()
+        .filter(|target| target.baseline_workspace_required)
+        .flat_map(|target| target.workspace_rule_files.iter().copied())
+        .collect()
+}
+
+fn format_workspace_setup_files() -> String {
+    let mut files = baseline_workspace_rule_files();
+    files.push(".vscode/mcp.json");
+    files.join(", ")
+}
+
 fn workspace_is_initialized(root: &Path) -> bool {
-    let rules = [
-        ".cursorrules",
-        ".clinerules",
-        ".roomrules",
-        ".windsurfrules",
-    ];
+    let rules = baseline_workspace_rule_files();
     root.join(".marrow").is_dir()
         && root.join(".marrowrc.json").exists()
         && root.join(".vscode/mcp.json").exists()
@@ -1147,15 +2117,27 @@ fn ensure_workspace_config(enforcement_mode: Option<EnforcementMode>) -> Result<
 }
 
 fn fallback_paths_for_agent(agent: skills::Agent, workspace_root: &Path) -> Vec<PathBuf> {
-    match agent {
-        skills::Agent::Cursor => vec![
-            workspace_root.join(".cursorrules"),
-            workspace_root.join(".vscode/mcp.json"),
-        ],
-        skills::Agent::GitHubCopilot => vec![workspace_root.join(".vscode/mcp.json")],
-        skills::Agent::Antigravity => vec![workspace_root.join(".roomrules")],
-        _ => Vec::new(),
+    let mut paths: Vec<PathBuf> = integration_target_for_agent(agent)
+        .into_iter()
+        .flat_map(|target| target.workspace_rule_files.iter().copied())
+        .map(|path| workspace_root.join(path))
+        .collect();
+
+    let legacy_fallbacks: &[&str] = match agent {
+        skills::Agent::Cursor => &[".cursorrules", ".vscode/mcp.json"],
+        skills::Agent::GitHubCopilot => &[".vscode/mcp.json"],
+        skills::Agent::Antigravity => &[".roomrules"],
+        _ => &[],
+    };
+
+    for fallback in legacy_fallbacks {
+        let path = workspace_root.join(fallback);
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
     }
+
+    paths
 }
 
 fn coverage_status_for_agent(
@@ -1163,20 +2145,31 @@ fn coverage_status_for_agent(
     workspace_root: &Path,
     home: &Path,
 ) -> (&'static str, String) {
-    let project_target = workspace_root.join(agent.target_path(skills::Scope::Project, home));
-    let global_target = agent.target_path(skills::Scope::Global, home);
+    let Some(target) = integration_target_for_agent(agent) else {
+        return (
+            "unprotected",
+            "agent is not registered as a rule-file target".to_string(),
+        );
+    };
 
-    if project_target.exists() && path_contains_marrow_marker(&project_target) {
-        return (
-            "protected",
-            format!("project instructions at {}", project_target.display()),
-        );
+    if target.rule_support.supports(skills::Scope::Project) {
+        let project_target = workspace_root.join(agent.target_path(skills::Scope::Project, home));
+        if project_target.exists() && path_contains_marrow_marker(&project_target) {
+            return (
+                "protected",
+                format!("project instructions at {}", project_target.display()),
+            );
+        }
     }
-    if global_target.exists() && path_contains_marrow_marker(&global_target) {
-        return (
-            "protected",
-            format!("global instructions at {}", global_target.display()),
-        );
+
+    if target.rule_support.supports(skills::Scope::Global) {
+        let global_target = agent.target_path(skills::Scope::Global, home);
+        if global_target.exists() && path_contains_marrow_marker(&global_target) {
+            return (
+                "protected",
+                format!("global instructions at {}", global_target.display()),
+            );
+        }
     }
 
     let fallback_hits: Vec<String> = fallback_paths_for_agent(agent, workspace_root)
@@ -1201,29 +2194,15 @@ fn coverage_status_for_agent(
 }
 
 fn format_agent_coverage_summary(workspace_root: &Path, home: &Path) -> String {
-    let agents = [
-        ("Claude Code", skills::Agent::ClaudeCode),
-        ("Antigravity", skills::Agent::Antigravity),
-        ("Cursor", skills::Agent::Cursor),
-        ("GitHub Copilot", skills::Agent::GitHubCopilot),
-        ("Cline", skills::Agent::Cline),
-        ("Zed", skills::Agent::Zed),
-    ];
-
     let mut out = String::new();
     writeln!(out, "Agent coverage:").ok();
-    for (name, agent) in agents {
+    for target in INTEGRATION_TARGETS
+        .iter()
+        .filter(|target| target.rule_agent.is_some())
+    {
+        let agent = target.rule_agent.expect("filtered above");
         let (status, detail) = coverage_status_for_agent(agent, workspace_root, home);
-        writeln!(out, "- {name}: {status} ({detail})").ok();
-    }
-    let windsurf_rules = workspace_root.join(".windsurfrules");
-    if path_contains_marrow_marker(&windsurf_rules) {
-        writeln!(
-            out,
-            "- Windsurf: partial (workspace fallback rules at {})",
-            windsurf_rules.display()
-        )
-        .ok();
+        writeln!(out, "- {}: {status} ({detail})", target.name).ok();
     }
     out.trim_end().to_string()
 }
@@ -1289,9 +2268,10 @@ async fn try_auto_init() -> Option<String> {
             eprintln!("[MARROW AUTO-INIT] Warning: could not create .marrow/: {e}");
             e
         })?;
+        let rule_indices = workspace_rule_target_indices();
         if let Err(e) = write_workspace_rules(
             &root,
-            &[0, 1, 2],
+            &rule_indices,
             WORKSPACE_RULES_CONTENT,
             WriteMode::SafeAppend,
         ) {
@@ -1318,7 +2298,7 @@ async fn try_auto_init() -> Option<String> {
 
     Some(
         "[MARROW AUTO-INIT] This workspace was not initialized. Marrow has automatically \
-         written workflow rules to .cursorrules and .clinerules. Please notify the user \
+         written registry-backed workspace rules. Please notify the user \
          that running `marrow integrate` once globally will prevent this message in \
          future projects.\n\n"
             .to_string(),
@@ -2656,9 +3636,10 @@ impl ServerHandler for ContextEngine {
                     tokio::task::spawn_blocking(move || {
                         let workspace_root =
                             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                        let rule_indices = workspace_rule_target_indices();
                         write_workspace_rules(
                             &workspace_root,
-                            &[0, 1, 2],
+                            &rule_indices,
                             WORKSPACE_RULES_CONTENT,
                             WriteMode::SafeAppend,
                         )?;
@@ -2757,13 +3738,14 @@ fn format_workspace_setup_summary(
     format!(
         "[MARROW] Workspace setup complete.\n\
          Path: {}\n\
-         Files: .cursorrules, .clinerules, .roomrules, .windsurfrules, .vscode/mcp.json\n\
+         Files: {}\n\
          Enforcement mode: {}\n\
          Existing files are preserved when Marrow rules are already present.\n\
-         Root-level files provide fallback coverage, but primary agent-specific instruction targets still matter.\n\
+         Registry-backed rule files cover Cursor, Cline, Roo Code, and Windsurf workspace guidance.\n\
          {}\n\
          Run `marrow integrate` to install agent-specific instruction files where coverage is still partial or unprotected.",
         workspace_root.display(),
+        format_workspace_setup_files(),
         enforcement_mode.as_str(),
         format_agent_coverage_summary(workspace_root, home)
     )
@@ -3008,18 +3990,1087 @@ mod tests {
     }
 
     #[test]
-    fn integrate_agent_list_covers_all_skill_agents() {
-        // Ensures the integrate agent table and skills::Agent enum stay in sync.
-        use crate::skills::Agent;
-        let skill_agents = [
-            Agent::ClaudeCode,
-            Agent::Antigravity,
-            Agent::Cursor,
-            Agent::GitHubCopilot,
-            Agent::Cline,
-            Agent::Zed,
+    fn integration_registry_classifies_first_class_secondary_and_compatibility_targets() {
+        assert_eq!(
+            integration_target_by_name("OpenClaw").map(|target| target.support_tier),
+            Some(IntegrationSupportTier::FirstClass)
+        );
+        assert_eq!(
+            integration_target_by_name("Sourcegraph Amp").map(|target| target.support_tier),
+            Some(IntegrationSupportTier::Secondary)
+        );
+        assert_eq!(
+            integration_target_by_name("llama.cpp").map(|target| target.support_tier),
+            Some(IntegrationSupportTier::CompatibilityOnly)
+        );
+    }
+
+    #[test]
+    fn integration_registry_normalizes_windsurf_and_roo_aliases() {
+        assert_eq!(
+            integration_target_by_name("codeium windsurf").map(|target| target.name),
+            Some("Windsurf")
+        );
+        assert_eq!(
+            integration_target_by_name("roo").map(|target| target.name),
+            Some("Roo Code")
+        );
+        assert_eq!(
+            integration_target_by_name(".roomrules").map(|target| target.name),
+            Some("Roo Code")
+        );
+    }
+
+    #[test]
+    fn integration_setup_targets_include_direct_and_secondary_but_exclude_compatibility_runtimes() {
+        let names: Vec<&str> = integration_setup_targets()
+            .into_iter()
+            .map(|target| target.name)
+            .collect();
+
+        let unique_names: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            names.len(),
+            unique_names.len(),
+            "integration setup targets should not contain duplicate menu items: {names:?}"
+        );
+
+        for name in [
+            "Claude Code",
+            "Antigravity",
+            "Cursor",
+            "GitHub Copilot",
+            "Cline",
+            "Zed",
+            "Windsurf",
+            "Continue",
+            "Roo Code",
+            "Goose",
+            "OpenHands",
+            "OpenClaw",
+            "Codex CLI",
+            "Gemini CLI",
+            "JetBrains AI Assistant",
+            "JetBrains Junie",
+            "LM Studio",
+        ] {
+            let target = integration_target_by_name(name).expect("direct target should exist");
+            assert!(
+                names.contains(&name),
+                "{name} should be listed by marrow integrate"
+            );
+            assert_eq!(target.support_tier, IntegrationSupportTier::FirstClass);
+            assert_ne!(target.kind, IntegrationTargetKind::RuntimeBackend);
+        }
+
+        for name in ["Kilo Code", "Sourcegraph Amp", "Augment Code"] {
+            let target = integration_target_by_name(name).expect("secondary target should exist");
+            assert!(
+                names.contains(&name),
+                "{name} should be surfaced by marrow integrate"
+            );
+            assert_eq!(target.support_tier, IntegrationSupportTier::Secondary);
+            assert_eq!(target.setup_mode, IntegrationSetupMode::Guided);
+            assert_eq!(
+                format_integration_menu_label(target),
+                format!("{} ({})", target.name, integration_skill_directory(target)),
+                "{name} label should use the target name and integration directory"
+            );
+        }
+
+        // Every automatic target must appear before every guided target.
+        let targets = integration_setup_targets();
+        let last_auto = targets
+            .iter()
+            .rposition(|t| t.setup_mode == IntegrationSetupMode::Automatic);
+        let first_guided = targets
+            .iter()
+            .position(|t| t.setup_mode == IntegrationSetupMode::Guided);
+        if let (Some(last_auto_idx), Some(first_guided_idx)) = (last_auto, first_guided) {
+            assert!(
+                last_auto_idx < first_guided_idx,
+                "all automatic targets must appear before all guided targets in integration_setup_targets()"
+            );
+        }
+
+        for name in [
+            "Ollama",
+            "llama.cpp",
+            "vLLM",
+            "SGLang",
+            "LiteLLM",
+            "Ramalama",
+            "Docker Model Runner",
+        ] {
+            let target = integration_target_by_name(name).expect("runtime target should exist");
+            assert!(
+                !names.contains(&name),
+                "{name} must not be a direct integrate target"
+            );
+            assert_eq!(
+                target.support_tier,
+                IntegrationSupportTier::CompatibilityOnly
+            );
+            assert_eq!(target.kind, IntegrationTargetKind::RuntimeBackend);
+        }
+    }
+
+    #[test]
+    fn openclaw_is_first_class_guided_self_hosted_host() {
+        let target = integration_target_by_name("OpenClaw").expect("OpenClaw target should exist");
+
+        assert_eq!(target.support_tier, IntegrationSupportTier::FirstClass);
+        assert_eq!(target.kind, IntegrationTargetKind::Host);
+        assert_eq!(target.setup_mode, IntegrationSetupMode::Guided);
+        assert!(!target.allow_config_write);
+        assert!(target.writer.is_none());
+        assert!(format_integration_guidance(target).contains("No config file was written"));
+    }
+
+    #[test]
+    fn guided_targets_do_not_have_config_writers() {
+        for name in [
+            "Continue",
+            "Codex CLI",
+            "Gemini CLI",
+            "JetBrains AI Assistant",
+            "JetBrains Junie",
+            "OpenHands",
+            "OpenClaw",
+            "LM Studio",
+            "Kilo Code",
+            "Sourcegraph Amp",
+            "Augment Code",
+        ] {
+            let target = integration_target_by_name(name).expect("target should exist");
+            assert_eq!(target.setup_mode, IntegrationSetupMode::Guided);
+            assert!(!target.allow_config_write, "{name} must not write config");
+            assert!(target.writer.is_none(), "{name} must not have a writer");
+        }
+    }
+
+    #[test]
+    fn guided_registration_does_not_create_config_files() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+        };
+
+        for name in [
+            "Continue",
+            "Codex CLI",
+            "Gemini CLI",
+            "JetBrains AI Assistant",
+            "JetBrains Junie",
+            "OpenHands",
+            "OpenClaw",
+            "LM Studio",
+            "Kilo Code",
+            "Sourcegraph Amp",
+            "Augment Code",
+        ] {
+            let target = integration_target_by_name(name).unwrap();
+            let outcome = register_integration_target(target, &ctx).unwrap();
+
+            assert_eq!(outcome, AgentOutcome::Guided);
+            assert!(
+                format_integration_guidance(target).contains("No config file was written"),
+                "{name} should provide configuration guidance without claiming a write"
+            );
+            assert!(
+                fs::read_dir(home.path()).unwrap().next().is_none(),
+                "guided target {name} must not create config files"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_writer_failure_is_not_downgraded_to_guided_setup() {
+        let home_file = tempfile::NamedTempFile::new().unwrap();
+        let ctx = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home_file.path().to_string_lossy().into_owned(),
+        };
+        let target = integration_target_by_name("Cursor").unwrap();
+
+        let err = register_integration_target(target, &ctx)
+            .expect_err("automatic writer failures should remain errors");
+
+        assert!(
+            err.to_string().contains("Not a directory")
+                || err.to_string().contains("not a directory"),
+            "unexpected writer error: {err}"
+        );
+    }
+
+    #[test]
+    fn compatibility_runtime_guidance_reports_backend_status() {
+        for name in [
+            "Ollama",
+            "llama.cpp",
+            "vLLM",
+            "SGLang",
+            "LiteLLM",
+            "Ramalama",
+            "Docker Model Runner",
+        ] {
+            let target = integration_target_by_name(name).expect("runtime target should exist");
+            let guidance = format_integration_guidance(target);
+
+            assert_eq!(
+                target.support_tier,
+                IntegrationSupportTier::CompatibilityOnly
+            );
+            assert!(
+                guidance.contains("model/runtime backend"),
+                "runtime guidance should identify backend status for {name}: {guidance}"
+            );
+            assert!(
+                guidance.contains("not an MCP agent/client/host destination"),
+                "runtime guidance should not claim direct MCP client treatment for {name}: {guidance}"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_menu_labels_include_directory_convention() {
+        for target in integration_setup_targets() {
+            let label = format_integration_menu_label(target);
+            assert!(
+                label.starts_with(&format!("{} (", target.name)),
+                "menu label for {:?} should start with the target name and directory: {label:?}",
+                target.name
+            );
+            assert!(
+                label.ends_with(')'),
+                "menu label for {:?} should end with a closing parenthesis: {label:?}",
+                target.name
+            );
+        }
+
+        assert_eq!(
+            format_integration_menu_label(integration_target_by_name("Cursor").unwrap()),
+            "Cursor (.agents/skills)"
+        );
+        assert_eq!(
+            format_integration_menu_label(integration_target_by_name("Continue").unwrap()),
+            "Continue (.continue/skills)"
+        );
+        assert_eq!(
+            format_integration_menu_label(integration_target_by_name("Sourcegraph Amp").unwrap()),
+            "Sourcegraph Amp (.agents/skills)"
+        );
+    }
+
+    #[test]
+    fn integration_menu_labels_contain_no_legacy_taxonomy_or_file_suffixes() {
+        let forbidden = [
+            "guided MCP client",
+            "guided agent",
+            "guided host",
+            "secondary, guided setup",
+            "manual setup",
+            "marrow-optimization.md",
+            "->",
         ];
-        assert_eq!(skill_agents.len(), 6);
+
+        for target in integration_setup_targets() {
+            let label = format_integration_menu_label(target);
+
+            for substr in forbidden {
+                assert!(
+                    !label.contains(substr),
+                    "menu label for {:?} must not contain {:?}: {label:?}",
+                    target.name,
+                    substr
+                );
+            }
+
+            // Secondary targets must not expose their tier name in the label
+            if target.support_tier == IntegrationSupportTier::Secondary {
+                assert!(
+                    !label.to_lowercase().contains("secondary"),
+                    "secondary target {:?} must not expose tier name in label: {label:?}",
+                    target.name
+                );
+            }
+
+            // Labels must be plain text — no ANSI escape sequences
+            assert!(
+                !label.contains('\x1b'),
+                "menu label for {:?} must contain no ANSI control sequences: {label:?}",
+                target.name
+            );
+        }
+    }
+
+    #[test]
+    fn integration_menu_universal_group_preserves_upstream_order() {
+        let labels = universal_agent_menu_labels();
+        let expected: Vec<String> = UNIVERSAL_AGENTS
+            .iter()
+            .map(|name| format!("{name} (.agents/skills)"))
+            .collect();
+
+        assert_eq!(labels, expected);
+        assert_eq!(UNIVERSAL_GROUP_LABEL, "Universal (.agents/skills)");
+        assert_eq!(ADDITIONAL_AGENTS_LABEL, "Additional agents");
+
+        for target in AGENT_SKILL_TARGETS {
+            assert_ne!(
+                format_skill_menu_label(target),
+                format_menu_label(target.name, UNIVERSAL_SKILLS_DIR),
+                "non-standard skill target '{}' must stay out of the universal block",
+                target.name
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_mcp_menu_places_universal_labels_before_non_standard_labels() {
+        let ordered_labels: Vec<String> = interactive_mcp_targets()
+            .into_iter()
+            .map(format_integration_menu_label)
+            .collect();
+
+        let first_non_standard = ordered_labels
+            .iter()
+            .position(|label| !label.ends_with("(.agents/skills)"))
+            .expect("expected at least one non-standard MCP label");
+
+        assert!(
+            ordered_labels[..first_non_standard]
+                .iter()
+                .all(|label| label.ends_with("(.agents/skills)")),
+            "universal .agents/skills labels must stay before non-standard MCP labels: {ordered_labels:?}"
+        );
+        assert!(
+            ordered_labels[first_non_standard..]
+                .iter()
+                .all(|label| !label.ends_with("(.agents/skills)")),
+            "non-standard MCP labels must only appear after the universal block: {ordered_labels:?}"
+        );
+    }
+
+    #[test]
+    fn additional_agents_section_contains_non_standard_mcp_labels() {
+        let additional_labels: Vec<String> = interactive_additional_mcp_targets()
+            .into_iter()
+            .map(format_integration_menu_label)
+            .collect();
+
+        assert!(
+            additional_labels.contains(&"Continue (.continue/skills)".to_string()),
+            "non-standard MCP labels should appear in Additional agents: {additional_labels:?}"
+        );
+        assert!(
+            additional_labels.contains(&"Windsurf (.windsurf/skills)".to_string()),
+            "overlapping non-standard MCP labels should appear in Additional agents: {additional_labels:?}"
+        );
+        assert!(
+            additional_labels
+                .iter()
+                .all(|label| !label.ends_with("(.agents/skills)")),
+            "Additional agents should only contain non-standard MCP labels: {additional_labels:?}"
+        );
+    }
+
+    #[test]
+    fn additional_agents_prompt_contains_only_skill_only_targets() {
+        let skill_only_labels: Vec<String> = interactive_skill_only_agent_target_indices()
+            .into_iter()
+            .map(|idx| format_skill_menu_label(&AGENT_SKILL_TARGETS[idx]))
+            .collect();
+
+        assert!(
+            skill_only_labels.contains(&"AiderDesk (.aider-desk/skills)".to_string()),
+            "skill-only agents should remain in the additional agents prompt: {skill_only_labels:?}"
+        );
+        assert!(
+            skill_only_labels.contains(&"Trae (.trae/skills)".to_string()),
+            "non-MCP agent skills should remain selectable: {skill_only_labels:?}"
+        );
+        assert!(
+            !skill_only_labels.contains(&"Continue (.continue/skills)".to_string()),
+            "MCP-capable overlap targets must not repeat in the additional agents prompt: {skill_only_labels:?}"
+        );
+        assert!(
+            !skill_only_labels.contains(&"Windsurf (.windsurf/skills)".to_string()),
+            "MCP-capable overlap targets must stay in the unified MCP prompt: {skill_only_labels:?}"
+        );
+    }
+
+    #[test]
+    fn unified_agent_menu_orders_universal_first_then_additional() {
+        let (universal_entries, universal_labels) = universal_agent_menu();
+        let (additional_entries, additional_labels) = additional_agent_menu();
+
+        assert_eq!(
+            universal_entries.len(),
+            universal_labels.len(),
+            "universal menu should have matching entry and label counts"
+        );
+        assert_eq!(
+            additional_entries.len(),
+            additional_labels.len(),
+            "additional menu should have matching entry and label counts"
+        );
+        assert!(!universal_entries.is_empty(), "universal menu should not be empty");
+        assert!(!additional_entries.is_empty(), "additional menu should not be empty");
+
+        // Universal labels are just the agent name — no config suffix
+        assert_eq!(
+            universal_labels.len(),
+            UNIVERSAL_AGENTS.len(),
+            "universal menu should have one entry per UNIVERSAL_AGENTS"
+        );
+        assert!(
+            universal_labels.contains(&"Amp".to_string()),
+            "universal menu should list agents by name only: {universal_labels:?}"
+        );
+        assert!(
+            universal_labels.contains(&"Deep Agents".to_string()),
+            "universal menu should include universal-only agents by name: {universal_labels:?}"
+        );
+        for label in &universal_labels {
+            assert!(
+                !label.contains('('),
+                "universal agent labels must not contain a config suffix: {label}"
+            );
+        }
+
+        let mut has_universal_no_mcp = false;
+        let mut has_universal_mcp = false;
+        for entry in &universal_entries {
+            match entry {
+                AgentMenuEntry::Mcp(_) => has_universal_mcp = true,
+                AgentMenuEntry::UniversalNoMcpTarget => has_universal_no_mcp = true,
+                AgentMenuEntry::SkillOnly(_) => {
+                    panic!("universal menu should not contain skill-only entries")
+                }
+            }
+        }
+        assert!(has_universal_mcp, "universal menu should contain at least one MCP target");
+        assert!(
+            has_universal_no_mcp,
+            "universal menu should contain at least one universal-only entry"
+        );
+
+        // Additional labels include the config suffix
+        assert!(
+            additional_labels.contains(&"AiderDesk (.aider-desk/skills)".to_string()),
+            "additional menu should include skill-only entries with config suffix: {additional_labels:?}"
+        );
+        assert!(
+            additional_entries
+                .iter()
+                .any(|e| matches!(e, AgentMenuEntry::SkillOnly(_))),
+            "additional menu should contain skill-only entries like AiderDesk"
+        );
+    }
+
+    #[test]
+    fn unified_agent_menu_partition_handles_universal_only_empty_and_mixed_selections() {
+        let (universal_entries, universal_labels) = universal_agent_menu();
+        let (additional_entries, additional_labels) = additional_agent_menu();
+
+        let universal_only_idx = universal_labels
+            .iter()
+            .position(|label| label == "Deep Agents")
+            .expect("Deep Agents should be selectable as a universal no-MCP target");
+        let selected = vec![&universal_entries[universal_only_idx]];
+        let (mcp, skill, has_universal_no_mcp_target) = partition_agent_menu_entries(&selected);
+        assert!(
+            mcp.is_empty(),
+            "universal-only selection should not add MCP targets"
+        );
+        assert!(
+            skill.is_empty(),
+            "universal-only selection should not add skill-only targets"
+        );
+        assert!(
+            has_universal_no_mcp_target,
+            "universal-only selection should prevent the no-selection early return"
+        );
+
+        let empty_selection: Vec<&AgentMenuEntry> = Vec::new();
+        let (mcp, skill, has_universal_no_mcp_target) =
+            partition_agent_menu_entries(&empty_selection);
+        assert!(mcp.is_empty());
+        assert!(skill.is_empty());
+        assert!(!has_universal_no_mcp_target);
+
+        let continue_idx = additional_labels
+            .iter()
+            .position(|label| label == "Continue (.continue/skills)")
+            .expect("Continue should be selectable as an additional MCP target");
+        let aider_idx = additional_labels
+            .iter()
+            .position(|label| label == "AiderDesk (.aider-desk/skills)")
+            .expect("AiderDesk should be selectable as an additional skill-only target");
+        let selected = vec![&additional_entries[continue_idx], &additional_entries[aider_idx]];
+        let (mcp, skill, has_universal_no_mcp_target) = partition_agent_menu_entries(&selected);
+        assert_eq!(mcp.len(), 1, "mixed selection should preserve MCP targets");
+        assert_eq!(mcp[0].name, "Continue");
+        assert_eq!(
+            skill.len(),
+            1,
+            "mixed selection should preserve skill-only targets"
+        );
+        assert_eq!(AGENT_SKILL_TARGETS[skill[0]].name, "AiderDesk");
+        assert!(!has_universal_no_mcp_target);
+    }
+
+    #[test]
+    fn cmd_integrate_renders_universal_and_additional_prompts_in_order() {
+        let source = include_str!("main.rs");
+        let cmd_start = source
+            .rfind("\nfn cmd_integrate(args: &[String]) -> Result<()> {")
+            .map(|idx| idx + 1)
+            .expect("cmd_integrate should exist");
+        let cmd_end = source[cmd_start..]
+            .find("\nfn cmd_validate() -> Result<()> {")
+            .map(|idx| cmd_start + idx)
+            .expect("cmd_integrate should end before cmd_validate");
+        let cmd_source = &source[cmd_start..cmd_end];
+
+        assert_eq!(UNIVERSAL_GROUP_LABEL, "Universal (.agents/skills)");
+        assert_eq!(ADDITIONAL_AGENTS_LABEL, "Additional agents");
+
+        let count_occurrences = |needle: &str| cmd_source.match_indices(needle).count();
+
+        let direct_branch_idx = cmd_source
+            .find("if !args.is_empty()")
+            .expect("cmd_integrate should preserve direct-argument branch");
+        let universal_menu_idx = cmd_source
+            .find("let (universal_entries, universal_labels) = universal_agent_menu();")
+            .expect("cmd_integrate should build the universal agent menu");
+        assert!(
+            direct_branch_idx < universal_menu_idx,
+            "direct-argument branch should remain before interactive prompting"
+        );
+        assert!(
+            cmd_source[..universal_menu_idx].contains("combined_target_lookup(&name)"),
+            "direct-argument branch should continue to use combined target lookup"
+        );
+
+        // Verify both section menus are built
+        assert!(
+            cmd_source.contains("universal_agent_menu()"),
+            "cmd_integrate should build the universal agent menu"
+        );
+        assert!(
+            cmd_source.contains("additional_agent_menu()"),
+            "cmd_integrate should build the additional agent menu"
+        );
+
+        // Verify two MultiSelect prompts — one per section
+        assert_eq!(
+            count_occurrences("inquire::MultiSelect::new("),
+            2,
+            "cmd_integrate should have one MultiSelect per section (universal + additional)"
+        );
+
+        // Verify section labels are used as prompt messages
+        assert!(
+            cmd_source.contains("UNIVERSAL_GROUP_LABEL,"),
+            "cmd_integrate should use UNIVERSAL_GROUP_LABEL as the universal prompt message"
+        );
+        assert!(
+            cmd_source.contains("ADDITIONAL_AGENTS_LABEL,"),
+            "cmd_integrate should use ADDITIONAL_AGENTS_LABEL as the additional prompt message"
+        );
+
+        assert!(
+            cmd_source.contains("Interactive prompts require a terminal. Use 'marrow integrate <name>' for non-interactive installs."),
+            "cmd_integrate should preserve non-TTY direct-argument guidance"
+        );
+
+        // Verify no static preview sections
+        assert_eq!(
+            count_occurrences("style(UNIVERSAL_GROUP_LABEL).bold()"),
+            0,
+            "cmd_integrate should not print static Universal group preview"
+        );
+        assert_eq!(
+            count_occurrences("style(ADDITIONAL_AGENTS_LABEL).bold()"),
+            0,
+            "cmd_integrate should not print static Additional agents preview"
+        );
+
+        assert!(
+            cmd_source.contains("partition_agent_menu_entries(&selected_entries)"),
+            "cmd_integrate should partition selected menu entries through the shared helper"
+        );
+
+        // Verify low-level helpers are not called directly in the main flow
+        assert_eq!(
+            count_occurrences("interactive_mcp_targets()"),
+            0,
+            "cmd_integrate should use the menu helpers instead of interactive_mcp_targets()"
+        );
+        assert_eq!(
+            count_occurrences("interactive_skill_only_agent_target_indices()"),
+            0,
+            "cmd_integrate should use the menu helpers instead of interactive_skill_only_agent_target_indices()"
+        );
+    }
+
+    // ── Agent skill target tests ──────────────────────────────────────────────
+
+    #[test]
+    fn agent_skill_targets_minimum_count() {
+        assert!(
+            AGENT_SKILL_TARGETS.len() >= 40,
+            "expected >= 40 agent skill targets, got {}",
+            AGENT_SKILL_TARGETS.len()
+        );
+    }
+
+    #[test]
+    fn agent_skill_targets_have_unique_names() {
+        let mut seen_names = std::collections::HashSet::new();
+        let mut seen_aliases = std::collections::HashSet::new();
+        for target in AGENT_SKILL_TARGETS {
+            assert!(
+                seen_names.insert(target.name),
+                "duplicate AgentSkillTarget name: {}",
+                target.name
+            );
+            for alias in target.aliases {
+                assert!(
+                    seen_aliases.insert(*alias),
+                    "duplicate AgentSkillTarget alias '{}' in '{}'",
+                    alias,
+                    target.name
+                );
+            }
+        }
+        // Intentional overlap is allowed for these agents that appear in both
+        // INTEGRATION_TARGETS (MCP config) and AGENT_SKILL_TARGETS (skill path).
+        let overlap_allowed: std::collections::HashSet<&str> =
+            ["claudecode", "roocode", "windsurf"].into_iter().collect();
+        for target in AGENT_SKILL_TARGETS {
+            let normalized = normalize_integration_name(target.name);
+            if overlap_allowed.contains(normalized.as_str()) {
+                continue;
+            }
+            for it in INTEGRATION_TARGETS {
+                if it.rule_agent.is_some() && normalize_integration_name(it.name) == normalized {
+                    panic!(
+                        "AgentSkillTarget '{}' overlaps IntegrationTarget '{}' which has rule_agent",
+                        target.name, it.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agent_skill_targets_have_nonempty_skills_dir() {
+        for target in AGENT_SKILL_TARGETS {
+            assert!(
+                !target.skills_dir.is_empty(),
+                "AgentSkillTarget '{}' has empty skills_dir",
+                target.name
+            );
+            assert!(
+                !target.skills_dir.starts_with('/'),
+                "AgentSkillTarget '{}' skills_dir must be relative: {}",
+                target.name,
+                target.skills_dir
+            );
+        }
+    }
+
+    #[test]
+    fn agent_skill_targets_no_universal_dup() {
+        for target in AGENT_SKILL_TARGETS {
+            assert_ne!(
+                target.skills_dir, ".agents/skills",
+                "AgentSkillTarget '{}' must not duplicate the universal path",
+                target.name
+            );
+        }
+    }
+
+    #[test]
+    fn universal_agents_contains_expected_visible_upstream_entries() {
+        assert_eq!(
+            UNIVERSAL_AGENTS.len(),
+            13,
+            "UNIVERSAL_AGENTS should have exactly 13 visible upstream universal agents"
+        );
+
+        let expected = [
+            "Amp",
+            "Antigravity",
+            "Cline",
+            "Codex",
+            "Cursor",
+            "Deep Agents",
+            "Dexto",
+            "Firebender",
+            "Gemini CLI",
+            "GitHub Copilot",
+            "Kimi Code CLI",
+            "OpenCode",
+            "Warp",
+        ];
+        for name in expected {
+            assert!(
+                UNIVERSAL_AGENTS.contains(&name),
+                "UNIVERSAL_AGENTS should contain {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn universal_agents_excludes_hidden_entries() {
+        for hidden in ["Replit", "Universal"] {
+            assert!(
+                !UNIVERSAL_AGENTS.contains(&hidden),
+                "UNIVERSAL_AGENTS must not include hidden entry {hidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_skill_target_by_name_finds_entries() {
+        assert!(
+            agent_skill_target_by_name("AiderDesk").is_some(),
+            "should find AiderDesk by name"
+        );
+        assert!(
+            agent_skill_target_by_name("aider-desk").is_some(),
+            "should find AiderDesk by alias"
+        );
+    }
+
+    #[test]
+    fn agent_skill_target_by_name_returns_none_for_unknown() {
+        assert!(agent_skill_target_by_name("Nonexistent Agent").is_none());
+    }
+
+    #[test]
+    fn agent_skill_target_exhaustive_fields() {
+        // Destructure without `..` so adding a new field to AgentSkillTarget
+        // causes a compile error here, forcing the test to be updated.
+        let AgentSkillTarget {
+            name,
+            aliases,
+            skills_dir,
+            scope_support,
+        } = &AGENT_SKILL_TARGETS[0];
+        assert!(!name.is_empty());
+        assert!(!aliases.is_empty());
+        assert!(!skills_dir.is_empty());
+        // scope_support must be a valid variant (this binds it, ensuring the field exists).
+        let _ = scope_support.supports(skills::Scope::Project);
+    }
+
+    #[test]
+    fn combined_target_lookup_finds_skill_only() {
+        let (mcp, skill) = combined_target_lookup("AiderDesk");
+        assert!(mcp.is_none(), "AiderDesk should not be an MCP target");
+        assert!(skill.is_some(), "AiderDesk should be a skill target");
+    }
+
+    #[test]
+    fn combined_target_lookup_finds_mcp_only() {
+        let (mcp, skill) = combined_target_lookup("Cursor");
+        assert!(mcp.is_some(), "Cursor should be an MCP target");
+        assert!(skill.is_none(), "Cursor should not be a skill target");
+    }
+
+    #[test]
+    fn combined_target_lookup_finds_overlap() {
+        let (mcp, skill) = combined_target_lookup("Goose");
+        assert!(mcp.is_some(), "Goose should be an MCP target");
+        assert!(skill.is_some(), "Goose should be a skill target");
+    }
+
+    #[test]
+    fn combined_target_lookup_claude_code_dual_hit() {
+        let (mcp, skill) = combined_target_lookup("Claude Code");
+        assert!(mcp.is_some(), "Claude Code should be an MCP target");
+        assert!(skill.is_some(), "Claude Code should also be a skill target");
+        assert_eq!(skill.unwrap().skills_dir, ".claude/skills");
+    }
+
+    #[test]
+    fn combined_target_lookup_roo_code_dual_hit() {
+        let (mcp, skill) = combined_target_lookup("Roo Code");
+        assert!(mcp.is_some(), "Roo Code should be an MCP target");
+        assert!(skill.is_some(), "Roo Code should also be a skill target");
+        assert_eq!(skill.unwrap().skills_dir, ".roo/skills");
+    }
+
+    #[test]
+    fn combined_target_lookup_windsurf_dual_hit() {
+        let (mcp, skill) = combined_target_lookup("Windsurf");
+        assert!(mcp.is_some(), "Windsurf should be an MCP target");
+        assert!(skill.is_some(), "Windsurf should also be a skill target");
+        assert_eq!(skill.unwrap().skills_dir, ".windsurf/skills");
+    }
+
+    #[test]
+    fn trae_and_trae_cn_are_distinct_entries_with_shared_path() {
+        let trae = agent_skill_target_by_name("Trae");
+        let trae_cn = agent_skill_target_by_name("Trae CN");
+        assert!(trae.is_some(), "Trae should exist");
+        assert!(trae_cn.is_some(), "Trae CN should exist");
+        let trae = trae.unwrap();
+        let trae_cn = trae_cn.unwrap();
+        assert_ne!(trae.name, trae_cn.name, "names must differ");
+        assert_eq!(
+            trae.skills_dir, trae_cn.skills_dir,
+            "Trae and Trae CN should share .trae/skills"
+        );
+        assert_eq!(trae.skills_dir, ".trae/skills");
+    }
+
+    #[test]
+    fn new_upstream_targets_resolve_correctly() {
+        let cases = [
+            ("Rovo Dev", ".rovodev/skills"),
+            ("Zencoder", ".zencoder/skills"),
+            ("Neovate", ".neovate/skills"),
+            ("Pochi", ".pochi/skills"),
+            ("AdaL", ".adal/skills"),
+        ];
+        for (name, expected_dir) in cases {
+            let target = agent_skill_target_by_name(name);
+            assert!(
+                target.is_some(),
+                "{name} should be found in AGENT_SKILL_TARGETS"
+            );
+            assert_eq!(target.unwrap().skills_dir, expected_dir);
+        }
+    }
+
+    #[test]
+    fn integration_menu_skill_labels_include_directory_convention() {
+        for target in AGENT_SKILL_TARGETS {
+            let label = format_skill_menu_label(target);
+            assert!(
+                label.starts_with(&format!("{} (", target.name)),
+                "skill label for '{}' must start with the display name and directory: {label:?}",
+                target.name
+            );
+            assert!(
+                label.ends_with(')'),
+                "skill label for '{}' must end with a closing parenthesis: {label:?}",
+                target.name
+            );
+        }
+    }
+
+    #[test]
+    fn integration_menu_skill_labels_contain_no_taxonomy_or_file_suffixes() {
+        let forbidden = [
+            "guided MCP client",
+            "guided agent",
+            "guided host",
+            "secondary, guided setup",
+            "manual setup",
+            "marrow-optimization.md",
+            "->",
+        ];
+
+        for target in AGENT_SKILL_TARGETS {
+            let label = format_skill_menu_label(target);
+            for substr in forbidden {
+                assert!(
+                    !label.contains(substr),
+                    "skill label for {:?} must not contain {:?}: {label:?}",
+                    target.name,
+                    substr
+                );
+            }
+            assert!(
+                !label.contains('\x1b'),
+                "skill label for {:?} must contain no ANSI control sequences: {label:?}",
+                target.name
+            );
+        }
+    }
+
+    #[test]
+    fn universal_skill_path_is_agents_skills() {
+        let path = std::path::PathBuf::from(".agents/skills").join("marrow-optimization.md");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(".agents/skills/marrow-optimization.md")
+        );
+    }
+
+    #[test]
+    fn windsurf_and_roo_rule_files_are_first_class_coverage_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join(".windsurfrules"), "marrow").unwrap();
+        fs::write(workspace.path().join(".roomrules"), "marrow").unwrap();
+
+        let summary = format_agent_coverage_summary(workspace.path(), home.path());
+
+        assert!(
+            summary.contains("Windsurf: protected"),
+            "Windsurf should be protected through registry-backed coverage: {summary}"
+        );
+        assert!(
+            summary.contains("Roo Code: protected"),
+            "Roo Code should be protected through registry-backed coverage: {summary}"
+        );
+        assert!(
+            !summary.contains("legacy") && !summary.contains("Windsurf: partial"),
+            "legacy partial Windsurf line should be gone: {summary}"
+        );
+        assert_eq!(summary.matches("Windsurf:").count(), 1, "{summary}");
+        assert_eq!(summary.matches("Roo Code:").count(), 1, "{summary}");
+    }
+
+    #[test]
+    fn workspace_initialization_uses_registry_baseline_rule_files() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join(".marrow")).unwrap();
+        fs::create_dir_all(workspace.path().join(".vscode")).unwrap();
+        fs::write(workspace.path().join(".marrowrc.json"), "{}").unwrap();
+        fs::write(workspace.path().join(".vscode/mcp.json"), "{}").unwrap();
+
+        assert!(
+            !workspace_is_initialized(workspace.path()),
+            "baseline workspace rule files should still be required"
+        );
+
+        for rule in baseline_workspace_rule_files() {
+            fs::write(workspace.path().join(rule), "MARROW AST CONTEXT ENGINE").unwrap();
+        }
+
+        assert!(workspace_is_initialized(workspace.path()));
+    }
+
+    #[test]
+    fn docs_separate_direct_targets_from_compatibility_only_backends() {
+        let docs = [
+            ("README", include_str!("../README.md")),
+            (
+                "state-of-the-union",
+                include_str!("../state-of-the-union.md"),
+            ),
+        ];
+
+        for (label, doc) in docs {
+            for direct_target in [
+                "Windsurf",
+                "Continue",
+                "Roo Code",
+                "Goose",
+                "OpenHands",
+                "OpenClaw",
+                "Codex CLI",
+                "Gemini CLI",
+                "JetBrains AI Assistant",
+                "JetBrains Junie",
+                "LM Studio",
+            ] {
+                assert!(
+                    doc.contains(direct_target),
+                    "{label} missing {direct_target}"
+                );
+            }
+
+            for secondary_target in ["Kilo Code", "Sourcegraph Amp", "Augment Code"] {
+                assert!(
+                    doc.contains(secondary_target),
+                    "{label} missing {secondary_target}"
+                );
+            }
+
+            for runtime in [
+                "Ollama",
+                "llama.cpp",
+                "vLLM",
+                "SGLang",
+                "LiteLLM",
+                "Ramalama",
+                "Docker Model Runner",
+            ] {
+                assert!(doc.contains(runtime), "{label} missing {runtime}");
+            }
+
+            assert!(
+                doc.contains("Compatibility-only") || doc.contains("compatibility-only"),
+                "{label} should identify compatibility-only model/runtime backends"
+            );
+        }
+    }
+
+    #[test]
+    fn github_copilot_workspace_mcp_config_counts_as_fallback_coverage() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(workspace.path().join(".vscode")).unwrap();
+        fs::write(
+            workspace.path().join(".vscode/mcp.json"),
+            r#"{"servers":{"marrow":{}}}"#,
+        )
+        .unwrap();
+
+        let (status, detail) =
+            coverage_status_for_agent(skills::Agent::GitHubCopilot, workspace.path(), home.path());
+
+        assert_eq!(status, "partial", "Copilot MCP fallback detail: {detail}");
+        assert!(
+            detail.contains(".vscode/mcp.json"),
+            "Copilot fallback should cite workspace MCP config: {detail}"
+        );
+    }
+
+    #[test]
+    fn antigravity_roomrules_counts_as_fallback_coverage() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join(".roomrules"), "marrow").unwrap();
+
+        let (status, detail) =
+            coverage_status_for_agent(skills::Agent::Antigravity, workspace.path(), home.path());
+
+        assert_eq!(status, "partial", "Antigravity fallback detail: {detail}");
+        assert!(
+            detail.contains(".roomrules"),
+            "Antigravity fallback should cite .roomrules: {detail}"
+        );
+    }
+
+    #[test]
+    fn write_workspace_rules_preserves_legacy_numeric_indices() {
+        let workspace = tempfile::tempdir().unwrap();
+        let modified = write_workspace_rules(
+            workspace.path(),
+            &[0, 1, 2],
+            WORKSPACE_RULES_CONTENT,
+            WriteMode::SafeAppend,
+        )
+        .unwrap();
+
+        for filename in [
+            ".cursorrules",
+            ".windsurfrules",
+            ".clinerules",
+            ".roomrules",
+        ] {
+            let path = workspace.path().join(filename);
+            assert!(path.exists(), "missing legacy rule file {filename}");
+            assert!(
+                fs::read_to_string(path)
+                    .unwrap()
+                    .contains("MARROW AST CONTEXT ENGINE"),
+                "missing Marrow marker in {filename}"
+            );
+        }
+        assert_eq!(modified.len(), 4, "legacy indices should write four files");
     }
 
     #[test]
@@ -3416,7 +5467,7 @@ mod tests {
     // ── per-agent integration config tests ────────────────────────────────────
 
     #[test]
-    fn integrate_claude_writes_command_marrow_with_env_path() {
+    fn integrate_claude_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
         let ctx = IntegrationCtx {
             binary: "/absolute/path/to/marrow".to_string(),
@@ -3426,11 +5477,21 @@ mod tests {
         let raw = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
-        assert_eq!(cmd, "marrow", "command must be 'marrow', got: {cmd}");
-        assert!(!cmd.starts_with('/'), "command must not be absolute path");
         assert!(
-            cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string(),
-            "env.PATH must be present"
+            cmd.ends_with("zsh") || cmd.ends_with("bash"),
+            "expected shell binary, got: {cmd}"
+        );
+        assert_eq!(cfg["mcpServers"]["marrow"]["args"][0], "-lc");
+        assert!(
+            cfg["mcpServers"]["marrow"]["args"][1]
+                .as_str()
+                .unwrap()
+                .contains("marrow mcp"),
+            "shell invocation must contain 'marrow mcp'"
+        );
+        assert!(
+            !raw.contains("/absolute/path/to/marrow"),
+            "binary path must not leak into config"
         );
     }
 
@@ -3577,8 +5638,8 @@ mod tests {
     #[test]
     fn no_integrate_fn_leaks_binary_path_into_config() {
         // Regression guard: ctx.binary must never appear as a command value in any config.
-        // - Claude/Antigravity/Zed: use command:"marrow" (portable name) with env.PATH.
-        // - Cursor/Copilot/Cline: use shell wrapper (/bin/zsh or /bin/bash) — never the binary.
+        // - Antigravity/Zed: use command:"marrow" (portable name) with env.PATH.
+        // - Claude/Cursor/Copilot/Cline: use shell wrapper (/bin/zsh or /bin/bash) — never the binary.
         let home = tempfile::tempdir().unwrap();
         let h = home.path();
         const BINARY: &str = "/some/absolute/path/to/marrow-unique-sentinel";
@@ -3629,10 +5690,8 @@ mod tests {
             );
         }
 
-        // Claude and Antigravity must use portable command name.
-        let claude_raw = std::fs::read_to_string(h.join(".claude.json")).unwrap();
-        let claude_cfg: serde_json::Value = serde_json::from_str(&claude_raw).unwrap();
-        assert_eq!(claude_cfg["mcpServers"]["marrow"]["command"], "marrow");
+        // Antigravity must use portable command name.
+        // (Claude Code now uses shell wrapper — verified in the shell-wrapper loop below.)
 
         // Zed must use portable path name in nested command object.
         let zed_raw = std::fs::read_to_string(zed.join("settings.json")).unwrap();
@@ -3644,6 +5703,7 @@ mod tests {
 
         // Shell-wrapper hosts must use a shell binary, not "marrow" directly.
         for (rel, ptr) in [
+            (".claude.json", "/mcpServers/marrow/command"),
             (".cursor/mcp.json", "/mcpServers/marrow/command"),
             ("Library/Application Support/Code/User/mcp.json", "/servers/marrow/command"),
             ("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
@@ -3863,33 +5923,17 @@ pub fn write_vscode_mcp_config(workspace_root: &Path, mode: WriteMode) -> Result
     Ok(Some(mcp_path.display().to_string()))
 }
 
-/// Write Marrow rule files for the selected agents.
-///
-/// `agent_indices` maps to:
-///   0 → Cursor   (.cursorrules)
-///   1 → Windsurf (.windsurfrules)
-///   2 → Cline    (.clinerules, .roomrules)
-///
-/// Returns the list of file paths that were created, appended, or symlinked.
-pub fn write_workspace_rules(
+fn write_workspace_rule_files(
     root_dir: &Path,
-    agent_indices: &[usize],
+    rule_files: &[&str],
     rules_content: &str,
     mode: WriteMode,
 ) -> Result<Vec<String>> {
     use std::io::Write;
     const MARROW_HEADER: &str = "# MARROW AST CONTEXT ENGINE";
 
-    // Index → file names. Cline shares .roomrules for Roo compatibility.
-    const AGENT_FILES: &[&[&str]] = &[
-        &[".cursorrules"],              // 0: Cursor
-        &[".windsurfrules"],            // 1: Windsurf
-        &[".clinerules", ".roomrules"], // 2: Cline + Roo
-    ];
-
     let mut modified: Vec<String> = Vec::new();
 
-    // For Symlink mode, ensure the central rules file exists once up-front.
     let central_rules_path = if matches!(mode, WriteMode::Symlink) {
         let p = dirs::home_dir()
             .context("could not resolve home directory")?
@@ -3907,73 +5951,66 @@ pub fn write_workspace_rules(
         None
     };
 
-    for &idx in agent_indices {
-        let Some(files) = AGENT_FILES.get(idx) else {
-            continue;
-        };
-        for &filename in *files {
-            let path = root_dir.join(filename);
-            match mode {
-                WriteMode::SafeAppend => {
-                    if path.exists() {
-                        let existing = fs::read_to_string(&path)
-                            .with_context(|| format!("could not read {}", path.display()))?;
-                        if existing.contains(MARROW_HEADER) {
-                            eprintln!("Skipped {} (Marrow rules already present)", path.display());
-                            continue;
-                        }
-                        let mut file = fs::OpenOptions::new()
-                            .append(true)
-                            .open(&path)
-                            .with_context(|| format!("could not open {}", path.display()))?;
-                        write!(file, "\n\n{rules_content}")?;
-                        eprintln!("Appended to {}", path.display());
-                    } else {
-                        let mut file = fs::OpenOptions::new()
-                            .create_new(true)
-                            .write(true)
-                            .open(&path)
-                            .with_context(|| format!("could not create {}", path.display()))?;
-                        write!(file, "{rules_content}")?;
-                        eprintln!("Created {}", path.display());
+    for &filename in rule_files {
+        let path = root_dir.join(filename);
+        match mode {
+            WriteMode::SafeAppend => {
+                if path.exists() {
+                    let existing = fs::read_to_string(&path)
+                        .with_context(|| format!("could not read {}", path.display()))?;
+                    if existing.contains(MARROW_HEADER) {
+                        eprintln!("Skipped {} (Marrow rules already present)", path.display());
+                        continue;
                     }
+                    let mut file = fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .with_context(|| format!("could not open {}", path.display()))?;
+                    write!(file, "\n\n{rules_content}")?;
+                    eprintln!("Appended to {}", path.display());
+                } else {
+                    let mut file = fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&path)
+                        .with_context(|| format!("could not create {}", path.display()))?;
+                    write!(file, "{rules_content}")?;
+                    eprintln!("Created {}", path.display());
+                }
+                modified.push(path.display().to_string());
+            }
+            WriteMode::Overwrite => {
+                fs::write(&path, rules_content)
+                    .with_context(|| format!("could not write {}", path.display()))?;
+                eprintln!("Overwrote {}", path.display());
+                modified.push(path.display().to_string());
+            }
+            WriteMode::Symlink => {
+                let central = central_rules_path.as_ref().expect("central path set above");
+                if path.exists() || path.is_symlink() {
+                    fs::remove_file(&path).ok();
+                }
+                #[cfg(unix)]
+                {
+                    std::os::unix::fs::symlink(central, &path).with_context(|| {
+                        format!(
+                            "could not symlink {} -> {}",
+                            path.display(),
+                            central.display()
+                        )
+                    })?;
+                    eprintln!("Symlinked {} -> {}", path.display(), central.display());
                     modified.push(path.display().to_string());
                 }
-                WriteMode::Overwrite => {
+                #[cfg(not(unix))]
+                {
                     fs::write(&path, rules_content)
                         .with_context(|| format!("could not write {}", path.display()))?;
-                    eprintln!("Overwrote {}", path.display());
+                    eprintln!(
+                        "Created {} (symlink unsupported on this platform, wrote copy)",
+                        path.display()
+                    );
                     modified.push(path.display().to_string());
-                }
-                WriteMode::Symlink => {
-                    let central = central_rules_path.as_ref().expect("central path set above");
-                    // Remove existing file or stale symlink before creating the new one.
-                    if path.exists() || path.is_symlink() {
-                        fs::remove_file(&path).ok();
-                    }
-                    #[cfg(unix)]
-                    {
-                        std::os::unix::fs::symlink(central, &path).with_context(|| {
-                            format!(
-                                "could not symlink {} → {}",
-                                path.display(),
-                                central.display()
-                            )
-                        })?;
-                        eprintln!("Symlinked {} → {}", path.display(), central.display());
-                        modified.push(path.display().to_string());
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        // Symlinks require elevated permissions on Windows; fall back to a copy.
-                        fs::write(&path, rules_content)
-                            .with_context(|| format!("could not write {}", path.display()))?;
-                        eprintln!(
-                            "Created {} (symlink unsupported on this platform, wrote copy)",
-                            path.display()
-                        );
-                        modified.push(path.display().to_string());
-                    }
                 }
             }
         }
@@ -3982,11 +6019,32 @@ pub fn write_workspace_rules(
     Ok(modified)
 }
 
+/// Write Marrow rule files for the selected legacy agent groups.
+///
+/// `agent_indices` preserves the public legacy contract:
+/// 0 => Cursor, 1 => Windsurf, 2 => Cline + Roo Code.
+///
+/// Returns the list of file paths that were created, appended, or symlinked.
+pub fn write_workspace_rules(
+    root_dir: &Path,
+    agent_indices: &[usize],
+    rules_content: &str,
+    mode: WriteMode,
+) -> Result<Vec<String>> {
+    let rule_files: Vec<&str> = agent_indices
+        .iter()
+        .filter_map(|&idx| LEGACY_WORKSPACE_RULE_FILES_BY_INDEX.get(idx))
+        .flat_map(|files| files.iter().copied())
+        .collect();
+    write_workspace_rule_files(root_dir, &rule_files, rules_content, mode)
+}
+
 fn cmd_rules() -> Result<()> {
     let root = std::env::current_dir().context("could not determine current directory")?;
+    let rule_indices = workspace_rule_target_indices();
     write_workspace_rules(
         &root,
-        &[0, 1, 2],
+        &rule_indices,
         WORKSPACE_RULES_CONTENT,
         WriteMode::SafeAppend,
     )?;
@@ -4070,9 +6128,11 @@ struct IntegrationCtx {
 }
 
 /// What a per-agent function reports back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentOutcome {
     Installed,
     NotFound,
+    Guided,
 }
 
 /// Read a JSON file into a `Value`, returning `{}` if the file is absent.
@@ -4266,9 +6326,7 @@ fn validate_marrow_command(env_path: &str) -> Result<()> {
 fn integrate_claude(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     let path = PathBuf::from(&ctx.home).join(".claude.json");
     let mut cfg = load_json_or_empty(&path)?;
-    let mut spec = mcp_launch_spec();
-    spec["env"] = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });
-    cfg["mcpServers"]["marrow"] = spec;
+    cfg["mcpServers"]["marrow"] = mcp_shell_launch_spec();
     save_json(&path, &cfg)?;
     Ok(AgentOutcome::Installed)
 }
@@ -4374,12 +6432,227 @@ fn integrate_zed(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     Ok(AgentOutcome::Installed)
 }
 
+fn register_integration_target(
+    target: &IntegrationTarget,
+    ctx: &IntegrationCtx,
+) -> Result<AgentOutcome> {
+    if !target.allow_config_write || target.setup_mode == IntegrationSetupMode::Guided {
+        return Ok(AgentOutcome::Guided);
+    }
+
+    let writer = target
+        .writer
+        .context("automatic integration target is missing a writer")?;
+    writer(ctx)
+}
+
+fn rule_agent_for_scope(target: &IntegrationTarget, scope: skills::Scope) -> Option<skills::Agent> {
+    target
+        .rule_agent
+        .filter(|agent| target.rule_support.supports(scope) && agent.supports_scope(scope))
+}
+
+fn format_integration_menu_label(target: &IntegrationTarget) -> String {
+    format_menu_label(target.name, &integration_skill_directory(target))
+}
+
+fn format_integration_guidance(target: &IntegrationTarget) -> String {
+    if target.support_tier == IntegrationSupportTier::CompatibilityOnly {
+        return format!(
+            "{} is a {} target, not an MCP agent/client/host destination. Configure Marrow through an MCP-capable agent or host, and point that tool at this backend separately.",
+            target.name,
+            target.kind.label()
+        );
+    }
+
+    if target.setup_mode == IntegrationSetupMode::Automatic {
+        return format!(
+            "{} is a verified automatic {} target. Run `marrow integrate` without arguments to use the interactive installer.",
+            target.name,
+            target.kind.label()
+        );
+    }
+
+    format!(
+        "{} is supported as an MCP {} target, but no verified config file path or merge writer exists yet. Add Marrow as an MCP stdio server with command `marrow` and args [`mcp`]. No config file was written.",
+        target.name,
+        target.kind.label()
+    )
+}
+
 // ── Interactive installer ─────────────────────────────────────────────────────
 
 /// `marrow integrate` — launch the interactive TUI installer.
-fn cmd_integrate() -> Result<()> {
+fn cmd_integrate(args: &[String]) -> Result<()> {
     use console::style;
-    use dialoguer::{theme::ColorfulTheme, MultiSelect, Select};
+
+    if !args.is_empty() {
+        let name = args.join(" ");
+        let (mcp_target, skill_target) = combined_target_lookup(&name);
+
+        if mcp_target.is_none() && skill_target.is_none() {
+            anyhow::bail!("unknown integration target: {name}");
+        }
+
+        let home = std::env::var("HOME").context("$HOME is not set")?;
+        let home_path = PathBuf::from(&home);
+
+        // Resolve (scope, method) pair: prompt if we have a skill target, otherwise default.
+        let (scope, method) = if skill_target.is_some() {
+            let scope = match inquire::Select::new(
+                "Rule file scope",
+                vec!["Global (recommended)", "Project"],
+            )
+            .prompt()
+            {
+                Ok(choice) => {
+                    if choice.starts_with("Global") {
+                        skills::Scope::Global
+                    } else {
+                        skills::Scope::Project
+                    }
+                }
+                Err(inquire::InquireError::NotTTY) => skills::Scope::Project,
+                Err(e) => return Err(e.into()),
+            };
+
+            let method =
+                match inquire::Select::new("Rule file method", vec!["Write File", "Symlink"])
+                    .prompt()
+                {
+                    Ok(choice) => {
+                        if choice == "Symlink" {
+                            skills::Method::Symlink
+                        } else {
+                            skills::Method::WriteFile
+                        }
+                    }
+                    Err(inquire::InquireError::NotTTY) => skills::Method::WriteFile,
+                    Err(e) => return Err(e.into()),
+                };
+
+            (scope, method)
+        } else {
+            (skills::Scope::Project, skills::Method::WriteFile)
+        };
+
+        let enforcement_mode = match inquire::Select::new(
+            "Workspace enforcement mode",
+            vec![
+                "Default (warn + auto-route low-level bypasses)",
+                "Strict (reject low-level bypasses)",
+            ],
+        )
+        .prompt()
+        {
+            Ok(choice) => {
+                if choice.starts_with("Strict") {
+                    EnforcementMode::Strict
+                } else {
+                    EnforcementMode::Default
+                }
+            }
+            Err(inquire::InquireError::NotTTY) => EnforcementMode::Default,
+            Err(e) => return Err(e.into()),
+        };
+        ensure_workspace_config(Some(enforcement_mode))?;
+
+        // Install universal skill (always, regardless of target type).
+        match skills::install_skill_to_dir(".agents/skills", scope, method, &home_path) {
+            Ok(status) => {
+                let status_label = match status {
+                    skills::InstallStatus::Written => "installed",
+                    skills::InstallStatus::PreservedExisting => "preserved existing",
+                };
+                eprintln!(
+                    "  {}  Universal \u{2192} .agents/skills/marrow-optimization.md ({})",
+                    style("\u{2713}").green().bold(),
+                    status_label,
+                );
+            }
+            Err(e) => eprintln!(
+                "  {}  Universal skill \u{2014} {}",
+                style("\u{2717}").red().bold(),
+                e,
+            ),
+        }
+
+        // Skill-only or overlap: install skill file(s).
+        if let Some(st) = skill_target {
+            if st.scope_support.supports(scope) {
+                match skills::install_skill_to_dir(st.skills_dir, scope, method, &home_path) {
+                    Ok(status) => {
+                        let status_label = match status {
+                            skills::InstallStatus::Written => "installed",
+                            skills::InstallStatus::PreservedExisting => "preserved existing",
+                        };
+                        eprintln!(
+                            "  {}  {} \u{2192} {}/marrow-optimization.md ({})",
+                            style("\u{2713}").green().bold(),
+                            st.name,
+                            st.skills_dir,
+                            status_label,
+                        );
+                    }
+                    Err(e) => eprintln!(
+                        "  {}  {} \u{2014} {}",
+                        style("\u{2717}").red().bold(),
+                        st.name,
+                        e,
+                    ),
+                }
+            } else {
+                eprintln!(
+                    "  {}  {} \u{2014} skill target does not support global scope",
+                    style("i").cyan().bold(),
+                    st.name,
+                );
+            }
+        }
+
+        // MCP-only or overlap: dispatch to register_integration_target for automatic
+        // targets; print guidance for guided targets.
+        if let Some(target) = mcp_target {
+            let binary = std::env::current_exe()
+                .context("Could not resolve current executable path")?
+                .to_string_lossy()
+                .to_string();
+            let ctx = IntegrationCtx {
+                binary,
+                home: home.clone(),
+            };
+
+            let mcp_result = register_integration_target(target, &ctx);
+            match &mcp_result {
+                Ok(AgentOutcome::Installed) => eprintln!(
+                    "  {}  {}  {}",
+                    style("\u{2713}").green().bold(),
+                    style(target.name).bold(),
+                    style("MCP registered").dim(),
+                ),
+                Ok(AgentOutcome::NotFound) => eprintln!(
+                    "  {}  {}  {}",
+                    style("\u{26a0}").yellow().bold(),
+                    style(target.name).dim(),
+                    style("(not installed \u{2014} skipped)").dim(),
+                ),
+                Ok(AgentOutcome::Guided) => eprintln!(
+                    "  {}  {}  {}",
+                    style("i").cyan().bold(),
+                    style(target.name).bold(),
+                    style(format_integration_guidance(target)).dim(),
+                ),
+                Err(e) => eprintln!(
+                    "  {}  {}  {}",
+                    style("\u{2717}").red().bold(),
+                    style(target.name).bold(),
+                    style(format!("MCP \u{2014} {e}")).red(),
+                ),
+            }
+        }
+
+        return Ok(());
+    }
 
     eprintln!("{}", style(MARROW_BANNER).cyan().bold());
     eprintln!(
@@ -4388,47 +6661,72 @@ fn cmd_integrate() -> Result<()> {
     );
     eprintln!();
 
-    #[allow(clippy::type_complexity)]
-    let agents: &[(
-        &str,
-        fn(&IntegrationCtx) -> Result<AgentOutcome>,
-        skills::Agent,
-    )] = &[
-        ("Claude Code", integrate_claude, skills::Agent::ClaudeCode),
-        (
-            "Antigravity (Gemini)",
-            integrate_antigravity,
-            skills::Agent::Antigravity,
-        ),
-        ("Cursor", integrate_cursor, skills::Agent::Cursor),
-        (
-            "GitHub Copilot",
-            integrate_copilot,
-            skills::Agent::GitHubCopilot,
-        ),
-        ("Cline", integrate_cline, skills::Agent::Cline),
-        ("Zed", integrate_zed, skills::Agent::Zed),
-    ];
+    let (universal_entries, universal_labels) = universal_agent_menu();
+    let (additional_entries, additional_labels) = additional_agent_menu();
 
-    let labels: Vec<&str> = agents.iter().map(|(name, _, _)| *name).collect();
+    let universal_selected: Vec<&AgentMenuEntry> = match inquire::MultiSelect::new(
+        UNIVERSAL_GROUP_LABEL,
+        universal_labels.clone(),
+    )
+    .with_help_message("space to toggle, enter to confirm")
+    .prompt()
+    {
+        Ok(chosen) => chosen
+            .iter()
+            .filter_map(|label| {
+                universal_labels
+                    .iter()
+                    .position(|candidate| candidate == label)
+                    .map(|idx| &universal_entries[idx])
+            })
+            .collect(),
+        Err(inquire::InquireError::NotTTY) => {
+            anyhow::bail!("Interactive prompts require a terminal. Use 'marrow integrate <name>' for non-interactive installs.");
+        }
+        Err(e) => return Err(e.into()),
+    };
 
-    let selections = MultiSelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select agents to configure  (space to toggle, enter to confirm)")
-        .items(&labels)
-        .interact()?;
+    let additional_selected: Vec<&AgentMenuEntry> = match inquire::MultiSelect::new(
+        ADDITIONAL_AGENTS_LABEL,
+        additional_labels.clone(),
+    )
+    .with_help_message("space to toggle, enter to confirm")
+    .prompt()
+    {
+        Ok(chosen) => chosen
+            .iter()
+            .filter_map(|label| {
+                additional_labels
+                    .iter()
+                    .position(|candidate| candidate == label)
+                    .map(|idx| &additional_entries[idx])
+            })
+            .collect(),
+        Err(inquire::InquireError::NotTTY) => {
+            anyhow::bail!("Interactive prompts require a terminal. Use 'marrow integrate <name>' for non-interactive installs.");
+        }
+        Err(e) => return Err(e.into()),
+    };
 
-    if selections.is_empty() {
-        eprintln!("\n{}", style("No agents selected — nothing to do.").dim());
+    let mut selected_entries: Vec<&AgentMenuEntry> = universal_selected;
+    selected_entries.extend(additional_selected);
+
+    let (mcp_selections, skill_selections, has_universal_no_mcp_target) =
+        partition_agent_menu_entries(&selected_entries);
+
+    if mcp_selections.is_empty() && skill_selections.is_empty() && !has_universal_no_mcp_target {
+        eprintln!(
+            "\n{}",
+            style("No agents selected \u{2014} nothing to do.").dim()
+        );
         return Ok(());
     }
 
-    eprintln!("  {}", style(rule_install_note()).dim());
-    let install_rules = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Create Marrow rule files for the selected agents?")
-        .items(&["Yes (recommended)", "No"])
-        .default(0)
-        .interact()?
-        == 0;
+    let has_mcp_with_rules = mcp_selections
+        .iter()
+        .any(|target| target.rule_agent.is_some());
+    let has_skill_targets = !skill_selections.is_empty();
+    let needs_rules = has_mcp_with_rules || has_skill_targets;
 
     let binary = std::env::current_exe()
         .context("Could not resolve current executable path")?
@@ -4436,22 +6734,24 @@ fn cmd_integrate() -> Result<()> {
         .to_string();
     let home = std::env::var("HOME").context("$HOME is not set")?;
     let home_path = PathBuf::from(&home);
-    let ctx = IntegrationCtx { binary, home };
+    let ctx = IntegrationCtx {
+        binary,
+        home: home.clone(),
+    };
 
     // Warn if `marrow` is not resolvable via the GUI-safe PATH we will inject.
-    // This converts a vague post-restart ENOENT into an immediate install-time diagnosis.
     {
         let env_path = gui_safe_path(&ctx.binary);
         if let Err(e) = validate_marrow_command(&env_path) {
             eprintln!(
                 "  {}  {}",
-                style("⚠").yellow().bold(),
+                style("\u{26a0}").yellow().bold(),
                 style(format!("PATH warning: {e}")).yellow()
             );
             eprintln!(
                 "  {}",
                 style(
-                    "Continuing install — ensure `marrow` is on PATH before restarting your IDE."
+                    "Continuing install \u{2014} ensure `marrow` is on PATH before restarting your IDE."
                 )
                 .dim()
             );
@@ -4459,43 +6759,71 @@ fn cmd_integrate() -> Result<()> {
         }
     }
 
-    let rule_config = if install_rules {
-        // Scope selection: Global writes to ~/.agent/rules; Project writes to .agent/rules in CWD
-        let scope_idx = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Rule file scope")
-            .items(&["Global (recommended)", "Project"])
-            .default(0)
-            .interact()?;
-        let scope = if scope_idx == 0 {
-            skills::Scope::Global
-        } else {
-            skills::Scope::Project
-        };
+    let (rule_scope, rule_method) = if needs_rules {
+        if has_mcp_with_rules {
+            eprintln!("  {}", style(rule_install_note()).dim());
+        }
 
-        // Method selection: WriteFile copies the content; Symlink points to ~/.marrow/marrow-optimization.md
-        let method_idx = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Rule file method")
-            .items(&["Write File", "Symlink"])
-            .default(0)
-            .interact()?;
-        let method = if method_idx == 0 {
-            skills::Method::WriteFile
-        } else {
-            skills::Method::Symlink
+        let scope =
+            match inquire::Select::new("Rule file scope", vec!["Global (recommended)", "Project"])
+                .prompt()
+            {
+                Ok(choice) => {
+                    if choice.starts_with("Global") {
+                        skills::Scope::Global
+                    } else {
+                        skills::Scope::Project
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+        let method = match inquire::Select::new("Rule file method", vec!["Write File", "Symlink"])
+            .prompt()
+        {
+            Ok(choice) => {
+                if choice == "Symlink" {
+                    skills::Method::Symlink
+                } else {
+                    skills::Method::WriteFile
+                }
+            }
+            Err(e) => return Err(e.into()),
         };
 
         eprintln!();
         eprintln!("  {}", style("Rule files to create:").dim());
-        for idx in &selections {
-            let (name, _, skill_agent) = agents[*idx];
+        for target in &mcp_selections {
+            if let Some(skill_agent) = rule_agent_for_scope(target, scope) {
+                eprintln!(
+                    "    {}",
+                    style(format_rule_plan_line(
+                        target.name,
+                        skill_agent,
+                        scope,
+                        method,
+                        &home_path
+                    ))
+                    .dim()
+                );
+            } else {
+                eprintln!(
+                    "    {}",
+                    style(format!(
+                        "{} -> guided setup only (no verified rule-file target for this scope)",
+                        target.name
+                    ))
+                    .dim()
+                );
+            }
+        }
+        for &idx in &skill_selections {
+            let st = &AGENT_SKILL_TARGETS[idx];
             eprintln!(
                 "    {}",
-                style(format_rule_plan_line(
-                    name,
-                    skill_agent,
-                    scope,
-                    method,
-                    &home_path
+                style(format!(
+                    "{} \u{2192} {}/marrow-optimization.md",
+                    st.name, st.skills_dir
                 ))
                 .dim()
             );
@@ -4504,30 +6832,28 @@ fn cmd_integrate() -> Result<()> {
             "  {}",
             style("Edit/remove the target paths above later if you want to disable implicit Marrow guidance.").dim()
         );
-        Some((scope, method))
+        (scope, method)
     } else {
-        eprintln!(
-            "  {}",
-            style(
-                "Rule files skipped. Marrow will still be available via MCP, but some agents may need explicit prompts to use it."
-            )
-            .dim()
-        );
-        None
+        (skills::Scope::Project, skills::Method::WriteFile)
     };
 
-    let enforcement_idx = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Workspace enforcement mode")
-        .items(&[
+    let enforcement_mode = match inquire::Select::new(
+        "Workspace enforcement mode",
+        vec![
             "Default (warn + auto-route low-level bypasses)",
             "Strict (reject low-level bypasses)",
-        ])
-        .default(0)
-        .interact()?;
-    let enforcement_mode = if enforcement_idx == 0 {
-        EnforcementMode::Default
-    } else {
-        EnforcementMode::Strict
+        ],
+    )
+    .prompt()
+    {
+        Ok(choice) => {
+            if choice.starts_with("Strict") {
+                EnforcementMode::Strict
+            } else {
+                EnforcementMode::Default
+            }
+        }
+        Err(e) => return Err(e.into()),
     };
     ensure_workspace_config(Some(enforcement_mode))?;
     eprintln!(
@@ -4540,56 +6866,131 @@ fn cmd_integrate() -> Result<()> {
     );
 
     eprintln!();
-    for idx in selections {
-        let (name, integrate_fn, skill_agent) = agents[idx];
 
-        // 1. MCP registration (existing behaviour)
-        let mcp_result = integrate_fn(&ctx);
+    // Install universal skill (always, regardless of selections).
+    match skills::install_skill_to_dir(".agents/skills", rule_scope, rule_method, &home_path) {
+        Ok(status) => {
+            let status_label = match status {
+                skills::InstallStatus::Written => "installed",
+                skills::InstallStatus::PreservedExisting => "preserved existing",
+            };
+            eprintln!(
+                "  {}  Universal \u{2192} .agents/skills/marrow-optimization.md ({})",
+                style("\u{2713}").green().bold(),
+                status_label,
+            );
+        }
+        Err(e) => eprintln!(
+            "  {}  Universal skill \u{2014} {}",
+            style("\u{2717}").red().bold(),
+            e,
+        ),
+    }
+
+    // Loop MCP targets: register + optional rule files (unchanged logic).
+    for target in mcp_selections {
+        let mcp_result = register_integration_target(target, &ctx);
         match &mcp_result {
             Ok(AgentOutcome::Installed) => eprintln!(
                 "  {}  {}  {}",
-                style("✓").green().bold(),
-                style(name).bold(),
+                style("\u{2713}").green().bold(),
+                style(target.name).bold(),
                 style("MCP registered").dim(),
             ),
             Ok(AgentOutcome::NotFound) => eprintln!(
                 "  {}  {}  {}",
-                style("⚠").yellow().bold(),
-                style(name).dim(),
-                style("(not installed — skipped)").dim(),
+                style("\u{26a0}").yellow().bold(),
+                style(target.name).dim(),
+                style("(not installed \u{2014} skipped)").dim(),
+            ),
+            Ok(AgentOutcome::Guided) => eprintln!(
+                "  {}  {}  {}",
+                style("i").cyan().bold(),
+                style(target.name).bold(),
+                style(format_integration_guidance(target)).dim(),
             ),
             Err(e) => eprintln!(
                 "  {}  {}  {}",
-                style("✗").red().bold(),
-                style(name).bold(),
-                style(format!("MCP — {e}")).red(),
+                style("\u{2717}").red().bold(),
+                style(target.name).bold(),
+                style(format!("MCP \u{2014} {e}")).red(),
             ),
         }
 
-        // 2. Optional rule files
-        if matches!(mcp_result, Ok(AgentOutcome::Installed)) {
-            if let Some((scope, method)) = rule_config {
-                let target = skill_agent.target_path(scope, &home_path);
-                match skills::install_skill(skill_agent, scope, method, &home_path) {
+        if matches!(
+            mcp_result,
+            Ok(AgentOutcome::Installed) | Ok(AgentOutcome::Guided)
+        ) {
+            if let Some(skill_agent) = rule_agent_for_scope(target, rule_scope) {
+                let rule_target = skill_agent.target_path(rule_scope, &home_path);
+                match skills::install_skill(skill_agent, rule_scope, rule_method, &home_path) {
                     Ok(status) => {
                         eprintln!(
                             "  {}  {}",
-                            style("✓").green().bold(),
-                            style(format_rule_install_status_line(name, status, &target)).dim(),
+                            style("\u{2713}").green().bold(),
+                            style(format_rule_install_status_line(
+                                target.name,
+                                status,
+                                &rule_target
+                            ))
+                            .dim(),
                         );
                         eprintln!(
                             "      {}",
-                            style(skills::install_source_description(method, &home_path)).dim(),
+                            style(skills::install_source_description(rule_method, &home_path))
+                                .dim(),
                         );
                     }
                     Err(e) => eprintln!(
                         "  {}  {}  {}",
-                        style("✗").red().bold(),
-                        style(name).bold(),
-                        style(format!("rules — {e}")).red(),
+                        style("\u{2717}").red().bold(),
+                        style(target.name).bold(),
+                        style(format!("rules \u{2014} {e}")).red(),
                     ),
                 }
+            } else {
+                eprintln!(
+                    "  {}  {}  {}",
+                    style("i").cyan().bold(),
+                    style(target.name).bold(),
+                    style("rules skipped \u{2014} no verified rule-file target for this scope")
+                        .dim(),
+                );
             }
+        }
+    }
+
+    // Loop skill targets: install skill file only (no MCP registration).
+    for idx in skill_selections {
+        let st = &AGENT_SKILL_TARGETS[idx];
+        if !st.scope_support.supports(rule_scope) {
+            eprintln!(
+                "  {}  {} \u{2014} skill target does not support this scope",
+                style("i").cyan().bold(),
+                st.name,
+            );
+            continue;
+        }
+        match skills::install_skill_to_dir(st.skills_dir, rule_scope, rule_method, &home_path) {
+            Ok(status) => {
+                let status_label = match status {
+                    skills::InstallStatus::Written => "installed",
+                    skills::InstallStatus::PreservedExisting => "preserved existing",
+                };
+                eprintln!(
+                    "  {}  {} \u{2192} {}/marrow-optimization.md ({})",
+                    style("\u{2713}").green().bold(),
+                    st.name,
+                    st.skills_dir,
+                    status_label,
+                );
+            }
+            Err(e) => eprintln!(
+                "  {}  {} \u{2014} {}",
+                style("\u{2717}").red().bold(),
+                st.name,
+                e,
+            ),
         }
     }
 
@@ -4886,16 +7287,24 @@ pub fn run_integrate_command(workspace_root: &Path) -> Result<()> {
     use dialoguer::{theme::ColorfulTheme, MultiSelect, Select};
 
     // ── Phase 1: Agent Selection ──────────────────────────────────────────────
-    let agent_labels = &[
-        "Cursor    (.cursorrules)",
-        "Windsurf  (.windsurfrules)",
-        "Cline     (.clinerules)",
-        "Copilot MCP (.vscode/mcp.json)",
-    ];
+    let workspace_targets = workspace_rule_targets();
+    let mut agent_labels: Vec<String> = workspace_targets
+        .iter()
+        .map(|target| {
+            format!(
+                "{} ({})",
+                target.name,
+                target.workspace_rule_files.join(", ")
+            )
+        })
+        .collect();
+    let copilot_index = agent_labels.len();
+    agent_labels.push("Copilot MCP (.vscode/mcp.json)".to_string());
+    let defaults = vec![true; agent_labels.len()];
     let selected_agents = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt("Which agents do you want to integrate with?")
-        .items(agent_labels)
-        .defaults(&[true, true, true, true])
+        .items(&agent_labels)
+        .defaults(&defaults)
         .interact()?;
 
     if selected_agents.is_empty() {
@@ -4907,8 +7316,8 @@ pub fn run_integrate_command(workspace_root: &Path) -> Result<()> {
     }
 
     // ── Phase 2: Rule Strictness ──────────────────────────────────────────────
-    // Only prompt when at least one markdown-rule agent (Cursor/Windsurf/Cline) is selected.
-    let has_rule_agents = selected_agents.iter().any(|&i| i < 3);
+    // Only prompt when at least one registry-backed workspace rule target is selected.
+    let has_rule_agents = selected_agents.iter().any(|&i| i < workspace_targets.len());
     let rules_content: &str = if has_rule_agents {
         let strictness_options = &[
             "Strict  (Forces the agent to use Marrow's Omni-Tool exclusively)",
@@ -4949,13 +7358,17 @@ pub fn run_integrate_command(workspace_root: &Path) -> Result<()> {
     eprintln!();
     let mut summary: Vec<String> = Vec::new();
 
-    // Rule files for markdown-based agents (indices 0, 1, 2).
-    let rule_agent_indices: Vec<usize> =
-        selected_agents.iter().copied().filter(|&i| i < 3).collect();
-    if !rule_agent_indices.is_empty() {
-        match write_workspace_rules(
+    // Rule files for registry-backed workspace targets.
+    let selected_rule_files: Vec<&str> = selected_agents
+        .iter()
+        .copied()
+        .filter_map(|i| workspace_targets.get(i))
+        .flat_map(|target| target.workspace_rule_files.iter().copied())
+        .collect();
+    if !selected_rule_files.is_empty() {
+        match write_workspace_rule_files(
             workspace_root,
-            &rule_agent_indices,
+            &selected_rule_files,
             rules_content,
             write_mode,
         ) {
@@ -4964,8 +7377,8 @@ pub fn run_integrate_command(workspace_root: &Path) -> Result<()> {
         }
     }
 
-    // Copilot MCP config (index 3).
-    if selected_agents.contains(&3) {
+    // Copilot MCP config.
+    if selected_agents.contains(&copilot_index) {
         match write_vscode_mcp_config(workspace_root, write_mode) {
             Ok(Some(path)) => summary.push(path),
             Ok(None) => {}
@@ -5178,14 +7591,14 @@ fn cmd_interactive() -> Result<()> {
     println!("{}", style("  AST Context Engine for AI Agents\n").cyan());
 
     let items = [
-        "1. Integrate Agents   (Generate rules & Copilot config)",
+        "1. Integrate Agents   (Configure MCP + rules)",
         "2. Index Workspace    (Build the AST graph once)",
         #[cfg(feature = "desktop")]
-            "3. Desktop App        (Open native dashboard window)",
+        "3. Desktop App        (Open native dashboard window)",
         #[cfg(feature = "desktop")]
-            "4. Exit",
+        "4. Exit",
         #[cfg(not(feature = "desktop"))]
-            "3. Exit",
+        "3. Exit",
     ];
 
     let selection = Select::with_theme(&ColorfulTheme::default())
@@ -5197,10 +7610,10 @@ fn cmd_interactive() -> Result<()> {
     let workspace_root = current_workspace_root();
 
     match selection {
-        0 => run_integrate_command(&workspace_root)?,
+        0 => cmd_integrate(&[])?,
         1 => run_index_command(&workspace_root)?,
         #[cfg(feature = "desktop")]
-            2 => cmd_desktop_submenu()?,
+        2 => cmd_desktop_submenu()?,
         _ => eprintln!("{}", style("Goodbye.").dim()),
     }
 
@@ -5365,7 +7778,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
             );
             return Ok(());
         }
-        Some("integrate") => return cmd_integrate(),
+        Some("integrate") => return cmd_integrate(&args[2..]),
         Some("validate") => return cmd_validate(),
         Some("benchmark") => {
             let mut tail: Vec<String> = args.iter().skip(2).cloned().collect();

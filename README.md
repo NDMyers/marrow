@@ -42,6 +42,16 @@ cargo run -- maintenance            # WAL checkpoint + incremental_vacuum on gra
 cargo run -- test-capsules        # capsule validation
 ```
 
+## Integration Targets
+
+`marrow integrate` uses an internal registry of setup-facing MCP targets. Verified automatic config writers are limited to Claude Code, Antigravity, Cursor, GitHub Copilot, Cline, and Zed. Those writers preserve the current supported JSON paths and merge formats.
+
+First-class guided targets are listed by the installer but do not receive speculative config writes: Windsurf, Continue, Roo Code, Goose, OpenHands, OpenClaw, Codex CLI, Gemini CLI, JetBrains AI Assistant, JetBrains Junie, and LM Studio. OpenClaw is treated as a first-class self-hosted MCP host; until a stable config path and merge format are verified, Marrow prints setup guidance instead of creating hidden IDE or YAML/TOML files.
+
+Secondary guided targets are Kilo Code, Sourcegraph Amp, and Augment Code. They are surfaced as configuration guidance targets, not as fully automated integrations.
+
+Compatibility-only model/runtime backends are not `marrow integrate` destinations: Ollama, llama.cpp, vLLM, SGLang, LiteLLM, Ramalama, and Docker Model Runner. Use them behind an MCP-capable agent, client, or host that launches `marrow mcp`.
+
 **Checks (optional):**
 
 ```bash
