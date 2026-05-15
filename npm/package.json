@@ -23,7 +23,7 @@
     "postinstall": "node scripts/install.js"
   },
   "dependencies": {
-    "axios": "^1.13.6",
+    "axios": "^1.16.1",
     "tar": "^7.5.9"
   },
   "engines": {
