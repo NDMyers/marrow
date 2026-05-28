@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, alpha]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout — first-party, pinned to v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # dtolnay/rust-toolchain — first-party Rust ecosystem, uses branch refs by design.
+      # Exception: This action uses branch-based refs (stable/nightly) intentionally;
+      # SHA pinning would break automatic toolchain updates.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo test
+      - run: cargo clippy -- -D warnings
+
+  packaging-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Validate packaging metadata and scripts
+        run: |
+          set -euo pipefail
+          grep -q '^maintainer-scripts = "scripts"$' Cargo.toml
+          grep -q '"/usr/share/applications/marrow.desktop"' Cargo.toml
+          grep -q '"/usr/share/icons/hicolor/256x256/apps/marrow.png"' Cargo.toml
+          test -f scripts/postinst
+          bash -n scripts/postinst scripts/deb-postinst.sh scripts/stage-linux-package-assets.sh scripts/package-linux-appimage.sh scripts/package-macos-dmg.sh
+      - name: Stage Linux package assets
+        run: |
+          set -euo pipefail
+          chmod +x scripts/stage-linux-package-assets.sh
+          cargo build --release --target x86_64-unknown-linux-gnu
+          scripts/stage-linux-package-assets.sh \
+            --target x86_64-unknown-linux-gnu \
+            --bin target/x86_64-unknown-linux-gnu/release/marrow \
+            --out-dir target/package-assets/linux
+          test -f target/package-assets/linux/marrow.desktop
+          test -f target/package-assets/linux/marrow.png
+
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # rustsec/audit-check — official RustSec advisory-db integration, pinned to v2.0.0
+      - uses: rustsec/audit-check@057f4c4d04f8cb2e15c54c41a03a5a01e84e3b52 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: npm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # actions/setup-node — first-party, pinned to v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+      - run: npm ci --ignore-scripts
+      - run: npm audit --omit=dev --audit-level=moderate
+
+  perf-smoke:
+    runs-on: ubuntu-latest
+    needs: rust
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: perf-harness synthetic fixture + thresholds
+        run: |
+          set -euo pipefail
+          FIX=$(mktemp -d)
+          trap 'rm -rf "$FIX"' EXIT
+          printf '%s\n' 'def helper():' '    pass' > "$FIX/lib.py"
+          printf '%s\n' 'def main():' '    helper()' > "$FIX/caller.py"
+          ./target/release/marrow perf-harness --root "$FIX" --repo-id ci-smoke --fresh --json > "$FIX/out.json"
+          export HJSON="$FIX/out.json"
+          python3 -c "import json, pathlib, os, sys; h=json.load(open(os.environ['HJSON'])); t=json.load(open('ci/perf-thresholds.json')); ing=h.get('ingest_wall_ms'); q=h.get('query_wall_ms'); \
+          assert ing is not None and q is not None, h; \
+          assert ing <= t['ingest_wall_ms_max'], (ing, t['ingest_wall_ms_max']); \
+          assert q <= t['query_wall_ms_max'], (q, t['query_wall_ms_max']); \
+          print('perf-smoke ok ingest_ms=', ing, 'query_ms=', q)"

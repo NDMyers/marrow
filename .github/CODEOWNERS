@@ -1,0 +1,15 @@
+# Security-critical paths require NDMyers approval
+
+# Core ingestion and retrieval logic
+/src/ingestion.rs @NDMyers
+/src/retrieval.rs @NDMyers
+
+# Daemon and IPC layer
+/src/daemon/ @NDMyers
+/src/ipc.rs @NDMyers
+
+# NPM installer and distribution
+/npm/ @NDMyers
+
+# CI/CD workflows
+/.github/workflows/ @NDMyers

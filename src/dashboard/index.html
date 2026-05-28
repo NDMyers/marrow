@@ -1,0 +1,4129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Marrow · Context Engine</title>
+  <style>
+    /* ── Reset & base ──────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    :root {
+      --bg:          #2c3438;
+      --surface:     #f7f0e7;
+      --border:      #6a7678;
+      --border-hi:   #a2acab;
+      --green:       #329f7d;
+      --green-glow:  rgba(50, 159, 125, 0.22);
+      --cyan:        #7468bf;
+      --cyan-glow:   rgba(116, 104, 191, 0.22);
+      --amber:       #bf7d2d;
+      --indigo:      #7468bf;
+      --dim:         #69787a;
+      --text:        #1d2326;
+      --font:        "Avenir Next", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    html, body {
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    /* Specimen field overlay */
+    body::after {
+      content: '';
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 9999;
+      background: repeating-linear-gradient(
+        to bottom,
+        transparent,
+        transparent 2px,
+        rgba(104, 114, 115, 0.06) 2px,
+        rgba(104, 114, 115, 0.06) 4px
+      );
+    }
+
+    /* ── Layout shell ──────────────────────────────────────────────────────── */
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Header ────────────────────────────────────────────────────────────── */
+    #header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    #header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    #logo {
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--green);
+      text-shadow: 0 0 8px var(--green-glow);
+      letter-spacing: 0;
+    }
+
+    #tagline {
+      color: var(--dim);
+      font-size: 11px;
+      letter-spacing: 0;
+    }
+
+    #status-area {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--dim);
+    }
+
+    #status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--specimen-amber);
+      flex-shrink: 0;
+    }
+
+    #status-dot.live {
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green-glow);
+      animation: pulse-dot 2s ease-in-out infinite;
+    }
+
+    #status-dot.error {
+      background: var(--specimen-danger);
+      box-shadow: 0 0 0 4px rgba(173, 85, 75, 0.12);
+    }
+
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; box-shadow: 0 0 6px var(--green-glow); }
+      50%       { opacity: 0.6; box-shadow: 0 0 12px var(--green); }
+    }
+
+    /* ── Tab bar ───────────────────────────────────────────────────────────── */
+    #tabs {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 20px;
+      display: flex;
+      gap: 0;
+      flex-shrink: 0;
+    }
+
+    .tab-btn {
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--dim);
+      font-family: var(--font);
+      font-size: 11px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      padding: 8px 16px 6px;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+    }
+
+    .tab-btn:hover {
+      color: var(--text);
+    }
+
+    .tab-btn.active {
+      color: var(--green);
+      text-shadow: 0 0 8px var(--green-glow);
+      border-bottom-color: var(--green);
+    }
+
+    /* ── Panels container ──────────────────────────────────────────────────── */
+    #panels {
+      flex: 1;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .panel {
+      display: none;
+      flex-direction: column;
+      flex: 1;
+      overflow-x: hidden;
+      overflow-y: auto;
+      padding: 16px 20px 0;
+    }
+
+    .panel.active {
+      display: flex;
+    }
+
+    /* ── Stat cards ────────────────────────────────────────────────────────── */
+    .cards-row {
+      display: flex;
+      gap: 12px;
+      flex-shrink: 0;
+      margin-bottom: 14px;
+    }
+
+    .card {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 12px 16px;
+      min-width: 0;
+    }
+
+    .card-label {
+      font-size: 10px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      color: var(--dim);
+      margin-bottom: 4px;
+    }
+
+    .card-value {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--specimen-ink);
+      text-shadow: 0 0 8px var(--green-glow);
+      line-height: 1.1;
+    }
+
+    .card-value.cyan {
+      color: var(--specimen-mint);
+      text-shadow: 0 0 8px var(--cyan-glow);
+    }
+
+    .card-value.amber {
+      color: var(--specimen-danger);
+      text-shadow: none;
+    }
+
+    .card-sub {
+      font-size: 10px;
+      color: var(--dim);
+      margin-top: 2px;
+    }
+
+    /* ── Table section ─────────────────────────────────────────────────────── */
+    .table-wrap {
+      flex: 1 0 120px;
+      min-height: 120px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--surface);
+      margin-bottom: 0;
+    }
+
+    .table-wrap::-webkit-scrollbar { width: 6px; }
+    .table-wrap::-webkit-scrollbar-track { background: var(--bg); }
+    .table-wrap::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    thead {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: var(--specimen-surface-subtle);
+    }
+
+    th {
+      padding: 8px 14px;
+      font-size: 10px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      color: var(--dim);
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    th:last-child { text-align: right; }
+    th.col-pct    { text-align: center; min-width: 160px; }
+    th.col-ts     { text-align: right; min-width: 72px; }
+
+    td {
+      padding: 7px 14px;
+      border-bottom: 1px solid rgba(213, 202, 185, 0.72);
+      vertical-align: middle;
+    }
+
+    tr:last-child td { border-bottom: none; }
+
+    tr.row-new {
+      animation: slide-in 0.35s ease-out forwards;
+    }
+
+    @keyframes slide-in {
+      from {
+        opacity: 0;
+        transform: translateY(-10px);
+        background: rgba(47, 155, 120, 0.12);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+        background: transparent;
+      }
+    }
+
+    /* ── Tool badges ────────────────────────────────────────────────────────── */
+    .badge {
+      display: inline-block;
+      font-size: 9px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      padding: 1px 6px;
+      border-radius: 3px;
+      margin-right: 6px;
+      font-weight: 700;
+      vertical-align: middle;
+    }
+
+    .badge-capsule {
+      background: var(--specimen-mint-soft);
+      color: var(--green);
+      border: 1px solid rgba(47, 155, 120, 0.34);
+    }
+
+    .badge-index {
+      background: var(--specimen-violet-soft);
+      color: var(--cyan);
+      border: 1px solid rgba(112, 99, 189, 0.34);
+    }
+
+    .badge-impact {
+      background: var(--specimen-amber-soft);
+      color: var(--amber);
+      border: 1px solid rgba(181, 116, 25, 0.34);
+    }
+
+    .badge-server {
+      background: var(--specimen-steel-soft);
+      color: var(--indigo);
+      border: 1px solid rgba(104, 114, 115, 0.32);
+    }
+
+    .badge-skeleton {
+      background: var(--specimen-violet-soft);
+      color: var(--specimen-violet);
+      border: 1px solid rgba(112, 99, 189, 0.34);
+    }
+
+    /* ── Tool label cell ────────────────────────────────────────────────────── */
+    .tool-label {
+      font-size: 12px;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: visible;
+      text-overflow: clip;
+      max-width: none;
+    }
+
+    .tool-label .sym {
+      color: var(--green);
+      text-shadow: 0 0 6px var(--green-glow);
+    }
+
+    .tool-label .sep {
+      color: var(--dim);
+      margin: 0 2px;
+    }
+
+    .tool-label .repo {
+      color: var(--dim);
+    }
+
+    /* ── Origin cell ────────────────────────────────────────────────────────── */
+    .origin-cell {
+      font-size: 11px;
+      color: var(--dim);
+      white-space: nowrap;
+    }
+
+    /* ── Pct bar cell ───────────────────────────────────────────────────────── */
+    .pct-cell {
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    .pct-bar-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .pct-bar-track {
+      width: 72px;
+      height: 7px;
+      background: var(--specimen-steel-soft);
+      border-radius: 3px;
+      overflow: hidden;
+      display: inline-block;
+      vertical-align: middle;
+    }
+
+    .pct-bar-fill {
+      display: block;
+      height: 100%;
+      width: 0%;
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+
+    .pct-bar-fill.high   { background: var(--green); box-shadow: 0 0 4px var(--green-glow); }
+    .pct-bar-fill.medium { background: var(--amber); }
+    .pct-bar-fill.low    { background: var(--dim); }
+
+    .pct-text {
+      font-size: 11px;
+      min-width: 38px;
+      text-align: right;
+      display: inline-block;
+    }
+
+    .pct-text.high   { color: var(--green); text-shadow: 0 0 6px var(--green-glow); }
+    .pct-text.medium { color: var(--amber); }
+    .pct-text.low    { color: var(--dim); }
+
+    .pct-dash { color: var(--dim); }
+
+    /* ── Timestamp cell ─────────────────────────────────────────────────────── */
+    .ts-cell {
+      font-size: 11px;
+      color: var(--dim);
+      text-align: right;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* ── Empty state ────────────────────────────────────────────────────────── */
+    #empty-row td {
+      text-align: center;
+      color: var(--dim);
+      font-size: 11px;
+      padding: 28px;
+      border: none;
+    }
+
+    /* ── Lifetime panel ─────────────────────────────────────────────────────── */
+    #lifetime-sub {
+      font-size: 11px;
+      color: var(--dim);
+      margin-bottom: 14px;
+      margin-top: -8px;
+    }
+
+    #scope-path {
+      font-size: 11px;
+      color: var(--dim);
+      margin-bottom: 14px;
+    }
+
+    #lifetime-advanced-controls {
+      display: flex;
+      justify-content: flex-start;
+      margin: -2px 0 14px;
+    }
+
+    #lifetime-advanced-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: rgba(22, 30, 37, 0.92);
+      color: var(--surface);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+    }
+
+    #lifetime-advanced-toggle:hover,
+    #lifetime-advanced-toggle[aria-expanded="true"] {
+      color: var(--surface);
+      border-color: var(--border-hi);
+      background: rgba(32, 44, 54, 0.96);
+    }
+
+    #lifetime-advanced-toggle:focus-visible {
+      outline: 1px solid var(--green);
+      outline-offset: 2px;
+    }
+
+    .icon-gear {
+      width: 13px;
+      height: 13px;
+      flex: 0 0 auto;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 1.7;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    #lifetime-advanced {
+      margin-bottom: 14px;
+    }
+
+    #lifetime-advanced[hidden] {
+      display: none;
+    }
+
+    #lifetime-advanced-copy {
+      font-size: 11px;
+      color: var(--dim);
+      margin: 0 0 12px;
+    }
+
+    .inventory-grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .inventory-panel {
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid rgba(216, 225, 236, 0.96);
+      border-radius: var(--specimen-radius);
+      box-shadow: var(--specimen-shadow-tight);
+      overflow: hidden;
+    }
+
+    .inventory-header {
+      align-items: center;
+      background: var(--specimen-surface-subtle);
+      border-bottom: 1px solid rgba(216, 225, 236, 0.96);
+      display: flex;
+      justify-content: space-between;
+      min-height: 40px;
+      padding: 8px 12px;
+    }
+
+    .inventory-title {
+      color: var(--specimen-ink-soft);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.01em;
+    }
+
+    .inventory-body {
+      overflow-x: auto;
+    }
+
+    .inventory-body table {
+      min-width: 760px;
+    }
+
+    .path-cell {
+      color: var(--specimen-muted);
+      font-family: var(--font-data);
+      font-size: 11px;
+      max-width: 340px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .status-pill {
+      border: 1px solid rgba(185, 198, 212, 0.96);
+      border-radius: 999px;
+      color: var(--specimen-ink-soft);
+      display: inline-flex;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 7px;
+    }
+
+    .status-pill.available,
+    .status-pill.active,
+    .status-pill.completed {
+      background: var(--specimen-mint-soft);
+      border-color: rgba(47, 143, 99, 0.34);
+      color: #266f4f;
+    }
+
+    .status-pill.error,
+    .status-pill.corrupt,
+    .status-pill.inaccessible_db {
+      background: var(--specimen-danger-soft);
+      border-color: rgba(191, 91, 74, 0.34);
+      color: #8a3f34;
+    }
+
+    .action-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+
+    .action-btn {
+      background: rgba(255, 255, 255, 0.96);
+      border: 1px solid rgba(185, 198, 212, 0.96);
+      border-radius: var(--specimen-radius-sm);
+      color: var(--specimen-ink-soft);
+      cursor: pointer;
+      font-family: var(--font-ui);
+      font-size: 10px;
+      font-weight: 800;
+      min-height: 28px;
+      padding: 4px 8px;
+    }
+
+    .action-btn:hover {
+      background: var(--specimen-tissue-soft);
+      border-color: rgba(61, 111, 224, 0.34);
+      color: var(--specimen-tissue-ink);
+    }
+
+    .action-btn.danger:hover {
+      background: var(--specimen-danger-soft);
+      border-color: rgba(191, 91, 74, 0.36);
+      color: #8a3f34;
+    }
+
+    /* ── Privacy footer ─────────────────────────────────────────────────────── */
+    #privacy {
+      flex-shrink: 0;
+      text-align: center;
+      font-size: 10px;
+      color: var(--specimen-muted);
+      letter-spacing: 0;
+      border-top: 1px solid var(--border);
+      padding: 8px 0;
+      background: var(--bg);
+    }
+
+    /* ── View Delta button ──────────────────────────────────────────────────── */
+    .view-delta-btn {
+      position: relative;
+      z-index: 1;
+      background: none;
+      border: 1px solid var(--specimen-border-strong);
+      color: var(--dim);
+      font-family: var(--font);
+      font-size: 9px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      padding: 1px 5px;
+      border-radius: 3px;
+      cursor: pointer;
+      margin-left: 8px;
+      scroll-margin-top: 44px;
+      vertical-align: middle;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .view-delta-btn:hover {
+      color: var(--green);
+      border-color: var(--green);
+      text-shadow: 0 0 6px var(--green-glow);
+    }
+
+    .evidence-tag {
+      display: inline-flex;
+      align-items: center;
+      margin-left: 8px;
+      padding: 2px 6px;
+      border: 1px solid rgba(128, 148, 168, 0.35);
+      border-radius: 4px;
+      color: var(--dim);
+      font-size: 10px;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+
+    /* ── Compare Modal ──────────────────────────────────────────────────────── */
+    #compare-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(40, 38, 34, 0.45);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+    }
+    #compare-overlay.open {
+      display: flex;
+    }
+
+    #compare-modal {
+      background: var(--surface);
+      border: 1px solid var(--border-hi);
+      border-radius: 4px;
+      width: 90vw;
+      max-width: 1200px;
+      height: 80vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 24px 70px rgba(55, 46, 35, 0.22);
+    }
+
+    #compare-header {
+      flex-shrink: 0;
+      background: var(--specimen-surface-subtle);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    #compare-title {
+      font-size: 11px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      color: var(--green);
+      text-shadow: 0 0 8px var(--green-glow);
+    }
+
+    #compare-close {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--dim);
+      font-family: var(--font);
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      letter-spacing: 0;
+    }
+    #compare-close:hover { color: var(--text); border-color: var(--border-hi); }
+
+    #compare-banner {
+      flex-shrink: 0;
+      background: var(--specimen-mint-soft);
+      border-bottom: 1px solid rgba(47, 155, 120, 0.28);
+      padding: 6px 16px;
+      font-size: 11px;
+      color: var(--green);
+      letter-spacing: 0;
+      text-align: center;
+      min-height: 30px;
+    }
+
+    #compare-panes {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      overflow: hidden;
+      gap: 0;
+    }
+
+    .compare-pane {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      border-right: 1px solid var(--border);
+    }
+    .compare-pane:last-child { border-right: none; }
+
+    .compare-pane-header {
+      flex-shrink: 0;
+      background: var(--specimen-surface-subtle);
+      border-bottom: 1px solid var(--border);
+      padding: 6px 14px;
+      font-size: 10px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .compare-pane-header .pane-label { color: var(--dim); }
+    .compare-pane-header .pane-chars { color: var(--amber); font-variant-numeric: tabular-nums; }
+
+    .compare-pane-body {
+      flex: 1;
+      overflow: auto;
+      padding: 0;
+    }
+    .compare-pane-body::-webkit-scrollbar { width: 6px; height: 6px; }
+    .compare-pane-body::-webkit-scrollbar-track { background: var(--bg); }
+    .compare-pane-body::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+    .compare-pane-body pre {
+      margin: 0;
+      padding: 12px 14px;
+      font-family: var(--font);
+      font-size: 11px;
+      line-height: 1.55;
+      color: var(--text);
+      white-space: pre;
+      tab-size: 4;
+    }
+
+    #compare-loading {
+      color: var(--dim);
+      font-size: 11px;
+      letter-spacing: 0;
+      padding: 20px 16px;
+      text-align: center;
+    }
+
+    /* ── Tree Visualization Panel ─────────────────────────────────────────────── */
+    #panel-tree { padding: 0; }
+
+    #tree-toolbar {
+      flex-shrink: 0;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .tree-label {
+      font-size: 10px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      color: var(--dim);
+      flex-shrink: 0;
+    }
+
+    /* Custom Workspace Selector */
+    #tree-repo-select {
+      display: none;
+    }
+
+    .workspace-selector {
+      position: relative;
+      min-width: 220px;
+    }
+
+    .workspace-selector-btn {
+      background: var(--bg);
+      border: 1px solid var(--border-hi);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 11px;
+      padding: 6px 10px;
+      border-radius: 3px;
+      cursor: pointer;
+      outline: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      width: 100%;
+      text-align: left;
+      transition: border-color 0.15s ease;
+    }
+    .workspace-selector-btn:hover { border-color: var(--border-hi); background: rgba(106, 118, 120, 0.05); }
+    .workspace-selector-btn:focus { border-color: var(--green); }
+    .workspace-selector-btn[aria-expanded="true"] { border-color: var(--green); }
+
+    .workspace-selector-label {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .workspace-selector-label.empty { color: var(--dim); }
+
+    .workspace-selector-count {
+      color: var(--dim);
+      font-size: 10px;
+      flex-shrink: 0;
+    }
+
+    .workspace-selector-arrow {
+      color: var(--dim);
+      font-size: 9px;
+      flex-shrink: 0;
+      transition: transform 0.15s ease;
+    }
+    .workspace-selector-btn[aria-expanded="true"] .workspace-selector-arrow { transform: rotate(180deg); }
+
+    .workspace-selector-dropdown {
+      position: absolute;
+      top: calc(100% + 4px);
+      left: 0;
+      right: 0;
+      background: var(--surface);
+      border: 1px solid var(--border-hi);
+      border-radius: 3px;
+      box-shadow: 0 4px 12px rgba(29, 35, 38, 0.15);
+      max-height: 280px;
+      overflow-y: auto;
+      z-index: 100;
+      display: none;
+    }
+    .workspace-selector-dropdown.open { display: block; }
+    .workspace-selector-dropdown::-webkit-scrollbar { width: 6px; }
+    .workspace-selector-dropdown::-webkit-scrollbar-track { background: var(--bg); }
+    .workspace-selector-dropdown::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+    .workspace-selector-option {
+      padding: 7px 10px;
+      cursor: pointer;
+      font-size: 11px;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      border-bottom: 1px solid rgba(106, 118, 120, 0.12);
+    }
+    .workspace-selector-option:last-child { border-bottom: none; }
+    .workspace-selector-option:hover { background: rgba(50, 159, 125, 0.08); }
+    .workspace-selector-option.focused { background: rgba(50, 159, 125, 0.12); }
+    .workspace-selector-option.selected { color: var(--green); font-weight: 600; }
+
+    .workspace-selector-option-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .workspace-selector-option-count {
+      color: var(--dim);
+      font-size: 10px;
+      flex-shrink: 0;
+    }
+
+    .workspace-selector-empty {
+      padding: 16px 10px;
+      text-align: center;
+      color: var(--dim);
+      font-size: 10px;
+      letter-spacing: 0;
+    }
+
+    #tree-info {
+      flex: 1;
+      font-size: 10px;
+      color: var(--dim);
+      letter-spacing: 0;
+    }
+
+    #tree-reset-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--dim);
+      font-family: var(--font);
+      font-size: 9px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      padding: 3px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    #tree-reset-btn:hover { color: var(--text); border-color: var(--border-hi); }
+
+    #tree-body {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    #tree-sidebar {
+      width: 220px;
+      flex-shrink: 0;
+      border-right: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #tree-search-wrap {
+      flex-shrink: 0;
+      padding: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    #tree-search {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 11px;
+      padding: 5px 8px;
+      border-radius: 3px;
+      outline: none;
+    }
+    #tree-search:focus { border-color: var(--border-hi); }
+    #tree-search::placeholder { color: var(--dim); }
+
+    #tree-dir-tree {
+      flex: 1;
+      overflow-y: auto;
+      padding: 4px 0;
+    }
+    #tree-dir-tree::-webkit-scrollbar { width: 4px; }
+    #tree-dir-tree::-webkit-scrollbar-track { background: var(--bg); }
+    #tree-dir-tree::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
+
+    .dir-item {
+      display: flex;
+      align-items: center;
+      padding: 2px 6px 2px 0;
+      cursor: pointer;
+      user-select: none;
+      font-size: 11px;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    .dir-item:hover { background: rgba(190, 95, 123, 0.1); }
+    .dir-item.dir-active { color: var(--green); }
+    .dir-item.dir-dir { color: var(--dim); }
+    .dir-item-indent { flex-shrink: 0; display: inline-block; }
+    .dir-item-icon { flex-shrink: 0; font-size: 10px; color: var(--dim); margin-right: 4px; }
+    .dir-item-name { overflow: hidden; text-overflow: ellipsis; }
+
+    #tree-legend {
+      flex-shrink: 0;
+      border-top: 1px solid var(--border);
+      padding: 6px 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 9px;
+      color: var(--dim);
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+    .legend-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+
+    #tree-canvas-wrap {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+      background: var(--bg);
+      min-width: 0;
+    }
+
+    #tree-svg-container {
+      position: absolute;
+      inset: 0;
+    }
+    #tree-svg-container canvas {
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+      display: block;
+    }
+    #tree-svg-container canvas:active { cursor: grabbing; }
+
+    #tree-tooltip {
+      position: absolute;
+      display: none;
+      background: var(--surface);
+      border: 1px solid var(--border-hi);
+      border-radius: 3px;
+      padding: 7px 10px;
+      font-size: 11px;
+      color: var(--text);
+      pointer-events: none;
+      z-index: 100;
+      max-width: 300px;
+      box-shadow: 0 14px 36px rgba(55, 46, 35, 0.2);
+    }
+    .tt-sym  { color: var(--green); font-weight: 700; display: block; margin-bottom: 3px; }
+    .tt-type { color: var(--dim); font-size: 9px; text-transform: uppercase; letter-spacing: 0; display: block; margin-bottom: 2px; }
+    .tt-file { color: var(--dim); font-size: 10px; display: block; word-break: break-all; }
+    .tt-deg  { color: var(--amber); font-size: 9px; display: block; margin-top: 3px; }
+
+    #tree-empty, #tree-loading {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+    }
+    #tree-empty-inner {
+      text-align: center;
+    }
+    #tree-empty-title {
+      font-size: 10px;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      color: var(--dim);
+      margin-bottom: 8px;
+    }
+    #tree-empty-sub { color: var(--specimen-muted); font-size: 12px; }
+    #tree-loading {
+      color: var(--dim);
+      font-size: 11px;
+      letter-spacing: 0;
+      flex-direction: column;
+      gap: 10px;
+      text-align: center;
+      padding: 16px;
+    }
+    #tree-loading-phase {
+      color: var(--green);
+      text-transform: uppercase;
+      text-shadow: 0 0 8px var(--green-glow);
+    }
+    #tree-loading-detail {
+      color: var(--dim);
+      font-size: 10px;
+      max-width: min(460px, 80vw);
+      overflow-wrap: anywhere;
+    }
+    #tree-loading-track {
+      width: min(320px, 70vw);
+      height: 3px;
+      background: var(--specimen-steel-soft);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    #tree-loading-bar {
+      display: block;
+      width: 12%;
+      height: 100%;
+      background: var(--green);
+      box-shadow: 0 0 10px var(--green-glow);
+      transition: width 0.18s ease;
+    }
+
+    #tree-truncation-banner {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: var(--specimen-amber-soft);
+      border: 1px solid rgba(181, 116, 25, 0.35);
+      border-radius: 3px;
+      padding: 4px 10px;
+      font-size: 9px;
+      letter-spacing: 0;
+      color: var(--amber);
+      pointer-events: none;
+      display: none;
+    }
+
+    #tree-footer {
+      flex-shrink: 0;
+      text-align: center;
+      font-size: 10px;
+      color: var(--specimen-muted);
+      letter-spacing: 0;
+      border-top: 1px solid var(--border);
+      padding: 8px 0;
+      background: var(--bg);
+    }
+
+    /* Calm workspace presentation system */
+    :root {
+      --specimen-bg: #f3f6fb;
+      --specimen-field: #e8edf5;
+      --specimen-surface: #fbfcfe;
+      --specimen-surface-raised: #ffffff;
+      --specimen-surface-subtle: #f4f7fb;
+      --specimen-graph: #edf2f8;
+      --specimen-ink: #172535;
+      --specimen-ink-soft: #314255;
+      --specimen-muted: #64758a;
+      --specimen-faint: #8b99ab;
+      --specimen-border: #d8e1ec;
+      --specimen-border-strong: #b9c6d4;
+      --specimen-graphite: #f7f9fc;
+      --specimen-graphite-2: #eef3f8;
+      --specimen-steel: #5f7285;
+      --specimen-steel-soft: #e7edf5;
+      --specimen-tissue: #3d6fe0;
+      --specimen-tissue-ink: #234ea4;
+      --specimen-tissue-soft: #e4ecff;
+      --specimen-amber: #c0862f;
+      --specimen-amber-soft: #f8ebcd;
+      --specimen-mint: #2f8f63;
+      --specimen-mint-soft: #dff2e8;
+      --specimen-violet: #6279ad;
+      --specimen-violet-soft: #e8edf7;
+      --specimen-danger: #bf5b4a;
+      --specimen-danger-soft: #f6dfda;
+      --specimen-shadow: 0 24px 48px rgba(27, 42, 63, 0.08);
+      --specimen-shadow-tight: 0 10px 24px rgba(27, 42, 63, 0.06);
+      --specimen-radius: 12px;
+      --specimen-radius-sm: 9px;
+      --font-ui: "Avenir Next", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-data: "SFMono-Regular", "Cascadia Mono", "Liberation Mono", Menlo, Consolas, monospace;
+      --focus-ring: 0 0 0 3px rgba(61, 111, 224, 0.18), 0 0 0 1px var(--specimen-tissue);
+      --graph-function: var(--specimen-mint);
+      --graph-method: var(--specimen-amber);
+      --graph-class: #4c74c9;
+      --graph-module: var(--specimen-violet);
+      --graph-default: var(--specimen-steel);
+      --graph-edge-base: #a4b3c2;
+      --graph-node-fill: #ffffff;
+      --graph-label-font: 600 10px "SFMono-Regular", "Cascadia Mono", "Liberation Mono", Menlo, monospace;
+      --graph-cluster-font: 700 10px "Avenir Next", "Segoe UI", system-ui, sans-serif;
+      --graph-hull-steel: #6f8094;
+      --graph-hull-tissue-deep: #234ea4;
+      --graph-hull-blue-steel: #4e84c8;
+      --graph-hull-bronze: #9a7637;
+      --graph-hull-sage: #5b8a72;
+      --graph-hull-danger: #bf5b4a;
+      --graph-hull-slate: #8393a6;
+
+      --bg: var(--specimen-bg);
+      --surface: var(--specimen-surface);
+      --border: var(--specimen-border);
+      --border-hi: var(--specimen-border-strong);
+      --green: var(--specimen-mint);
+      --green-glow: rgba(47, 143, 99, 0.18);
+      --cyan: var(--specimen-violet);
+      --cyan-glow: rgba(98, 121, 173, 0.18);
+      --amber: var(--specimen-amber);
+      --indigo: var(--specimen-tissue);
+      --dim: var(--specimen-muted);
+      --text: var(--specimen-ink);
+      --font: var(--font-ui);
+    }
+
+    html, body {
+      background: var(--specimen-bg);
+      color: var(--specimen-ink);
+      font-family: var(--font-ui);
+      font-size: 14px;
+    }
+
+    body::after { display: none; }
+
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(circle at top left, rgba(90, 130, 196, 0.12), transparent 34%),
+        radial-gradient(circle at bottom right, rgba(47, 143, 99, 0.08), transparent 28%),
+        linear-gradient(180deg, #f7f9fc 0%, var(--specimen-bg) 42%, #eef3f8 100%);
+      z-index: 0;
+    }
+
+    #app {
+      position: relative;
+      z-index: 1;
+      background: transparent;
+    }
+
+    #header {
+      background: rgba(255, 255, 255, 0.88);
+      border-bottom: 1px solid rgba(216, 225, 236, 0.94);
+      backdrop-filter: blur(14px);
+      box-shadow: 0 1px 0 rgba(255, 255, 255, 0.8);
+      gap: 16px;
+      padding: 16px 24px;
+    }
+
+    #header-left {
+      gap: 14px;
+      min-width: 0;
+    }
+
+    #logo {
+      color: var(--specimen-ink);
+      font-family: var(--font-ui);
+      font-size: 18px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-shadow: none;
+      white-space: nowrap;
+    }
+
+    #tagline {
+      color: var(--specimen-muted);
+      font-size: 12px;
+      letter-spacing: 0.01em;
+      overflow-wrap: anywhere;
+    }
+
+    #status-area {
+      background: rgba(244, 247, 251, 0.96);
+      border: 1px solid rgba(216, 225, 236, 0.94);
+      border-radius: 999px;
+      color: var(--specimen-muted);
+      font-size: 12px;
+      font-weight: 600;
+      min-height: 34px;
+      padding: 5px 12px;
+    }
+
+    #status-dot {
+      background: var(--specimen-amber);
+      border: 1px solid rgba(255, 255, 255, 0.96);
+      box-shadow: 0 0 0 3px rgba(192, 134, 47, 0.14);
+    }
+
+    #status-dot.live {
+      background: var(--specimen-mint);
+      box-shadow: 0 0 0 4px rgba(47, 143, 99, 0.12);
+      animation: pulse-dot 2.2s ease-in-out infinite;
+    }
+
+    #status-dot.error {
+      background: var(--specimen-danger);
+      box-shadow: 0 0 0 4px rgba(191, 91, 74, 0.12);
+    }
+
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.62; transform: scale(0.88); }
+    }
+
+    #tabs {
+      background: rgba(255, 255, 255, 0.72);
+      border-bottom: 1px solid rgba(216, 225, 236, 0.9);
+      padding: 0 24px;
+      gap: 8px;
+    }
+
+    .tab-btn {
+      color: var(--specimen-muted);
+      font-family: var(--font-ui);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      text-transform: none;
+      min-height: 46px;
+      padding: 14px 2px 12px;
+      transition: color 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+    }
+
+    .tab-btn:hover {
+      background: transparent;
+      color: var(--specimen-ink-soft);
+    }
+
+    .tab-btn.active {
+      color: var(--specimen-ink);
+      text-shadow: none;
+      border-bottom-color: rgba(61, 111, 224, 0.42);
+      background: transparent;
+    }
+
+    button:focus-visible,
+    select:focus-visible,
+    input:focus-visible,
+    .tab-btn:focus-visible {
+      outline: none;
+      box-shadow: var(--focus-ring);
+    }
+
+    .panel {
+      background: transparent;
+      gap: 16px;
+      overflow: auto;
+      padding: 20px 24px 0;
+    }
+
+    #panel-tree {
+      background: transparent;
+      overflow: hidden;
+    }
+
+    .cards-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(154px, 1fr));
+      gap: 14px;
+      margin-bottom: 0;
+    }
+
+    .card {
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid rgba(216, 225, 236, 0.96);
+      border-radius: var(--specimen-radius);
+      box-shadow: var(--specimen-shadow-tight);
+      min-height: 88px;
+      padding: 14px 16px;
+    }
+
+    .card-label,
+    th,
+    .tree-label,
+    .compare-pane-header,
+    #compare-title,
+    #tree-empty-title,
+    #tree-loading-phase,
+    .legend-item,
+    .badge {
+      font-family: var(--font-ui);
+      letter-spacing: 0.01em;
+      text-transform: none;
+    }
+
+    .card-label {
+      color: var(--specimen-muted);
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .card-value {
+      color: var(--specimen-ink);
+      font-family: var(--font-ui);
+      font-size: clamp(20px, 1.9vw, 25px);
+      font-variant-numeric: tabular-nums;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      text-shadow: none;
+    }
+
+    .card-value.cyan {
+      color: var(--specimen-mint);
+      text-shadow: none;
+    }
+
+    .card-value.amber {
+      color: var(--specimen-danger);
+      text-shadow: none;
+    }
+
+    .card-sub,
+    #lifetime-sub,
+    #scope-path,
+    .origin-cell,
+    .ts-cell,
+    .repo-path-cell,
+    .pct-dash {
+      color: var(--specimen-muted);
+    }
+
+    .table-wrap {
+      background: rgba(255, 255, 255, 0.95);
+      border: 1px solid rgba(216, 225, 236, 0.96);
+      border-radius: var(--specimen-radius);
+      box-shadow: var(--specimen-shadow-tight);
+      overflow: auto;
+    }
+
+    .table-wrap::-webkit-scrollbar,
+    .compare-pane-body::-webkit-scrollbar,
+    #tree-dir-tree::-webkit-scrollbar { width: 8px; height: 8px; }
+    .table-wrap::-webkit-scrollbar-track,
+    .compare-pane-body::-webkit-scrollbar-track,
+    #tree-dir-tree::-webkit-scrollbar-track { background: var(--specimen-surface-subtle); }
+    .table-wrap::-webkit-scrollbar-thumb,
+    .compare-pane-body::-webkit-scrollbar-thumb,
+    #tree-dir-tree::-webkit-scrollbar-thumb { background: #c2ccda; border-radius: 999px; }
+
+    table {
+      min-width: 720px;
+    }
+
+    thead,
+    #compare-header,
+    .compare-pane-header {
+      background: var(--specimen-surface-subtle);
+    }
+
+    th {
+      color: var(--specimen-muted);
+      font-size: 11px;
+      font-weight: 700;
+      border-bottom: 1px solid rgba(216, 225, 236, 0.96);
+    }
+
+    td {
+      border-bottom: 1px solid rgba(228, 235, 243, 0.9);
+      color: var(--specimen-ink-soft);
+    }
+
+    tbody tr { background: transparent; }
+
+    tr.row-new { animation: slide-in 0.28s ease-out forwards; }
+
+    @keyframes slide-in {
+      from { opacity: 0; transform: translateY(-6px); background: rgba(61, 111, 224, 0.08); }
+      to { opacity: 1; transform: translateY(0); background: transparent; }
+    }
+
+    .badge {
+      background: rgba(244, 247, 251, 0.92);
+      border: 1px solid rgba(185, 198, 212, 0.9);
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 7px;
+    }
+
+    .badge-capsule { color: #3d5f98; }
+    .badge-index { color: #326f58; }
+    .badge-impact { color: #8a672f; }
+    .badge-server { color: var(--specimen-steel); }
+    .badge-skeleton { color: #5e7299; }
+
+    .tool-label {
+      color: var(--specimen-ink-soft);
+      font-size: 12px;
+    }
+
+    .tool-label .sym,
+    .tt-sym {
+      color: var(--specimen-tissue-ink);
+      text-shadow: none;
+    }
+
+    .tool-label .repo,
+    .tool-label .sep,
+    .tt-file,
+    .tt-type { color: var(--specimen-muted); }
+
+    .pct-bar-track {
+      background: var(--specimen-steel-soft);
+      border: 1px solid rgba(185, 198, 212, 0.8);
+    }
+
+    .pct-bar-fill.high { background: var(--specimen-mint); box-shadow: none; }
+    .pct-bar-fill.medium { background: var(--specimen-amber); }
+    .pct-bar-fill.low { background: var(--specimen-steel); }
+    .pct-text.high { color: var(--specimen-mint); text-shadow: none; }
+    .pct-text.medium { color: var(--specimen-amber); }
+    .pct-text.low { color: var(--specimen-muted); }
+
+    #empty-row td,
+    #repo-empty-row td {
+      background: rgba(250, 252, 255, 0.92);
+      color: var(--specimen-muted);
+      font-size: 12px;
+      padding: 28px;
+    }
+
+    #privacy,
+    #privacy-lt,
+    #tree-footer {
+      background: rgba(255, 255, 255, 0.78);
+      border-top: 1px solid rgba(216, 225, 236, 0.96);
+      color: var(--specimen-muted);
+      font-size: 11px;
+      letter-spacing: 0.01em;
+      padding: 10px 14px;
+    }
+
+    .view-delta-btn,
+    #tree-reset-btn,
+    #compare-close {
+      background: rgba(255, 255, 255, 0.96);
+      border: 1px solid rgba(185, 198, 212, 0.96);
+      border-radius: var(--specimen-radius-sm);
+      color: var(--specimen-ink-soft);
+      font-family: var(--font-ui);
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      min-height: 30px;
+      text-shadow: none;
+      transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+    }
+
+    .view-delta-btn:hover,
+    #tree-reset-btn:hover,
+    #compare-close:hover {
+      background: var(--specimen-tissue-soft);
+      border-color: rgba(61, 111, 224, 0.34);
+      color: var(--specimen-tissue-ink);
+      text-shadow: none;
+    }
+
+    .evidence-tag {
+      color: var(--specimen-muted);
+      border-color: rgba(185, 198, 212, 0.9);
+      background: rgba(255, 255, 255, 0.7);
+      font-family: var(--font-ui);
+      font-size: 10px;
+      font-weight: 700;
+    }
+
+    #compare-overlay {
+      background: rgba(23, 37, 53, 0.28);
+      backdrop-filter: blur(10px);
+    }
+
+    #compare-modal {
+      background: rgba(255, 255, 255, 0.98);
+      border: 1px solid rgba(216, 225, 236, 0.96);
+      border-radius: var(--specimen-radius);
+      box-shadow: 0 32px 72px rgba(20, 33, 49, 0.16);
+    }
+
+    #compare-header {
+      border-bottom: 1px solid rgba(216, 225, 236, 0.96);
+      padding: 12px 16px;
+    }
+
+    #compare-title {
+      color: var(--specimen-ink);
+      font-weight: 700;
+      text-shadow: none;
+    }
+
+    #compare-banner {
+      background: rgba(247, 249, 252, 0.96);
+      border-bottom: 1px solid rgba(216, 225, 236, 0.96);
+      color: var(--specimen-ink-soft);
+      font-weight: 600;
+    }
+
+    .compare-pane { border-right: 1px solid rgba(216, 225, 236, 0.96); }
+    .compare-pane-header { border-bottom: 1px solid rgba(216, 225, 236, 0.96); }
+    .compare-pane-header .pane-label { color: var(--specimen-muted); font-weight: 600; }
+    .compare-pane-header .pane-chars { color: var(--specimen-ink-soft); }
+    .compare-pane-body { background: rgba(251, 252, 254, 0.9); }
+    .compare-pane-body pre {
+      color: var(--specimen-ink-soft);
+      font-family: var(--font-data);
+      font-size: 12px;
+    }
+    #compare-loading,
+    #compare-loading-2 { color: var(--specimen-muted); }
+
+    #tree-toolbar {
+      background: rgba(255, 255, 255, 0.9);
+      border-bottom: 1px solid rgba(216, 225, 236, 0.96);
+      gap: 12px;
+      padding: 10px 16px;
+    }
+
+    .tree-label {
+      color: var(--specimen-muted);
+      font-weight: 600;
+    }
+
+    #tree-info {
+      color: var(--specimen-muted);
+      font-weight: 600;
+    }
+
+    #tree-repo-select,
+    #tree-search {
+      background: rgba(255, 255, 255, 0.98);
+      border: 1px solid rgba(185, 198, 212, 0.96);
+      border-radius: var(--specimen-radius-sm);
+      color: var(--specimen-ink-soft);
+      font-family: var(--font-ui);
+      font-size: 12px;
+      min-height: 36px;
+    }
+
+    #tree-repo-select:focus,
+    #tree-search:focus { border-color: var(--specimen-tissue); }
+    #tree-search::placeholder { color: var(--specimen-faint); }
+
+    #tree-body {
+      background: rgba(255, 255, 255, 0.56);
+      border: 1px solid rgba(216, 225, 236, 0.8);
+      border-radius: var(--specimen-radius);
+      box-shadow: var(--specimen-shadow-tight);
+      margin: 0 24px 0;
+    }
+
+    #tree-sidebar {
+      background: rgba(247, 249, 252, 0.96);
+      border-right: 1px solid rgba(216, 225, 236, 0.96);
+    }
+
+    #tree-search-wrap {
+      border-bottom: 1px solid rgba(216, 225, 236, 0.96);
+      padding: 10px;
+    }
+
+    .dir-item {
+      border-radius: 8px;
+      color: var(--specimen-ink-soft);
+      font-size: 12px;
+      margin: 0 6px;
+      min-height: 28px;
+      padding-right: 8px;
+    }
+    .dir-item:hover { background: rgba(61, 111, 224, 0.08); }
+    .dir-item.dir-active {
+      background: var(--specimen-tissue-soft);
+      color: var(--specimen-tissue-ink);
+    }
+    .dir-item.dir-dir,
+    .dir-item-icon { color: var(--specimen-muted); }
+
+    #tree-legend {
+      background: rgba(255, 255, 255, 0.82);
+      border-top: 1px solid rgba(216, 225, 236, 0.96);
+    }
+    .legend-item { color: var(--specimen-muted); font-weight: 600; }
+    .legend-dot.legend-function { background: var(--graph-function); }
+    .legend-dot.legend-method { background: var(--graph-method); }
+    .legend-dot.legend-class { background: var(--graph-class); }
+    .legend-dot.legend-module { background: var(--graph-module); }
+
+    #tree-canvas-wrap {
+      background:
+        linear-gradient(90deg, rgba(164, 179, 194, 0.18) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(164, 179, 194, 0.14) 1px, transparent 1px),
+        linear-gradient(180deg, #f5f8fc 0%, var(--specimen-graph) 100%);
+      background-size: 36px 36px;
+    }
+
+    #tree-tooltip {
+      background: rgba(255, 255, 255, 0.98);
+      border: 1px solid rgba(185, 198, 212, 0.96);
+      border-radius: var(--specimen-radius-sm);
+      box-shadow: 0 16px 36px rgba(20, 33, 49, 0.12);
+      color: var(--specimen-ink-soft);
+      font-family: var(--font-ui);
+    }
+    .tt-deg { color: var(--specimen-amber); }
+
+    #tree-empty,
+    #tree-loading {
+      color: var(--specimen-muted);
+      padding: 18px;
+    }
+    #tree-empty-inner,
+    #tree-loading {
+      background: rgba(255, 255, 255, 0.96);
+      border: 1px solid rgba(216, 225, 236, 0.96);
+      border-radius: var(--specimen-radius);
+      box-shadow: var(--specimen-shadow-tight);
+      max-width: min(480px, 86vw);
+      padding: 18px 20px;
+    }
+    #tree-empty-title { color: var(--specimen-ink-soft); font-weight: 700; }
+    #tree-empty-sub { color: var(--specimen-muted); }
+    #tree-loading-phase {
+      color: var(--specimen-ink-soft);
+      font-weight: 700;
+      text-shadow: none;
+    }
+    #tree-loading-detail { color: var(--specimen-muted); }
+    #tree-loading-track {
+      background: var(--specimen-steel-soft);
+      border: 1px solid rgba(216, 225, 236, 0.96);
+      height: 5px;
+    }
+    #tree-loading-bar {
+      background: var(--specimen-tissue);
+      box-shadow: none;
+    }
+    #tree-loading[data-phase="error"] #tree-loading-bar { background: var(--specimen-danger); }
+
+    #tree-truncation-banner {
+      background: rgba(248, 235, 205, 0.96);
+      border: 1px solid rgba(192, 134, 47, 0.28);
+      border-radius: var(--specimen-radius-sm);
+      color: #7d5a1f;
+      font-weight: 800;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        scroll-behavior: auto !important;
+        transition-duration: 0.001ms !important;
+      }
+      tr.row-new { animation: none; }
+      #status-dot.live { animation: none; }
+    }
+
+    @media (max-width: 860px) {
+      #header {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 14px 16px;
+      }
+      #header-left {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 4px;
+      }
+      #tabs {
+        flex-wrap: wrap;
+        padding: 0 12px;
+      }
+      .tab-btn {
+        flex: 1 1 120px;
+      }
+      .panel {
+        padding: 14px 12px 0;
+      }
+      .cards-row {
+        grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+      }
+      #tree-toolbar {
+        align-items: stretch;
+        flex-wrap: wrap;
+      }
+      #tree-repo-select {
+        min-width: min(100%, 240px);
+      }
+      #tree-info {
+        flex-basis: 100%;
+      }
+      #tree-body {
+        flex-direction: column;
+        margin: 0 12px 0;
+      }
+      #tree-sidebar {
+        border-bottom: 1px solid rgba(216, 225, 236, 0.96);
+        border-right: 0;
+        max-height: 230px;
+        width: 100%;
+      }
+      #tree-canvas-wrap {
+        min-height: 320px;
+      }
+      #compare-modal {
+        height: calc(100dvh - 24px);
+        width: calc(100vw - 24px);
+      }
+      #compare-panes {
+        grid-template-columns: 1fr;
+      }
+      .compare-pane {
+        border-bottom: 1px solid rgba(216, 225, 236, 0.96);
+        border-right: none;
+        min-height: 0;
+      }
+      .compare-pane:last-child { border-bottom: none; }
+    }
+
+    @media (max-width: 520px) {
+      #logo { font-size: 17px; }
+      #tagline { font-size: 11px; }
+      .cards-row { grid-template-columns: 1fr; }
+      .card { min-height: 78px; }
+      #privacy,
+      #privacy-lt,
+      #tree-footer { font-size: 10px; }
+      table { min-width: 680px; }
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Header -->
+  <header id="header">
+    <div id="header-left">
+      <span id="logo">MARROW</span>
+      <span id="tagline">local offline codebase cross-section engine</span>
+    </div>
+    <div id="status-area">
+      <div id="status-dot"></div>
+      <span id="status-text">connecting…</span>
+    </div>
+  </header>
+
+  <!-- Tab bar -->
+  <nav id="tabs">
+    <button class="tab-btn active" data-tab="session" onclick="switchTab('session')">Session</button>
+    <button class="tab-btn" data-tab="lifetime" onclick="switchTab('lifetime')">Lifetime</button>
+    <button class="tab-btn" data-tab="tree" onclick="switchTab('tree')">Graph</button>
+  </nav>
+
+  <!-- Panels -->
+  <div id="panels">
+
+    <!-- SESSION panel -->
+    <section id="panel-session" class="panel active">
+
+      <!-- Stat cards -->
+      <div class="cards-row">
+        <div class="card">
+          <div class="card-label">Requests</div>
+          <div class="card-value" id="s-requests">0</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Baseline Tokens</div>
+          <div class="card-value cyan" id="s-file-tokens">0</div>
+          <div class="card-sub" id="s-file-tokens-sub">estimated unless exact benchmark</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Tokens Saved</div>
+          <div class="card-value" id="s-tokens-saved">0</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Reduction %</div>
+          <div class="card-value amber" id="s-reduction">0.0%</div>
+          <div class="card-sub" id="s-reduction-sub">dashboard estimate; benchmark for exact</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Attached DB Size</div>
+          <div class="card-value" id="s-db-size">—</div>
+          <div class="card-sub">current graph.db on disk</div>
+        </div>
+      </div>
+
+      <!-- Live tool-call table -->
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="min-width:100px">Origin</th>
+              <th>Tool Execution</th>
+              <th class="col-pct">Token % Saved</th>
+              <th class="col-ts">Time</th>
+            </tr>
+          </thead>
+          <tbody id="event-tbody">
+            <tr id="empty-row">
+              <td colspan="4">Awaiting local tool calls</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Footer inside panel (so it pushes against table) -->
+      <footer id="privacy">
+        Marrow operates entirely offline. No telemetry. All data remains strictly on your local machine (127.0.0.1).
+      </footer>
+
+    </section>
+
+    <!-- LIFETIME panel -->
+    <section id="panel-lifetime" class="panel">
+
+      <div class="cards-row">
+        <div class="card">
+          <div class="card-label">All-Time Requests</div>
+          <div class="card-value" id="l-requests">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">All-Time Tokens Saved</div>
+          <div class="card-value" id="l-tokens-saved">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Lifetime Reduction %</div>
+          <div class="card-value amber" id="l-reduction">—</div>
+        </div>
+      </div>
+
+      <p id="lifetime-sub">Persisted summary of core usage impact and the attached database footprint.</p>
+      <p id="scope-path">Attached database: <span id="scope-db-path">—</span></p>
+
+      <div id="lifetime-advanced-controls">
+        <button
+          id="lifetime-advanced-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="lifetime-advanced"
+          aria-label="Show advanced settings"
+          onclick="toggleLifetimeAdvanced()"
+        >
+          <svg class="icon-gear" viewBox="0 0 16 16" aria-hidden="true">
+            <circle cx="8" cy="8" r="2.5"></circle>
+            <path d="M8 1.75v1.5M8 12.75v1.5M12.42 3.58l-1.06 1.06M4.64 11.36l-1.06 1.06M14.25 8h-1.5M3.25 8h-1.5M12.42 12.42l-1.06-1.06M4.64 4.64L3.58 3.58"></path>
+          </svg>
+          <span id="lifetime-advanced-toggle-label">Show advanced metrics</span>
+        </button>
+      </div>
+
+      <div class="cards-row">
+        <div class="card">
+          <div class="card-label">Attached DB Size</div>
+          <div class="card-value" id="db-size">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Indexed Repos</div>
+          <div class="card-value cyan" id="db-repos">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Indexed Symbols</div>
+          <div class="card-value amber" id="db-symbols">—</div>
+        </div>
+      </div>
+
+      <div id="lifetime-advanced" hidden>
+        <p id="lifetime-advanced-copy">Operational diagnostics for pipeline enforcement and safety guards.</p>
+        <div class="cards-row">
+          <div class="card">
+            <div class="card-label">Pipeline Compliance %</div>
+            <div class="card-value amber" id="l-pipeline-compliance">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">Auto-Routed Bypasses</div>
+            <div class="card-value" id="l-autorouted">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">Rejected Bypasses</div>
+            <div class="card-value" id="l-rejected">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">Ambiguous Symbol Guards</div>
+            <div class="card-value" id="l-ambiguous">—</div>
+          </div>
+          <div class="card">
+            <div class="card-label">Stale Capsule Guards</div>
+            <div class="card-value" id="l-stale">—</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="inventory-grid">
+        <section class="inventory-panel" aria-labelledby="workspace-inventory-title">
+          <div class="inventory-header">
+            <div class="inventory-title" id="workspace-inventory-title">Workspace Inventory</div>
+            <div class="card-sub" id="workspace-inventory-count">0 workspaces</div>
+          </div>
+          <div class="inventory-body">
+            <table>
+              <thead>
+                <tr>
+                  <th>Workspace</th>
+                  <th>Status</th>
+                  <th>Path</th>
+                  <th>Last Seen</th>
+                  <th style="text-align:right">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="workspace-inventory-body">
+                <tr><td colspan="5">No registered workspaces</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="inventory-panel" aria-labelledby="db-inventory-title">
+          <div class="inventory-header">
+            <div class="inventory-title" id="db-inventory-title">DB / Index Inventory</div>
+            <div class="card-sub" id="db-inventory-count">0 databases</div>
+          </div>
+          <div class="inventory-body">
+            <table>
+              <thead>
+                <tr>
+                  <th>Workspace</th>
+                  <th>Status</th>
+                  <th>DB</th>
+                  <th>Repos</th>
+                  <th>Files</th>
+                  <th style="text-align:right">Symbols</th>
+                </tr>
+              </thead>
+              <tbody id="db-inventory-body">
+                <tr><td colspan="6">No graph databases found</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="inventory-panel" aria-labelledby="activity-title">
+          <div class="inventory-header">
+            <div class="inventory-title" id="activity-title">Runtime Activity</div>
+            <div class="card-sub" id="activity-count">0 active</div>
+          </div>
+          <div class="inventory-body">
+            <table>
+              <thead>
+                <tr>
+                  <th>Kind</th>
+                  <th>State</th>
+                  <th>Workspace</th>
+                  <th>Detail</th>
+                  <th style="text-align:right">Updated</th>
+                </tr>
+              </thead>
+              <tbody id="activity-body">
+                <tr><td colspan="5">No runtime activity</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <footer id="privacy-lt">
+        Marrow operates entirely offline. No telemetry. All data remains strictly on your local machine (127.0.0.1).
+      </footer>
+
+    </section>
+
+    <!-- TREE VISUALIZATION panel -->
+    <section id="panel-tree" class="panel">
+      <div id="tree-toolbar">
+        <label class="tree-label" for="workspace-selector-btn">Workspace</label>
+        <div class="workspace-selector">
+          <button
+            id="workspace-selector-btn"
+            class="workspace-selector-btn"
+            type="button"
+            aria-expanded="false"
+            aria-haspopup="listbox"
+            aria-controls="workspace-selector-dropdown"
+            aria-label="Select workspace"
+          >
+            <span id="workspace-selector-label" class="workspace-selector-label empty">Select workspace</span>
+            <span id="workspace-selector-count" class="workspace-selector-count"></span>
+            <span class="workspace-selector-arrow">▼</span>
+          </button>
+          <div
+            id="workspace-selector-dropdown"
+            class="workspace-selector-dropdown"
+            role="listbox"
+            aria-label="Available workspaces"
+          >
+          </div>
+          <select id="tree-repo-select" hidden aria-hidden="true">
+            <option value="">Select workspace</option>
+          </select>
+        </div>
+        <span id="tree-info"></span>
+        <button id="tree-reset-btn" onclick="treeResetView()">Reset</button>
+      </div>
+      <div id="tree-body">
+        <div id="tree-sidebar">
+          <div id="tree-search-wrap">
+            <label class="sr-only" for="tree-search">Search symbols</label>
+            <input id="tree-search" type="text" placeholder="Search symbols…" aria-label="Search symbols" oninput="treeSearch(this.value)" />
+          </div>
+          <div id="tree-dir-tree"></div>
+          <div id="tree-legend">
+            <span class="legend-item"><span class="legend-dot legend-function"></span>Function</span>
+            <span class="legend-item"><span class="legend-dot legend-method"></span>Method</span>
+            <span class="legend-item"><span class="legend-dot legend-class"></span>Class</span>
+            <span class="legend-item"><span class="legend-dot legend-module"></span>Module</span>
+          </div>
+        </div>
+        <div id="tree-canvas-wrap">
+          <div id="tree-svg-container"></div>
+          <div id="tree-tooltip"></div>
+          <div id="tree-empty" style="display:flex">
+            <div id="tree-empty-inner">
+              <div id="tree-empty-title">Select a repository</div>
+              <div id="tree-empty-sub">Choose an indexed workspace to visualize its symbol graph.</div>
+            </div>
+          </div>
+          <div id="tree-loading" data-phase="idle" style="display:none">
+            <div id="tree-loading-phase">Loading graph…</div>
+            <div id="tree-loading-track"><span id="tree-loading-bar"></span></div>
+            <div id="tree-loading-detail">Starting request</div>
+          </div>
+          <div id="tree-truncation-banner"></div>
+        </div>
+      </div>
+      <footer id="tree-footer">
+        Local D3 canvas. Graph data stays on 127.0.0.1.
+      </footer>
+    </section>
+
+  </div><!-- /panels -->
+
+</div><!-- /app -->
+
+<!-- Token Delta Modal -->
+<div id="compare-overlay" role="dialog" aria-modal="true" aria-label="Context Capsule Delta">
+  <div id="compare-modal">
+    <div id="compare-header">
+      <span id="compare-title">Context Capsule Delta</span>
+      <button id="compare-close" onclick="closeCompareModal()" title="Close">Close</button>
+    </div>
+    <div id="compare-banner">
+      <span id="compare-banner-text">loading…</span>
+    </div>
+    <div id="compare-panes">
+      <div class="compare-pane" id="pane-original">
+        <div class="compare-pane-header">
+          <span class="pane-label" id="pane-original-label">Baseline Evidence</span>
+          <span class="pane-chars" id="pane-original-chars">— tokens</span>
+        </div>
+        <div class="compare-pane-body" id="pane-original-body">
+          <div id="compare-loading">loading…</div>
+        </div>
+      </div>
+      <div class="compare-pane" id="pane-optimized">
+        <div class="compare-pane-header">
+          <span class="pane-label">Marrow Capsule</span>
+          <span class="pane-chars" id="pane-optimized-chars">— tokens</span>
+        </div>
+        <div class="compare-pane-body" id="pane-optimized-body">
+          <div id="compare-loading-2">loading…</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<style>
+  /* Lifetime footer shares the same style via id, duplicate here for scoping */
+  #privacy-lt {
+    flex-shrink: 0;
+    text-align: center;
+    font-size: 11px;
+    color: var(--specimen-muted);
+    letter-spacing: 0.01em;
+    border-top: 1px solid rgba(216, 225, 236, 0.96);
+    padding: 10px 14px;
+    background: rgba(255, 255, 255, 0.78);
+    margin-top: auto;
+  }
+</style>
+
+<script src="/d3-v7.min.js"></script>
+<script>
+  'use strict';
+
+  // ── State ──────────────────────────────────────────────────────────────────
+
+  const session = {
+    requests:     0,
+    fileTokens:   0,
+    capsuleTokens: 0,
+    tokensSaved:  0,
+    reductionPct: 0,
+  };
+
+  let rowCount = 0;
+  const MAX_ROWS = 50;
+
+  let sseSource = null;
+  let reconnectTimer = null;
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  function escHtml(str) {
+    if (str == null) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function fmtNum(n) {
+    return Number(n).toLocaleString();
+  }
+
+  function fmtPct(n) {
+    return Number(n).toFixed(1) + '%';
+  }
+
+  function fmtMb(mb) {
+    const value = Number(mb || 0);
+    return value > 0 ? value.toFixed(2) + ' MB' : '< 0.01 MB';
+  }
+
+  function fmtTs(ts) {
+    // ts is a unix epoch in seconds
+    const d = new Date(Number(ts) * 1000);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  }
+
+  function fmtRelativeTs(ts) {
+    const n = Number(ts || 0);
+    if (!n) return '—';
+    return fmtTs(n);
+  }
+
+  function workspaceName(row) {
+    if (!row) return '—';
+    if (row.display_name) return row.display_name;
+    const root = String(row.workspace_root || '');
+    return root.split('/').filter(Boolean).pop() || row.workspace_id || 'workspace';
+  }
+
+  function statusPill(value) {
+    const status = String(value || 'unknown');
+    return `<span class="status-pill ${escHtml(status)}">${escHtml(status.replace(/_/g, ' '))}</span>`;
+  }
+
+  function nowTs() {
+    return Math.floor(Date.now() / 1000);
+  }
+
+  function pctBarHtml(pct) {
+    if (pct == null) return '<span class="pct-dash">—</span>';
+    const p = Math.min(100, Math.max(0, Number(pct)));
+    const cls = p > 50 ? 'high' : p >= 20 ? 'medium' : 'low';
+    return `
+      <span class="pct-bar-wrap">
+        <span class="pct-bar-track">
+          <span class="pct-bar-fill ${cls}" style="width:${p}%"></span>
+        </span>
+        <span class="pct-text ${cls}">${fmtPct(p)}</span>
+      </span>`;
+  }
+
+  function badgeHtml(type) {
+    const map = {
+      capsule:  ['badge-capsule',  'capsule'],
+      index:    ['badge-index',    'index'],
+      impact:   ['badge-impact',   'impact'],
+      server:   ['badge-server',   'server'],
+      skeleton: ['badge-skeleton', 'skeleton'],
+    };
+    const [cls, label] = map[type] || ['badge-server', type];
+    return `<span class="badge ${cls}">${escHtml(label)}</span>`;
+  }
+
+  function provenanceOf(data) {
+    return (data && data.provenance) ? data.provenance : {};
+  }
+
+  function proofOf(data) {
+    return (data && data.proof_snapshot) ? data.proof_snapshot : {};
+  }
+
+  function evidenceLabel(data) {
+    const p = provenanceOf(data);
+    const proof = proofOf(data);
+    const source = p.baseline_token_source || proof.token_source || 'estimated';
+    const proofLabel = p.proof_label || proof.proof_label || 'unavailable';
+    if (source === 'exact') return 'exact';
+    if (source === 'full') return 'full';
+    if (source === 'truncated_full') return 'truncated full';
+    if (proofLabel.includes('sampled') && proofLabel.includes('truncated')) return 'sampled + truncated';
+    if (proofLabel.includes('sampled')) return 'sampled';
+    if (proofLabel.includes('truncated')) return 'truncated';
+    if (proofLabel.includes('cached')) return 'cached proof';
+    return source;
+  }
+
+  function evidenceTagHtml(data) {
+    return `<span class="evidence-tag">${escHtml(evidenceLabel(data))}</span>`;
+  }
+
+  // ── DOM Updates ────────────────────────────────────────────────────────────
+
+  function updateSessionCards() {
+    document.getElementById('s-requests').textContent     = fmtNum(session.requests);
+    document.getElementById('s-file-tokens').textContent  = fmtNum(session.fileTokens);
+    document.getElementById('s-tokens-saved').textContent = fmtNum(session.tokensSaved);
+    document.getElementById('s-reduction').textContent    = fmtPct(session.reductionPct);
+  }
+
+  function updateLifetimeCards(lt) {
+    document.getElementById('l-requests').textContent    = fmtNum(lt.total_requests);
+    document.getElementById('l-tokens-saved').textContent = fmtNum(lt.total_tokens_saved);
+    document.getElementById('l-reduction').textContent   = fmtPct(lt.reduction_pct);
+    document.getElementById('l-pipeline-compliance').textContent = fmtPct(lt.pipeline_compliance_pct || 0);
+    document.getElementById('l-autorouted').textContent = fmtNum(lt.direct_low_level_autorouted || 0);
+    document.getElementById('l-rejected').textContent = fmtNum(lt.direct_low_level_rejected || 0);
+    document.getElementById('l-ambiguous').textContent = fmtNum(lt.ambiguous_symbol_requests || 0);
+    document.getElementById('l-stale').textContent = fmtNum(lt.stale_capsule_prevented || 0);
+  }
+
+  function updateDatabaseScope(database) {
+    if (!database) return;
+
+    document.getElementById('s-db-size').textContent = fmtMb(database.size_mb);
+    document.getElementById('db-size').textContent = fmtMb(database.size_mb);
+    document.getElementById('db-repos').textContent = fmtNum(database.repo_count || 0);
+    document.getElementById('db-symbols').textContent = fmtNum(database.symbol_count || 0);
+    document.getElementById('scope-db-path').textContent = database.path || '—';
+  }
+
+  function cleanupWorkspace(action, workspaceId) {
+    const labels = {
+      unregister: 'Unregister',
+      'clear-index': 'Clear index',
+      'delete-db': 'Delete DB',
+    };
+    const label = labels[action] || action;
+    if (!window.confirm(`${label} ${workspaceId}?`)) return;
+    fetch('/api/cleanup/' + encodeURIComponent(action), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workspace_id: workspaceId, confirmed: true }),
+    })
+      .then(r => r.json().then(body => ({ ok: r.ok, body })))
+      .then(result => {
+        if (!result.ok || result.body.error) window.alert(result.body.error || 'Action failed');
+        fetchStats(false);
+      })
+      .catch(err => window.alert(err.message));
+  }
+
+  function updateWorkspaceInventory(workspaces) {
+    const rows = Array.isArray(workspaces) ? workspaces : [];
+    document.getElementById('workspace-inventory-count').textContent = rows.length.toLocaleString() + ' workspaces';
+    const tbody = document.getElementById('workspace-inventory-body');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="5">No registered workspaces</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(row => `
+      <tr>
+        <td>${escHtml(workspaceName(row))}</td>
+        <td>${statusPill(row.status)}</td>
+        <td class="path-cell" title="${escHtml(row.workspace_root || '')}">${escHtml(row.workspace_root || '')}</td>
+        <td>${escHtml(fmtRelativeTs(row.last_seen_at))}</td>
+        <td>
+          <div class="action-row">
+            <button class="action-btn" type="button" onclick="cleanupWorkspace('unregister', '${escHtml(row.workspace_id)}')">Unregister</button>
+            <button class="action-btn" type="button" onclick="cleanupWorkspace('clear-index', '${escHtml(row.workspace_id)}')">Clear Index</button>
+            <button class="action-btn danger" type="button" onclick="cleanupWorkspace('delete-db', '${escHtml(row.workspace_id)}')">Delete DB</button>
+          </div>
+        </td>
+      </tr>
+    `).join('');
+  }
+
+  function updateDbInventory(dbs) {
+    const rows = Array.isArray(dbs) ? dbs : [];
+    document.getElementById('db-inventory-count').textContent = rows.length.toLocaleString() + ' databases';
+    const tbody = document.getElementById('db-inventory-body');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="6">No graph databases found</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(row => `
+      <tr>
+        <td>${escHtml(workspaceName(row))}</td>
+        <td>${statusPill(row.status)}</td>
+        <td class="path-cell" title="${escHtml(row.graph_db_path || '')}">${escHtml(row.graph_db_path || '')}</td>
+        <td>${fmtNum(row.repo_count || 0)}</td>
+        <td>${fmtNum(row.file_count || 0)}</td>
+        <td style="text-align:right">${fmtNum(row.symbol_count || 0)}</td>
+      </tr>
+    `).join('');
+  }
+
+  function updateActivityPanel(activity) {
+    const rows = Array.isArray(activity) ? activity : [];
+    const active = rows.filter(row => row.state === 'active').length;
+    document.getElementById('activity-count').textContent = active.toLocaleString() + ' active';
+    const tbody = document.getElementById('activity-body');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="5">No runtime activity</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.slice().reverse().map(row => `
+      <tr>
+        <td>${escHtml(String(row.kind || '').replace(/_/g, ' '))}</td>
+        <td>${statusPill(row.state)}</td>
+        <td>${escHtml(row.workspace_id || '—')}</td>
+        <td class="path-cell" title="${escHtml(row.detail || '')}">${escHtml(row.detail || '')}</td>
+        <td style="text-align:right">${escHtml(fmtRelativeTs(row.updated_at))}</td>
+      </tr>
+    `).join('');
+  }
+
+  function updateGlobalInventory(body) {
+    updateWorkspaceInventory(body.workspaces || []);
+    updateDbInventory(body.dbs || []);
+    updateActivityPanel(body.activity || []);
+    workspaceSelectorPopulateFromStats(body);
+  }
+
+  function setStatus(state) {
+    const dot  = document.getElementById('status-dot');
+    const text = document.getElementById('status-text');
+    dot.className = '';
+    if (state === 'live') {
+      dot.classList.add('live');
+      text.textContent = 'live';
+    } else if (state === 'error') {
+      dot.classList.add('error');
+      text.textContent = 'reconnecting…';
+    } else {
+      text.textContent = 'connecting…';
+    }
+  }
+
+  // ── Table row insertion ────────────────────────────────────────────────────
+
+  function removeEmptyRow() {
+    const empty = document.getElementById('empty-row');
+    if (empty) empty.remove();
+  }
+
+  function addTableRow(origin, badgeType, toolLabelHtml, pctSaved, ts, deltaInfo) {
+    removeEmptyRow();
+
+    const tbody = document.getElementById('event-tbody');
+
+    // Trim to MAX_ROWS
+    while (tbody.rows.length >= MAX_ROWS) {
+      tbody.deleteRow(tbody.rows.length - 1);
+    }
+
+    const tsStr = ts ? fmtTs(ts) : fmtTs(nowTs());
+
+    const deltaBtn = deltaInfo
+      ? `<button class="view-delta-btn"
+           data-filepath="${escHtml(deltaInfo.filepath)}"
+           data-tool="${escHtml(deltaInfo.tool)}"
+           data-symbol="${escHtml(deltaInfo.symbol || '')}"
+           data-repo="${escHtml(deltaInfo.repo || '')}"
+           data-ts="${escHtml(String(deltaInfo.ts || ''))}"
+           onclick="openCompareModal(this)">Compare</button>`
+      : '';
+
+    const tr = document.createElement('tr');
+    tr.className = 'row-new';
+    tr.innerHTML = `
+      <td class="origin-cell">${escHtml(origin || '—')}</td>
+      <td class="tool-label">${badgeHtml(badgeType)}${toolLabelHtml}${deltaBtn}</td>
+      <td class="pct-cell">${pctBarHtml(pctSaved)}</td>
+      <td class="ts-cell">${escHtml(tsStr)}</td>
+    `;
+
+    tbody.insertBefore(tr, tbody.firstChild);
+    rowCount++;
+
+    // Remove animation class after it finishes
+    tr.addEventListener('animationend', () => tr.classList.remove('row-new'), { once: true });
+  }
+
+  // ── Event Handling ─────────────────────────────────────────────────────────
+
+  function handleEvent(data) {
+    switch (data.type) {
+
+      case 'capsule_served': {
+        session.requests++;
+        session.fileTokens    += data.file_tokens    || 0;
+        session.capsuleTokens += data.capsule_tokens || 0;
+        session.tokensSaved   += data.tokens_saved   || 0;
+        session.reductionPct = session.fileTokens > 0
+          ? (session.tokensSaved / session.fileTokens) * 100
+          : 0;
+        updateSessionCards();
+
+        const sym  = escHtml(data.symbol || '');
+        const repo = escHtml(data.repo   || '');
+        const toolHtml = `<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span>${evidenceTagHtml(data)}`;
+        const pct = data.file_tokens > 0
+          ? (data.tokens_saved / data.file_tokens) * 100
+          : null;
+        const deltaInfo = (data.file && data.has_cached_delta) ? { filepath: data.file, tool: 'get_context_capsule', symbol: data.symbol || '', repo: data.repo || '', ts: data.ts || '' } : null;
+        addTableRow(data.origin || '—', 'capsule', toolHtml, pct, data.ts, deltaInfo);
+        break;
+      }
+
+      case 'repo_indexed': {
+        const repo    = escHtml(data.repo_id || '');
+        const symbols = fmtNum(data.symbols  || 0);
+        const edges   = fmtNum(data.edges    || 0);
+        const toolHtml = `<span class="sym">${repo}</span><span class="sep"> · </span><span class="repo">${symbols} symbols / ${edges} edges</span>`;
+        addTableRow('—', 'index', toolHtml, null, data.ts);
+        break;
+      }
+
+      case 'impact_analyzed': {
+        const sym  = escHtml(data.symbol || '');
+        const repo = escHtml(data.repo   || '');
+        const aff  = fmtNum(data.affected_count || 0);
+        const toolHtml = `<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo} — ${aff} affected</span>`;
+        addTableRow('—', 'impact', toolHtml, null, data.ts);
+        break;
+      }
+
+      case 'server_started': {
+        const port = escHtml(String(data.port || ''));
+        const db   = escHtml(data.db_path || '');
+        const toolHtml = `<span class="sym">server</span><span class="sep"> · </span><span class="repo">port ${port} · ${db}</span>`;
+        addTableRow('—', 'server', toolHtml, null, null);
+        break;
+      }
+
+      case 'skeleton_generated': {
+        const dir   = escHtml(data.target_dir || '(workspace)');
+        const nodes = fmtNum(data.node_count || 0);
+        const toolHtml = `<span class="sym">run_pipeline · analyze_repo</span><span class="sep"> · </span><span class="repo">${dir} — Mapped ${nodes} structural nodes</span>`;
+        addTableRow('—', 'skeleton', toolHtml, null, data.ts);
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  // ── Replay recent_events from /stats ──────────────────────────────────────
+  //
+  // Session counters (requests, fileTokens, tokensSaved) are loaded from the
+  // server snapshot in fetchStats BEFORE replay runs. Replay must only populate
+  // table rows — never mutate counters — to avoid double-counting.
+
+  function replayEvents(events) {
+    if (!Array.isArray(events)) return;
+    // events are newest-first from server; replay oldest-first so table ends newest-first
+    const ordered = [...events].reverse();
+    for (const ev of ordered) {
+      handleEventReplay(ev);
+    }
+  }
+
+  function handleEventReplay(data) {
+    // Table-only replay: session counters are already set from the server snapshot.
+    // Do NOT increment session.requests / session.fileTokens / session.tokensSaved here.
+    switch (data.type) {
+      case 'capsule_served': {
+        // Only get_context_capsule events contribute to session token metrics.
+        const sym     = escHtml(data.symbol || '');
+        const repo    = escHtml(data.repo   || '');
+        const pct = data.file_tokens > 0
+          ? (data.tokens_saved / data.file_tokens) * 100
+          : null;
+        const deltaBtn = (data.file && data.has_cached_delta)
+          ? `<button class="view-delta-btn" data-filepath="${escHtml(data.file)}" data-tool="get_context_capsule" data-symbol="${escHtml(data.symbol || '')}" data-repo="${escHtml(data.repo || '')}" data-ts="${escHtml(String(data.ts || ''))}" onclick="openCompareModal(this)">Compare</button>`
+          : '';
+
+        removeEmptyRow();
+        const tbody = document.getElementById('event-tbody');
+        while (tbody.rows.length >= MAX_ROWS) tbody.deleteRow(tbody.rows.length - 1);
+        const tsStr = data.ts ? fmtTs(data.ts) : '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="origin-cell">${escHtml(data.origin || '—')}</td>
+          <td class="tool-label">${badgeHtml('capsule')}<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo}</span>${evidenceTagHtml(data)}${deltaBtn}</td>
+          <td class="pct-cell">${pctBarHtml(pct)}</td>
+          <td class="ts-cell">${escHtml(tsStr)}</td>
+        `;
+        tbody.insertBefore(tr, tbody.firstChild);
+        break;
+      }
+
+      case 'repo_indexed': {
+        removeEmptyRow();
+        const tbody   = document.getElementById('event-tbody');
+        while (tbody.rows.length >= MAX_ROWS) tbody.deleteRow(tbody.rows.length - 1);
+        const repo    = escHtml(data.repo_id || '');
+        const symbols = fmtNum(data.symbols  || 0);
+        const edges   = fmtNum(data.edges    || 0);
+        const tsStr   = data.ts ? fmtTs(data.ts) : '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="origin-cell">—</td>
+          <td class="tool-label">${badgeHtml('index')}<span class="sym">${repo}</span><span class="sep"> · </span><span class="repo">${symbols} symbols / ${edges} edges</span></td>
+          <td class="pct-cell"><span class="pct-dash">—</span></td>
+          <td class="ts-cell">${escHtml(tsStr)}</td>
+        `;
+        tbody.insertBefore(tr, tbody.firstChild);
+        break;
+      }
+
+      case 'impact_analyzed': {
+        removeEmptyRow();
+        const tbody = document.getElementById('event-tbody');
+        while (tbody.rows.length >= MAX_ROWS) tbody.deleteRow(tbody.rows.length - 1);
+        const sym  = escHtml(data.symbol || '');
+        const repo = escHtml(data.repo   || '');
+        const aff  = fmtNum(data.affected_count || 0);
+        const tsStr = data.ts ? fmtTs(data.ts) : '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="origin-cell">—</td>
+          <td class="tool-label">${badgeHtml('impact')}<span class="sym">${sym}</span><span class="sep"> · </span><span class="repo">${repo} — ${aff} affected</span></td>
+          <td class="pct-cell"><span class="pct-dash">—</span></td>
+          <td class="ts-cell">${escHtml(tsStr)}</td>
+        `;
+        tbody.insertBefore(tr, tbody.firstChild);
+        break;
+      }
+
+      case 'skeleton_generated': {
+        removeEmptyRow();
+        const tbody = document.getElementById('event-tbody');
+        while (tbody.rows.length >= MAX_ROWS) tbody.deleteRow(tbody.rows.length - 1);
+        const dir   = escHtml(data.target_dir || '(workspace)');
+        const nodes = fmtNum(data.node_count  || 0);
+        const tsStr = data.ts ? fmtTs(data.ts) : '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="origin-cell">—</td>
+          <td class="tool-label">${badgeHtml('skeleton')}<span class="sym">run_pipeline · analyze_repo</span><span class="sep"> · </span><span class="repo">${dir} — Mapped ${nodes} structural nodes</span></td>
+          <td class="pct-cell"><span class="pct-dash">—</span></td>
+          <td class="ts-cell">${escHtml(tsStr)}</td>
+        `;
+        tbody.insertBefore(tr, tbody.firstChild);
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  // ── fetchStats ─────────────────────────────────────────────────────────────
+
+  let _statsFetchPromise = null;
+
+  const _LIFETIME_CARD_IDS = [
+    'l-requests', 'l-tokens-saved', 'l-reduction',
+    'l-pipeline-compliance', 'l-autorouted', 'l-rejected', 'l-ambiguous', 'l-stale',
+  ];
+
+  function _setLifetimeCardsText(text) {
+    _LIFETIME_CARD_IDS.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = text;
+    });
+  }
+
+  function fetchStats(replaySession) {
+    if (_statsFetchPromise) return _statsFetchPromise;
+    _setLifetimeCardsText('…');
+    _statsFetchPromise = fetch('/stats')
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(body => {
+        if (replaySession && body.session) {
+          const s = body.session;
+          // Load authoritative totals from server snapshot.
+          // replayEvents() below only populates table rows — it must NOT re-add to these counters.
+          session.requests      = s.total_requests       || 0;
+          session.fileTokens    = s.total_file_tokens    || 0;
+          session.capsuleTokens = s.total_capsule_tokens || 0;
+          session.tokensSaved   = s.total_tokens_saved   || 0;
+          session.reductionPct  = session.fileTokens > 0
+            ? (session.tokensSaved / session.fileTokens) * 100
+            : 0;
+          updateSessionCards();
+          replayEvents(s.recent_events || []);
+        }
+        if (body.lifetime) {
+          updateLifetimeCards(body.lifetime);
+        }
+        if (body.database) {
+          updateDatabaseScope(body.database);
+        }
+        updateGlobalInventory(body);
+      })
+      .catch(err => {
+        _setLifetimeCardsText('Err');
+        console.error('[marrow] /stats fetch failed:', err);
+      })
+      .finally(() => {
+        _statsFetchPromise = null;
+      });
+    return _statsFetchPromise;
+  }
+
+  // ── SSE ────────────────────────────────────────────────────────────────────
+
+  function connectSSE() {
+    if (sseSource) {
+      sseSource.close();
+      sseSource = null;
+    }
+
+    setStatus('connecting');
+
+    sseSource = new EventSource('/stream');
+
+    sseSource.onopen = () => {
+      setStatus('live');
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    };
+
+    sseSource.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        handleEvent(data);
+      } catch (_) {
+        // malformed JSON; skip
+      }
+    };
+
+    sseSource.onerror = () => {
+      setStatus('error');
+      sseSource.close();
+      sseSource = null;
+      reconnectTimer = setTimeout(connectSSE, 3000);
+    };
+  }
+
+  // ── Tab switching ──────────────────────────────────────────────────────────
+
+  function switchTab(name) {
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.tab === name);
+    });
+    document.querySelectorAll('.panel').forEach(p => {
+      p.classList.toggle('active', p.id === `panel-${name}`);
+    });
+    if (name === 'lifetime') {
+      fetchStats(false);
+    }
+    if (name === 'tree') {
+      treeOnTabActivate();
+    }
+  }
+
+  function toggleLifetimeAdvanced() {
+    const panel = document.getElementById('lifetime-advanced');
+    const button = document.getElementById('lifetime-advanced-toggle');
+    const label = document.getElementById('lifetime-advanced-toggle-label');
+    const willExpand = panel.hasAttribute('hidden');
+
+    panel.toggleAttribute('hidden', !willExpand);
+    button.setAttribute('aria-expanded', String(willExpand));
+    button.setAttribute('aria-label', willExpand ? 'Hide advanced settings' : 'Show advanced settings');
+    label.textContent = willExpand ? 'Hide advanced metrics' : 'Show advanced metrics';
+  }
+
+  // ── Boot ───────────────────────────────────────────────────────────────────
+
+  document.addEventListener('DOMContentLoaded', () => {
+    fetchStats(true);
+    connectSSE();
+
+    // Close modal on overlay click (outside the modal box)
+    document.getElementById('compare-overlay').addEventListener('click', function(e) {
+      if (e.target === this) closeCompareModal();
+    });
+
+    // Close modal on Escape key
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') closeCompareModal();
+    });
+  });
+
+  // ── Compare Modal ──────────────────────────────────────────────────────────
+
+  function openCompareModal(btn) {
+    const filepath = btn.dataset.filepath;
+    const tool     = btn.dataset.tool;
+    const symbol   = btn.dataset.symbol || '';
+    const repo     = btn.dataset.repo   || '';
+    const ts       = btn.dataset.ts     || '';
+
+    const overlay = document.getElementById('compare-overlay');
+    overlay.classList.add('open');
+
+    // Reset panes to loading state
+    document.getElementById('compare-banner-text').textContent = 'loading…';
+    document.getElementById('pane-original-chars').textContent  = '— tokens';
+    document.getElementById('pane-optimized-chars').textContent = '— tokens';
+    document.getElementById('pane-original-body').innerHTML  = '<div style="padding:20px;color:var(--dim);font-size:11px">loading…</div>';
+    document.getElementById('pane-optimized-body').innerHTML = '<div style="padding:20px;color:var(--dim);font-size:11px">loading…</div>';
+
+    const url = '/api/compare?filepath=' + encodeURIComponent(filepath)
+              + '&tool_used=' + encodeURIComponent(tool)
+              + '&symbol='    + encodeURIComponent(symbol)
+              + '&repo='      + encodeURIComponent(repo)
+              + '&ts='        + encodeURIComponent(ts);
+
+    fetch(url)
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) {
+          document.getElementById('compare-banner-text').textContent = 'Error: ' + data.error;
+          document.getElementById('pane-original-body').innerHTML  = '';
+          document.getElementById('pane-optimized-body').innerHTML = '';
+          return;
+        }
+
+        const origLen = data.original_length  || 0;
+        const optLen  = data.optimized_length || 0;
+        const saved   = origLen - optLen;
+        const pct     = origLen > 0 ? ((saved / origLen) * 100).toFixed(1) : '0.0';
+        const p = provenanceOf(data);
+        const proof = proofOf(data);
+        const source = p.baseline_token_source || 'estimated';
+        const sourcePrefix = source === 'exact' ? '' : '~';
+        const proofBits = [];
+        if (proof.sampled) proofBits.push('sampled');
+        if (proof.truncated) proofBits.push('truncated');
+        if (proof.max_bytes) proofBits.push(`${Number(proof.max_bytes).toLocaleString()} byte cap`);
+        if (proof.max_files) proofBits.push(`${Number(proof.max_files).toLocaleString()} file cap`);
+        const proofDetail = proofBits.length ? ` · proof ${proofBits.join(', ')}` : '';
+
+        const origToks = Math.ceil(origLen);
+        const optToks  = Math.ceil(optLen);
+        const savedToks = Math.ceil(saved);
+
+        document.getElementById('compare-banner-text').textContent =
+          `${evidenceLabel(data)} baseline: ${sourcePrefix}${origToks.toLocaleString()} tokens to ${sourcePrefix}${optToks.toLocaleString()} tokens`
+          + ` · ${sourcePrefix}${savedToks.toLocaleString()} tokens saved (${pct}% reduction)${proofDetail}`;
+
+        document.getElementById('pane-original-label').textContent = source === 'full' || source === 'truncated_full' ? 'Original Context' : 'Baseline Proof';
+        document.getElementById('pane-original-chars').textContent  = `${sourcePrefix}${origToks.toLocaleString()} tokens · ${source}`;
+        document.getElementById('pane-optimized-chars').textContent = `${sourcePrefix}${optToks.toLocaleString()} tokens`;
+
+        const origPre  = document.createElement('pre');
+        const origCode = document.createElement('code');
+        origCode.textContent = data.original_text || '';
+        origPre.appendChild(origCode);
+        document.getElementById('pane-original-body').innerHTML = '';
+        document.getElementById('pane-original-body').appendChild(origPre);
+
+        const optPre  = document.createElement('pre');
+        const optCode = document.createElement('code');
+        optCode.textContent = data.optimized_text || '';
+        optPre.appendChild(optCode);
+        document.getElementById('pane-optimized-body').innerHTML = '';
+        document.getElementById('pane-optimized-body').appendChild(optPre);
+      })
+      .catch(err => {
+        document.getElementById('compare-banner-text').textContent = 'Fetch error: ' + err.message;
+        document.getElementById('pane-original-body').innerHTML  = '';
+        document.getElementById('pane-optimized-body').innerHTML = '';
+      });
+  }
+
+  function closeCompareModal() {
+    document.getElementById('compare-overlay').classList.remove('open');
+    // Clear content to release memory
+    document.getElementById('pane-original-body').innerHTML  = '';
+    document.getElementById('pane-optimized-body').innerHTML = '';
+  }
+
+  // ── Tree Visualization ─────────────────────────────────────────────────
+  const treeD3Available = typeof d3 !== 'undefined';
+
+  function cssVar(name, fallback) {
+    const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return value || fallback;
+  }
+
+  function hexToRgb(hex, fallback) {
+    const clean = String(hex || '').replace('#', '').trim();
+    const expanded = clean.length === 3
+      ? clean.split('').map(ch => ch + ch).join('')
+      : clean;
+    if (expanded.length !== 6) return fallback;
+    const n = Number.parseInt(expanded, 16);
+    if (Number.isNaN(n)) return fallback;
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+
+  function cssRgb(name, fallbackHex) {
+    return hexToRgb(cssVar(name, fallbackHex), hexToRgb(fallbackHex, [140, 150, 150]));
+  }
+
+  const TREE_EDGE_RGB = cssRgb('--graph-edge-base', '#a4b3c2').join(',');
+
+  const TREE_CANVAS = {
+    edgeRgb: TREE_EDGE_RGB,
+    edge: `rgba(${TREE_EDGE_RGB},0.38)`,
+    edgeFocus: `rgba(${TREE_EDGE_RGB},0.72)`,
+    edgeMuted: `rgba(${TREE_EDGE_RGB},0.08)`,
+    nodeFill: cssVar('--graph-node-fill', '#ffffff'),
+    labelFont: cssVar('--graph-label-font', '600 10px "SFMono-Regular", "Liberation Mono", Menlo, monospace'),
+    clusterFont: cssVar('--graph-cluster-font', '700 10px "Avenir Next", system-ui, sans-serif'),
+  };
+
+  // State
+  let treeCanvas     = null;
+  let treeCtx        = null;
+  let treeTransform  = treeD3Available ? d3.zoomIdentity : { k: 1, x: 0, y: 0, applyX(v) { return v * this.k + this.x; }, applyY(v) { return v * this.k + this.y; }, invertX(v) { return (v - this.x) / this.k; }, invertY(v) { return (v - this.y) / this.k; } };
+  let treeZoom       = null;
+  let treeSim        = null;
+  let treeAllNodes   = [];
+  let treeAllEdges   = [];
+  let treeFocusId    = null;
+  let treeSearchStr  = '';
+  let treeActivePath = null;
+  let treeInitDone   = false;
+  let treeNodeById   = {};
+  let treeDidDrag    = false;
+  let treePanStart   = null;
+  let treePanOccurred = false;
+  let treeDragStartX  = 0;
+  let treeDragStartY  = 0;
+  let treeDragOffsetX = 0;
+  let treeDragOffsetY = 0;
+  let treeSearchTimer = null;
+  let treeFileGroups  = {};
+  let treeFileColors  = {};
+  let treeFileEntries = [];
+  let treeNodesByColor = {};
+  let treeCachedHulls = [];
+  let treeCachedClusterLabels = [];
+  let treeFrameCounter = 0;
+  let treeLastHullFrame = -999;
+  let treeLoadSeq = 0;
+  let treeLoadAbort = null;
+
+  const TREE_LOAD_PHASES = {
+    fetching:  ['Fetching graph', 24],
+    preparing: ['Preparing graph data', 48],
+    layout:    ['Running layout', 72],
+    drawing:   ['Drawing graph', 92],
+    ready:     ['Ready', 100],
+    error:     ['Graph load failed', 100],
+  };
+
+  const FILE_HULL_PALETTE = [
+    cssRgb('--graph-function', '#2f8f63'), cssRgb('--graph-class', '#4c74c9'),
+    cssRgb('--graph-module', '#6279ad'), cssRgb('--graph-method', '#c0862f'),
+    cssRgb('--graph-hull-steel', '#6f8094'), cssRgb('--graph-hull-tissue-deep', '#234ea4'),
+    cssRgb('--graph-hull-blue-steel', '#4e84c8'), cssRgb('--graph-hull-bronze', '#9a7637'),
+    cssRgb('--graph-hull-sage', '#5b8a72'), cssRgb('--graph-module', '#6279ad'),
+    cssRgb('--graph-hull-danger', '#bf5b4a'), cssRgb('--graph-hull-slate', '#8393a6'),
+  ];
+
+  function makeClusterForce(strength) {
+    let simNodes;
+    function force(alpha) {
+      const cx = {}, cy = {}, ct = {};
+      for (const n of simNodes) {
+        const fp = n.file_path || '';
+        cx[fp] = (cx[fp] || 0) + (n.x || 0);
+        cy[fp] = (cy[fp] || 0) + (n.y || 0);
+        ct[fp] = (ct[fp] || 0) + 1;
+      }
+      for (const fp in cx) { cx[fp] /= ct[fp]; cy[fp] /= ct[fp]; }
+      for (const n of simNodes) {
+        if (n.fx != null) continue;
+        const fp = n.file_path || '';
+        n.vx = (n.vx || 0) + (cx[fp] - n.x) * strength * alpha;
+        n.vy = (n.vy || 0) + (cy[fp] - n.y) * strength * alpha;
+      }
+    }
+    force.initialize = ns => { simNodes = ns; };
+    return force;
+  }
+
+  const TREE_COLORS = {
+    function:  cssVar('--graph-function', '#2f8f63'),
+    method:    cssVar('--graph-method', '#c0862f'),
+    class:     cssVar('--graph-class', '#4c74c9'),
+    module:    cssVar('--graph-module', '#6279ad'),
+    struct:    cssVar('--graph-module', '#6279ad'),
+    interface: cssVar('--graph-class', '#4c74c9'),
+    default:   cssVar('--graph-default', '#5f7285'),
+  };
+
+  function treeColor(type) {
+    return TREE_COLORS[(type || '').toLowerCase()] || TREE_COLORS.default;
+  }
+
+  function treeNodeR(d) {
+    return Math.max(5, Math.min(16, 4 + (d.degree || 0) * 0.6));
+  }
+
+  function treeNodeOpacity(d) {
+    if (treeActivePath) {
+      if (d.file_path === treeActivePath) return 1;
+      if (treeFocusId === d.id || (d.neighborIds && d.neighborIds.has(treeFocusId))) return 0.4;
+      return 0.05;
+    }
+    if (treeSearchStr) {
+      return d.label.toLowerCase().includes(treeSearchStr) ? 1 : 0.06;
+    }
+    if (treeFocusId !== null) {
+      if (d.id === treeFocusId) return 1;
+      if (d.neighborIds && d.neighborIds.has(treeFocusId)) return 0.85;
+      return 0.05;
+    }
+    return 1;
+  }
+
+  function treeSetLoadState(phase, detail) {
+    const loading = document.getElementById('tree-loading');
+    const phaseEl = document.getElementById('tree-loading-phase');
+    const detailEl = document.getElementById('tree-loading-detail');
+    const bar = document.getElementById('tree-loading-bar');
+    const [label, pct] = TREE_LOAD_PHASES[phase] || TREE_LOAD_PHASES.fetching;
+    loading.dataset.phase = phase;
+    loading.style.display = 'flex';
+    phaseEl.textContent = label;
+    detailEl.textContent = detail || '';
+    bar.style.width = pct + '%';
+  }
+
+  function treeClearLoadState(loadId) {
+    if (loadId != null && loadId !== treeLoadSeq) return;
+    const loading = document.getElementById('tree-loading');
+    loading.dataset.phase = 'idle';
+    loading.style.display = 'none';
+  }
+
+  function treeShowLoadError(loadId, message) {
+    if (loadId != null && loadId !== treeLoadSeq) return;
+    treeSetLoadState('error', message);
+    window.setTimeout(() => treeClearLoadState(loadId), 1200);
+    treeResetGraphView();
+    document.getElementById('tree-empty').style.display = 'flex';
+    document.getElementById('tree-empty-sub').textContent = message;
+  }
+
+  function treeResetGraphView() {
+    if (treeSim) treeSim.stop();
+    treeAllNodes = [];
+    treeAllEdges = [];
+    treeFocusId = null;
+    treeActivePath = null;
+    treeNodeById = {};
+    treeFileGroups = {};
+    treeFileEntries = [];
+    treeNodesByColor = {};
+    treeCachedHulls = [];
+    treeCachedClusterLabels = [];
+    const dir = document.getElementById('tree-dir-tree');
+    if (dir) dir.innerHTML = '';
+    if (treeCtx && treeCanvas) treeCtx.clearRect(0, 0, treeCanvas.width, treeCanvas.height);
+  }
+
+  function treeEdgeOpacity(e) {
+    if (treeActivePath) {
+      const srcPath = e.source.file_path || e.source;
+      const tgtPath = e.target.file_path || e.target;
+      return (srcPath === treeActivePath || tgtPath === treeActivePath) ? 0.55 : 0.04;
+    }
+    if (treeSearchStr) return 0.08;
+    if (treeFocusId !== null) {
+      const sid = (e.source && e.source.id) ? e.source.id : e.source;
+      const tid = (e.target && e.target.id) ? e.target.id : e.target;
+      return (sid === treeFocusId || tid === treeFocusId) ? 0.7 : 0.03;
+    }
+    return 0.3;
+  }
+
+  // ── Canvas helpers ──────────────────────────────────────────────────────────
+
+  function canvasClientToGraph(clientX, clientY) {
+    const rect = treeCanvas.getBoundingClientRect();
+    return [
+      treeTransform.invertX(clientX - rect.left),
+      treeTransform.invertY(clientY - rect.top),
+    ];
+  }
+
+  function canvasHitTest(gx, gy) {
+    let best = null, bestDist = Infinity;
+    for (const n of treeAllNodes) {
+      if (n.x == null) continue;
+      const dx = n.x - gx, dy = n.y - gy;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const r = treeNodeR(n) + 8;
+      if (dist < r && dist < bestDist) { best = n; bestDist = dist; }
+    }
+    return best;
+  }
+
+  // ── Canvas draw ─────────────────────────────────────────────────────────────
+
+  function drawFrame() {
+    if (!treeCtx || !treeCanvas) return;
+    const W = treeCanvas.width, H = treeCanvas.height;
+    const k = treeTransform.k;
+    const hasFilter = treeFocusId !== null || treeSearchStr || treeActivePath;
+    const simAlpha = treeSim && typeof treeSim.alpha === 'function' ? treeSim.alpha() : 0;
+    const denseGraph = treeAllNodes.length > 260;
+    const showLabels = k >= 0.75 && (!denseGraph || hasFilter || simAlpha < 0.06);
+    treeFrameCounter++;
+
+    treeCtx.clearRect(0, 0, W, H);
+    treeRefreshShapeCaches(false);
+
+    // ── Graph-space rendering ──
+    treeCtx.save();
+    treeCtx.translate(treeTransform.x, treeTransform.y);
+    treeCtx.scale(k, k);
+
+    // ── File cluster hulls (graph space, below edges) ──
+    for (const hull of treeCachedHulls) {
+      const [r, g, b] = hull.color;
+      const pts = hull.points;
+      treeCtx.beginPath();
+      treeCtx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) treeCtx.lineTo(pts[i][0], pts[i][1]);
+      treeCtx.closePath();
+      treeCtx.fillStyle   = `rgba(${r},${g},${b},0.09)`;
+      treeCtx.strokeStyle = `rgba(${r},${g},${b},0.22)`;
+      treeCtx.lineWidth   = 1 / k;
+      treeCtx.fill();
+      treeCtx.stroke();
+    }
+
+    // Edges — batch by opacity group to minimize state changes
+    const lw = Math.max(0.5, 1 / k);
+    treeCtx.lineWidth = lw;
+
+    if (!hasFilter) {
+      treeCtx.beginPath();
+      treeCtx.strokeStyle = TREE_CANVAS.edge;
+      for (const e of treeAllEdges) {
+        if (!e.source.x || !e.target.x) continue;
+        treeCtx.moveTo(e.source.x, e.source.y);
+        treeCtx.lineTo(e.target.x, e.target.y);
+      }
+      treeCtx.stroke();
+    } else if (treeFocusId !== null) {
+      // Two batches: connected edges (high) and background (low)
+      treeCtx.beginPath();
+      treeCtx.strokeStyle = TREE_CANVAS.edgeFocus;
+      for (const e of treeAllEdges) {
+        if (!e.source.x || !e.target.x) continue;
+        const sid = e.source.id || e.source;
+        const tid = e.target.id || e.target;
+        if (sid === treeFocusId || tid === treeFocusId) {
+          treeCtx.moveTo(e.source.x, e.source.y);
+          treeCtx.lineTo(e.target.x, e.target.y);
+        }
+      }
+      treeCtx.stroke();
+      treeCtx.beginPath();
+      treeCtx.strokeStyle = TREE_CANVAS.edgeMuted;
+      for (const e of treeAllEdges) {
+        if (!e.source.x || !e.target.x) continue;
+        const sid = e.source.id || e.source;
+        const tid = e.target.id || e.target;
+        if (sid !== treeFocusId && tid !== treeFocusId) {
+          treeCtx.moveTo(e.source.x, e.source.y);
+          treeCtx.lineTo(e.target.x, e.target.y);
+        }
+      }
+      treeCtx.stroke();
+    } else {
+      // Per-edge opacity (search / path filter)
+      for (const e of treeAllEdges) {
+        if (!e.source.x || !e.target.x) continue;
+        treeCtx.beginPath();
+        treeCtx.strokeStyle = `rgba(${TREE_CANVAS.edgeRgb},${treeEdgeOpacity(e)})`;
+        treeCtx.moveTo(e.source.x, e.source.y);
+        treeCtx.lineTo(e.target.x, e.target.y);
+        treeCtx.stroke();
+      }
+    }
+
+    // Nodes — fill pass (uniform fill color)
+    treeCtx.fillStyle = TREE_CANVAS.nodeFill;
+    for (const n of treeAllNodes) {
+      if (n.x == null) continue;
+      treeCtx.globalAlpha = hasFilter ? treeNodeOpacity(n) : 1;
+      treeCtx.beginPath();
+      treeCtx.arc(n.x, n.y, treeNodeR(n), 0, 2 * Math.PI);
+      treeCtx.fill();
+    }
+
+    // Nodes — stroke pass (grouped by symbol-type color to minimize strokeStyle changes)
+    for (const [color, bucket] of Object.entries(treeNodesByColor)) {
+      treeCtx.strokeStyle = color;
+      for (const n of bucket) {
+        treeCtx.globalAlpha = hasFilter ? treeNodeOpacity(n) : 1;
+        treeCtx.lineWidth   = (n.id === treeFocusId ? 2.5 : 1.5) / k;
+        treeCtx.beginPath();
+        treeCtx.arc(n.x, n.y, treeNodeR(n), 0, 2 * Math.PI);
+        treeCtx.stroke();
+      }
+    }
+    treeCtx.globalAlpha = 1;
+    treeCtx.restore();
+
+    // ── Cluster file labels (screen space, fade as you zoom in) ──
+    if (!hasFilter) {
+      treeCtx.font = TREE_CANVAS.clusterFont;
+      treeCtx.textAlign = 'center';
+      for (const label of treeCachedClusterLabels) {
+        const sx  = treeTransform.applyX(label.x);
+        const sy  = treeTransform.applyY(label.y);
+        if (sx < -60 || sx > W + 60 || sy < -20 || sy > H + 20) continue;
+        const alpha = Math.max(0, 1 - k);
+        if (alpha < 0.01) continue;
+        const [r, g, b] = label.color;
+        treeCtx.globalAlpha = alpha;
+        treeCtx.fillStyle   = `rgb(${r},${g},${b})`;
+        treeCtx.fillText(label.text, sx, sy);
+      }
+      treeCtx.globalAlpha = 1;
+      treeCtx.textAlign = 'left';
+    }
+
+    // ── Screen-space labels (constant pixel size regardless of zoom) ──
+    if (showLabels) {
+      treeCtx.font = TREE_CANVAS.labelFont;
+      treeCtx.textAlign = 'left';
+      for (const n of treeAllNodes) {
+        if (n.x == null) continue;
+        const sx = treeTransform.applyX(n.x);
+        const sy = treeTransform.applyY(n.y);
+        // Cull labels that are off-screen
+        if (sx < -150 || sx > W + 10 || sy < -20 || sy > H + 10) continue;
+        treeCtx.globalAlpha = hasFilter ? treeNodeOpacity(n) : 1;
+        treeCtx.fillStyle   = treeColor(n.symbol_type);
+        const label = n.label.length > 18 ? n.label.slice(0, 16) + '…' : n.label;
+        treeCtx.fillText(label, sx + treeNodeR(n) * k + 3, sy + 4);
+      }
+      treeCtx.globalAlpha = 1;
+    }
+  }
+
+  function treeRefreshShapeCaches(force) {
+    if (!treeD3Available) return;
+    const denseGraph = treeAllNodes.length > 260;
+    const simAlpha = treeSim && typeof treeSim.alpha === 'function' ? treeSim.alpha() : 0;
+    const cadence = denseGraph && simAlpha > 0.06 ? 8 : 1;
+    if (!force && treeFrameCounter - treeLastHullFrame < cadence) return;
+
+    treeCachedHulls = [];
+    treeCachedClusterLabels = [];
+    for (const [fp, fnodes] of treeFileEntries) {
+      const valid = fnodes.filter(n => n.x != null);
+      if (valid.length >= 3) {
+        const hull = d3.polygonHull(valid.map(n => [n.x, n.y]));
+        if (hull) {
+          const hcx = hull.reduce((s, p) => s + p[0], 0) / hull.length;
+          const hcy = hull.reduce((s, p) => s + p[1], 0) / hull.length;
+          const pad = 18;
+          treeCachedHulls.push({
+            color: treeFileColors[fp] || cssRgb('--graph-default', '#687273'),
+            points: hull.map(([x, y]) => {
+              const dx = x - hcx, dy = y - hcy;
+              const d  = Math.sqrt(dx * dx + dy * dy) || 1;
+              return [x + dx / d * pad, y + dy / d * pad];
+            }),
+          });
+        }
+      }
+      if (valid.length >= 2) {
+        treeCachedClusterLabels.push({
+          x: valid.reduce((s, n) => s + n.x, 0) / valid.length,
+          y: valid.reduce((s, n) => s + n.y, 0) / valid.length,
+          text: fp.split('/').pop() || fp,
+          color: treeFileColors[fp] || cssRgb('--graph-function', '#2f8f63'),
+        });
+      }
+    }
+    treeLastHullFrame = treeFrameCounter;
+  }
+
+  // ── Canvas init ─────────────────────────────────────────────────────────────
+
+  function treeInitCanvas() {
+    const container = document.getElementById('tree-svg-container');
+    container.innerHTML = '';
+
+    treeCanvas = document.createElement('canvas');
+    container.appendChild(treeCanvas);
+
+    // Size canvas pixels to match container CSS size (avoids blurry canvas)
+    function resizeCanvas() {
+      treeCanvas.width  = container.clientWidth  || 900;
+      treeCanvas.height = container.clientHeight || 600;
+      treeCtx = treeCanvas.getContext('2d');
+      drawFrame();
+    }
+    resizeCanvas();
+    new ResizeObserver(resizeCanvas).observe(container);
+
+    // D3 zoom — applies pan/zoom and triggers redraw
+    if (!treeD3Available) {
+      // Without D3, show a degraded-mode message and skip zoom/drag setup.
+      document.getElementById('tree-empty').style.display = 'flex';
+      document.getElementById('tree-empty-title').textContent = 'GRAPH VISUALIZATION UNAVAILABLE';
+      document.getElementById('tree-empty-sub').textContent = 'D3.js is not loaded. The tree panel requires a local D3 build.';
+      treeInitDone = true;
+      return;
+    }
+    treeZoom = d3.zoom()
+      .scaleExtent([0.04, 10])
+      .on('zoom', (ev) => {
+        // Only flag a user-initiated pan/zoom (sourceEvent is null for programmatic transitions)
+        if (ev.sourceEvent) treePanOccurred = true;
+        treeTransform = ev.transform;
+        drawFrame();
+      });
+
+    // D3 drag — subject() returns the node under the pointer (or null → zoom handles it)
+    const dragBehavior = d3.drag()
+      .subject(function(ev) {
+        const t = d3.zoomTransform(treeCanvas);
+        return canvasHitTest(t.invertX(ev.x), t.invertY(ev.y));
+      })
+      .on('start', (ev) => {
+        treeDidDrag = false;
+        treeDragStartX = ev.x;
+        treeDragStartY = ev.y;
+        // Capture the offset from cursor to node center in graph space so the node
+        // stays locked under the exact click point throughout the drag.
+        const t0 = d3.zoomTransform(treeCanvas);
+        treeDragOffsetX = ev.subject.x - t0.invertX(ev.x);
+        treeDragOffsetY = ev.subject.y - t0.invertY(ev.y);
+        // Very low alpha — keeps the sim alive for link forces on the dragged node
+        // without reheating neighbors enough to cause visible jiggle.
+        if (!ev.active && treeSim) treeSim.alphaTarget(0.05).restart();
+        ev.subject.fx = ev.subject.x;
+        ev.subject.fy = ev.subject.y;
+      })
+      .on('drag', (ev) => {
+        // Require ≥4px movement before treating as a drag (prevents accidental drag on click)
+        const dx = ev.x - treeDragStartX, dy = ev.y - treeDragStartY;
+        if (!treeDidDrag && Math.sqrt(dx * dx + dy * dy) < 4) return;
+        treeDidDrag = true;
+        const t = d3.zoomTransform(treeCanvas);
+        ev.subject.fx = t.invertX(ev.x) + treeDragOffsetX;
+        ev.subject.fy = t.invertY(ev.y) + treeDragOffsetY;
+      })
+      .on('end', (ev) => {
+        if (!ev.active && treeSim) treeSim.alphaTarget(0);
+        ev.subject.fx = null;
+        ev.subject.fy = null;
+        if (!treeDidDrag) {
+          const d = ev.subject;
+          treeFocusId === d.id ? treeClearFocus() : treeSetFocus(d.id);
+        }
+      });
+
+    // Drag must be registered before zoom: when subject() finds a node it calls
+    // stopImmediatePropagation(), preventing zoom from treating the click as a pan.
+    // When subject() returns null (empty space), propagation continues and zoom handles it.
+    d3.select(treeCanvas).call(dragBehavior).call(treeZoom);
+
+    // Background click (no node hit, no pan movement) → clear focus
+    treeCanvas.addEventListener('mousedown', (ev) => {
+      treePanStart    = { x: ev.clientX, y: ev.clientY };
+      treePanOccurred = false; // reset; zoom handler will set true if user actually pans
+    });
+    treeCanvas.addEventListener('click', (ev) => {
+      // If D3 zoom fired a user-initiated event (pan/scroll) during this gesture, ignore
+      if (treePanOccurred) return;
+      if (!treePanStart) return;
+      const dx = Math.abs(ev.clientX - treePanStart.x);
+      const dy = Math.abs(ev.clientY - treePanStart.y);
+      if (dx > 8 || dy > 8) return; // was a pan, ignore
+      const [gx, gy] = canvasClientToGraph(ev.clientX, ev.clientY);
+      if (!canvasHitTest(gx, gy)) treeClearFocus();
+    });
+
+    // Hover tooltip
+    treeCanvas.addEventListener('mousemove', (ev) => {
+      if (!treeAllNodes.length) return;
+      const [gx, gy] = canvasClientToGraph(ev.clientX, ev.clientY);
+      const hovered = canvasHitTest(gx, gy);
+      if (hovered) {
+        treeShowTip(ev, hovered);
+        treeCanvas.style.cursor = 'pointer';
+      } else {
+        treeHideTip();
+        treeCanvas.style.cursor = '';
+      }
+    });
+    treeCanvas.addEventListener('mouseleave', () => treeHideTip());
+
+    treeInitDone = true;
+  }
+
+  // ── Render cycle ─────────────────────────────────────────────────────────────
+
+  function treePrepareGraphData(nodes, edges) {
+    treeAllNodes   = nodes;
+    treeAllEdges   = edges;
+    treeFocusId    = null;
+    treeActivePath = null;
+    treeSearchStr  = '';
+    document.getElementById('tree-search').value = '';
+
+    // Server provides degree; fall back to client-side computation if missing
+    if (nodes.length && nodes[0].degree == null) {
+      const deg = {};
+      edges.forEach(e => {
+        deg[e.source] = (deg[e.source] || 0) + 1;
+        deg[e.target] = (deg[e.target] || 0) + 1;
+      });
+      nodes.forEach(n => { n.degree = deg[n.id] || 0; });
+    }
+
+    // Pre-compute neighbor sets for focus-mode opacity
+    const nbr = {};
+    nodes.forEach(n => { nbr[n.id] = new Set(); });
+    edges.forEach(e => {
+      if (nbr[e.source]) nbr[e.source].add(e.target);
+      if (nbr[e.target]) nbr[e.target].add(e.source);
+    });
+    nodes.forEach(n => { n.neighborIds = nbr[n.id] || new Set(); });
+
+    treeNodeById = {};
+    nodes.forEach(n => { treeNodeById[n.id] = n; });
+
+    // Group nodes by file for cluster hulls
+    treeFileGroups = {};
+    nodes.forEach(n => {
+      const fp = n.file_path || '';
+      if (!treeFileGroups[fp]) treeFileGroups[fp] = [];
+      treeFileGroups[fp].push(n);
+    });
+    const fileKeys = Object.keys(treeFileGroups);
+    treeFileColors = {};
+    fileKeys.forEach((fp, i) => {
+      treeFileColors[fp] = FILE_HULL_PALETTE[i % FILE_HULL_PALETTE.length];
+    });
+
+    treeFileEntries = Object.entries(treeFileGroups);
+    treeNodesByColor = {};
+    nodes.forEach(n => {
+      const c = treeColor(n.symbol_type);
+      if (!treeNodesByColor[c]) treeNodesByColor[c] = [];
+      treeNodesByColor[c].push(n);
+    });
+    treeCachedHulls = [];
+    treeCachedClusterLabels = [];
+    treeFrameCounter = 0;
+    treeLastHullFrame = -999;
+
+    return { nodes, edges };
+  }
+
+  function treeRender(nodes, edges, loadId) {
+    const prepared = treePrepareGraphData(nodes, edges);
+    treeRenderPrepared(prepared.nodes, prepared.edges, loadId);
+  }
+
+  function treeRenderPrepared(nodes, edges, loadId) {
+    if (loadId != null && loadId !== treeLoadSeq) return;
+
+    if (treeSim) treeSim.stop();
+
+    if (!treeD3Available) {
+      // Without D3, just draw static nodes without force simulation
+      treeRefreshShapeCaches(true);
+      drawFrame();
+      treeRebuildDirTree();
+      document.getElementById('tree-empty').style.display   = 'none';
+      treeClearLoadState(loadId);
+      return;
+    }
+
+    const W = treeCanvas ? treeCanvas.width  : 900;
+    const H = treeCanvas ? treeCanvas.height : 600;
+
+    // Higher alphaDecay (0.05 vs 0.025) converges in ~90 ticks instead of ~180
+    treeSim = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(edges)
+        .id(d => d.id)
+        .distance(d => 60 + (d.source.degree || 0) * 4)
+        .strength(0.5))
+      .force('charge', d3.forceManyBody().strength(-450).distanceMax(500))
+      .force('center', d3.forceCenter(W / 2, H / 2).strength(0.06))
+      .force('collide', d3.forceCollide().radius(d => treeNodeR(d) + 12))
+      .force('cluster', makeClusterForce(0.18))
+      .alphaDecay(0.05)
+      .velocityDecay(0.4);
+
+    let firstDraw = true;
+    treeSim.on('tick', () => {
+      if (loadId != null && loadId !== treeLoadSeq) return;
+      if (firstDraw) {
+        firstDraw = false;
+        treeSetLoadState('drawing', nodes.length.toLocaleString() + ' nodes ready');
+      }
+      drawFrame();
+    });
+    treeSim.on('end',  () => {
+      if (loadId != null && loadId !== treeLoadSeq) return;
+      treeRefreshShapeCaches(true);
+      drawFrame();
+      if (treeFocusId === null) treeZoomFit(750);
+    });
+
+    document.getElementById('tree-empty').style.display   = 'none';
+    treeSetLoadState('drawing', nodes.length.toLocaleString() + ' nodes ready');
+    treeRefreshShapeCaches(true);
+    drawFrame();
+    treeRebuildDirTree();
+    window.requestAnimationFrame(() => treeClearLoadState(loadId));
+  }
+
+  function treeSetFocus(id) {
+    treeFocusId    = id;
+    treeActivePath = null;
+    drawFrame();
+
+    const n = treeNodeById[id];
+    if (n && treeCanvas && treeZoom && treeD3Available) {
+      const W = treeCanvas.width, H = treeCanvas.height;
+
+      // Collect the focus node + its direct neighbors (depth-1)
+      const focusNodes = [n];
+      if (n.neighborIds) {
+        n.neighborIds.forEach(nid => {
+          const nn = treeNodeById[nid];
+          if (nn && nn.x != null) focusNodes.push(nn);
+        });
+      }
+
+      let xf;
+      if (focusNodes.length === 1) {
+        // Isolated node: zoom in close, at least scale 2.5
+        const scale = Math.max(treeTransform.k, 2.5);
+        xf = d3.zoomIdentity
+          .translate(W / 2 - n.x * scale, H / 2 - n.y * scale)
+          .scale(scale);
+      } else {
+        // Fit node + neighbors with padding
+        let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+        focusNodes.forEach(fn => {
+          x0 = Math.min(x0, fn.x); x1 = Math.max(x1, fn.x);
+          y0 = Math.min(y0, fn.y); y1 = Math.max(y1, fn.y);
+        });
+        const pad   = 90;
+        const bboxW = x1 - x0 || 1;
+        const bboxH = y1 - y0 || 1;
+        // Scale to fill viewport with padding; clamp between 1.0 and 4.0
+        const scale = Math.min(4.0, Math.max(1.0,
+          Math.min((W - pad * 2) / bboxW, (H - pad * 2) / bboxH)
+        ));
+        const tx = (W - scale * (x0 + x1)) / 2;
+        const ty = (H - scale * (y0 + y1)) / 2;
+        xf = d3.zoomIdentity.translate(tx, ty).scale(scale);
+      }
+
+      d3.select(treeCanvas).transition().duration(400).call(treeZoom.transform, xf);
+    }
+  }
+
+  function treeClearFocus() {
+    treeFocusId    = null;
+    treeActivePath = null;
+    drawFrame();
+  }
+
+  function treeUpdateOpacities() {
+    drawFrame();
+  }
+
+  function treeZoomFit(duration) {
+    if (!treeD3Available || !treeCanvas || !treeAllNodes.length) return;
+    const W = treeCanvas.width, H = treeCanvas.height;
+
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    treeAllNodes.forEach(n => {
+      if (n.x == null) return;
+      x0 = Math.min(x0, n.x); x1 = Math.max(x1, n.x);
+      y0 = Math.min(y0, n.y); y1 = Math.max(y1, n.y);
+    });
+    if (!isFinite(x0)) return;
+
+    const pad   = 60;
+    const scale = Math.min(0.92, Math.min(W / (x1 - x0 + pad * 2), H / (y1 - y0 + pad * 2)));
+    const tx    = (W - scale * (x0 + x1)) / 2;
+    const ty    = (H - scale * (y0 + y1)) / 2;
+    const xf    = d3.zoomIdentity.translate(tx, ty).scale(scale);
+
+    const sel = d3.select(treeCanvas);
+    (duration > 0 ? sel.transition().duration(duration) : sel).call(treeZoom.transform, xf);
+  }
+
+  function treeResetView() {
+    treeClearFocus();
+    treeZoomFit(400);
+  }
+
+  function treeSearch(query) {
+    clearTimeout(treeSearchTimer);
+    treeSearchTimer = setTimeout(() => {
+      treeSearchStr  = query.trim().toLowerCase();
+      treeActivePath = null;
+      drawFrame();
+
+      document.querySelectorAll('.dir-item.dir-file').forEach(el => el.classList.remove('dir-active'));
+
+      if (treeSearchStr && treeAllNodes.length) {
+        const hit = treeAllNodes.find(n => n.label.toLowerCase().includes(treeSearchStr));
+        if (hit && hit.x != null && treeCanvas && treeZoom && treeD3Available) {
+          const W = treeCanvas.width, H = treeCanvas.height;
+          d3.select(treeCanvas).transition().duration(400).call(
+            treeZoom.transform,
+            d3.zoomIdentity.translate(W / 2 - hit.x, H / 2 - hit.y).scale(1.6)
+          );
+        }
+      }
+    }, 150);
+  }
+
+  // ── Directory sidebar ──────────────────────────────────────────────────────
+
+  function treeRebuildDirTree() {
+    const container = document.getElementById('tree-dir-tree');
+    container.innerHTML = '';
+    if (!treeAllNodes.length) return;
+
+    // Build tree structure from file paths
+    const tree = {};
+    const fileNodeMap = {}; // path → [nodeIds]
+
+    treeAllNodes.forEach(n => {
+      const fp = n.file_path || 'unknown';
+      if (!fileNodeMap[fp]) fileNodeMap[fp] = [];
+      fileNodeMap[fp].push(n.id);
+
+      // Split path into segments
+      const parts = fp.replace(/\\/g, '/').split('/');
+      let cur = tree;
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (!cur[parts[i]]) cur[parts[i]] = { __children: {}, __isDir: true };
+        cur = cur[parts[i]].__children;
+      }
+      const fname = parts[parts.length - 1];
+      if (!cur[fname]) cur[fname] = { __children: {}, __isDir: false, __path: fp };
+    });
+
+    function renderNode(obj, name, depth, isDir) {
+      const div = document.createElement('div');
+      div.className = 'dir-item ' + (isDir ? 'dir-dir' : 'dir-file');
+
+      const indent = document.createElement('span');
+      indent.className = 'dir-item-indent';
+      indent.style.width = (depth * 12 + 6) + 'px';
+      div.appendChild(indent);
+
+      const icon = document.createElement('span');
+      icon.className = 'dir-item-icon';
+      icon.textContent = isDir ? '▸ ' : '';
+      div.appendChild(icon);
+
+      const label = document.createElement('span');
+      label.className = 'dir-item-name';
+      label.textContent = name;
+      div.appendChild(label);
+
+      if (!isDir && obj.__path) {
+        const fp = obj.__path;
+        const cnt = (fileNodeMap[fp] || []).length;
+        const badge = document.createElement('span');
+        badge.style.cssText = 'margin-left:auto;padding-right:6px;font-size:9px;color:var(--dim);flex-shrink:0';
+        badge.textContent = cnt;
+        div.appendChild(badge);
+
+        div.onclick = () => {
+          treeFocusId = null;
+          treeSearchStr = '';
+          document.getElementById('tree-search').value = '';
+          treeActivePath = (treeActivePath === fp) ? null : fp;
+          document.querySelectorAll('.dir-item.dir-file').forEach(el => el.classList.remove('dir-active'));
+          if (treeActivePath) div.classList.add('dir-active');
+          treeUpdateOpacities();
+        };
+      }
+
+      container.appendChild(div);
+
+      // Render children (dirs first, then files)
+      const kids = obj.__children || {};
+      const dirs  = Object.entries(kids).filter(([, v]) => v.__isDir);
+      const files = Object.entries(kids).filter(([, v]) => !v.__isDir);
+      [...dirs, ...files].forEach(([childName, childObj]) => {
+        renderNode(childObj, childName, depth + 1, childObj.__isDir);
+      });
+    }
+
+    // Render root children
+    const dirs  = Object.entries(tree).filter(([, v]) => v.__isDir);
+    const files = Object.entries(tree).filter(([, v]) => !v.__isDir);
+    [...dirs, ...files].forEach(([name, obj]) => {
+      renderNode(obj, name, 0, obj.__isDir);
+    });
+  }
+
+  // ── Tooltip ────────────────────────────────────────────────────────────────
+
+  function treeShowTip(ev, d) {
+    const tip = document.getElementById('tree-tooltip');
+    tip.innerHTML = `
+      <span class="tt-sym">${escHtml(d.label)}</span>
+      <span class="tt-type">${escHtml(d.symbol_type || 'unknown')}</span>
+      <span class="tt-file">${escHtml(d.file_path || '')}</span>
+      <span class="tt-deg">${d.degree || 0} connection${d.degree !== 1 ? 's' : ''}</span>
+    `;
+    tip.style.display = 'block';
+    treeMoveTip(ev);
+  }
+
+  function treeMoveTip(ev) {
+    const wrap = document.getElementById('tree-canvas-wrap');
+    const rect = wrap.getBoundingClientRect();
+    const tip  = document.getElementById('tree-tooltip');
+    let x = ev.clientX - rect.left + 18;
+    let y = ev.clientY - rect.top  - 10;
+    if (x + 310 > rect.width)  x = ev.clientX - rect.left - 320;
+    if (y + 100 > rect.height) y = ev.clientY - rect.top  - 110;
+    tip.style.left = x + 'px';
+    tip.style.top  = y + 'px';
+  }
+
+  function treeHideTip() {
+    document.getElementById('tree-tooltip').style.display = 'none';
+  }
+
+  // ── Fetch & load ───────────────────────────────────────────────────────────
+
+  function treeSelectRepo(selectionKey) {
+    if (!selectionKey) return;
+    const selected = workspaceSelectorRepos.find(item => item.key === selectionKey);
+    const repoId = selected ? selected.repo_id : selectionKey;
+    const workspaceId = selected ? selected.workspace_id : '';
+    const requestLabel = selected ? selected.label : repoId;
+    const loadId = ++treeLoadSeq;
+    if (treeLoadAbort) treeLoadAbort.abort();
+    treeLoadAbort = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    if (!treeInitDone) treeInitCanvas();
+    if (!treeD3Available) {
+      document.getElementById('tree-empty').style.display = 'flex';
+      document.getElementById('tree-empty-sub').textContent =
+        'Tree visualization is unavailable (D3.js not loaded). Graph data is still accessible via the API.';
+      return;
+    }
+
+    document.getElementById('tree-empty').style.display = 'none';
+    treeSetLoadState('fetching', requestLabel);
+    document.getElementById('tree-info').textContent = '';
+    treeResetGraphView();
+
+    const url = workspaceId
+      ? '/api/graph?workspace_id=' + encodeURIComponent(workspaceId) + '&repo_id=' + encodeURIComponent(repoId || '')
+      : '/api/graph?repo_id=' + encodeURIComponent(repoId);
+
+    fetch(url, treeLoadAbort ? { signal: treeLoadAbort.signal } : undefined)
+      .then(r => r.json())
+      .then(data => {
+        if (loadId !== treeLoadSeq) return;
+        treeSetLoadState('preparing', requestLabel);
+
+        if (data.error) {
+          treeShowLoadError(loadId, 'Error: ' + data.error);
+          return;
+        }
+        if (!data.nodes || data.nodes.length === 0) {
+          treeClearLoadState(loadId);
+          treeResetGraphView();
+          document.getElementById('tree-empty').style.display = 'flex';
+          document.getElementById('tree-empty-sub').textContent =
+            'No symbols found for this workspace. Try running ingest_repo first.';
+          return;
+        }
+
+        const banner = document.getElementById('tree-truncation-banner');
+        if (data.truncated) {
+          banner.textContent = 'Showing 500 of ' + data.total_node_count.toLocaleString() + ' nodes (most connected)';
+          banner.style.display = 'block';
+        } else {
+          banner.style.display = 'none';
+        }
+
+        document.getElementById('tree-info').textContent =
+          data.nodes.length.toLocaleString() + ' nodes · ' +
+          data.edges.length.toLocaleString() + ' edges';
+
+        window.requestAnimationFrame(() => {
+          if (loadId !== treeLoadSeq) return;
+          try {
+            treeSetLoadState('layout', data.nodes.length.toLocaleString() + ' nodes · ' + data.edges.length.toLocaleString() + ' edges');
+            treeRender(data.nodes, data.edges, loadId);
+          } catch (err) {
+            treeShowLoadError(loadId, 'Render failed: ' + err.message);
+          }
+        });
+      })
+      .catch(err => {
+        if (err.name === 'AbortError' || loadId !== treeLoadSeq) return;
+        treeShowLoadError(loadId, 'Fetch failed: ' + err.message);
+      });
+  }
+
+  function treeOnTabActivate() {
+    fetchStats(false);
+
+    // Fit canvas to current bounds if already initialized
+    if (treeInitDone && treeCanvas) {
+      setTimeout(() => treeZoomFit(0), 50);
+    }
+  }
+
+  // ── Workspace Selector Component ───────────────────────────────────────────
+
+  let workspaceSelectorRepos = [];
+  let workspaceSelectorCurrent = '';
+  let workspaceSelectorFocusedIndex = -1;
+
+  function workspaceSelectorItemsFromStats(data) {
+    const dbs = Array.isArray(data.dbs) ? data.dbs : [];
+    if (dbs.length) {
+      const items = [];
+      dbs.forEach(db => {
+        const repos = Array.isArray(db.repos) ? db.repos : [];
+        if (repos.length) {
+          repos.forEach(repo => {
+            items.push({
+              key: db.workspace_id + '::' + repo.repo_id,
+              workspace_id: db.workspace_id,
+              repo_id: repo.repo_id,
+              label: workspaceName(db) + ' / ' + repo.repo_id,
+              count: repo.symbol_count || 0,
+              status: db.status,
+            });
+          });
+        } else {
+          items.push({
+            key: db.workspace_id,
+            workspace_id: db.workspace_id,
+            repo_id: '',
+            label: workspaceName(db),
+            count: db.symbol_count || 0,
+            status: db.status,
+          });
+        }
+      });
+      return items;
+    }
+    const repos = (data.database && data.database.repos) ? data.database.repos : [];
+    return repos.map(repo => ({
+      key: repo.repo_id,
+      workspace_id: '',
+      repo_id: repo.repo_id,
+      label: repo.repo_id,
+      count: repo.symbol_count || 0,
+      status: 'available',
+    }));
+  }
+
+  function workspaceSelectorPopulateFromStats(data) {
+    workspaceSelectorPopulate(workspaceSelectorItemsFromStats(data || {}));
+  }
+
+  function workspaceSelectorPopulate(items) {
+    workspaceSelectorRepos = items;
+    const dropdown = document.getElementById('workspace-selector-dropdown');
+    const sel = document.getElementById('tree-repo-select');
+
+    // Sync hidden native select
+    sel.innerHTML = '<option value="">Select workspace</option>';
+    items.forEach(item => {
+      const opt = document.createElement('option');
+      opt.value = item.key;
+      opt.textContent = item.label + ' (' + (item.count || 0).toLocaleString() + ' symbols)';
+      sel.appendChild(opt);
+    });
+
+    // Populate custom dropdown
+    if (items.length === 0) {
+      dropdown.innerHTML = '<div class="workspace-selector-empty">No indexed workspaces found</div>';
+    } else {
+      dropdown.innerHTML = '';
+      items.forEach((item, idx) => {
+        const option = document.createElement('div');
+        option.className = 'workspace-selector-option';
+        option.setAttribute('role', 'option');
+        option.setAttribute('data-repo-id', item.key);
+        option.setAttribute('data-index', idx);
+        option.innerHTML = `
+          <span class="workspace-selector-option-name">${escHtml(item.label)}</span>
+          <span class="workspace-selector-option-count">${(item.count || 0).toLocaleString()} symbols</span>
+        `;
+        option.addEventListener('click', () => workspaceSelectorSelect(item.key));
+        dropdown.appendChild(option);
+      });
+    }
+
+    // Restore or auto-select
+    if (workspaceSelectorCurrent) {
+      workspaceSelectorUpdateDisplay(workspaceSelectorCurrent);
+      sel.value = workspaceSelectorCurrent;
+    } else if (items.length === 1 && document.getElementById('panel-tree').classList.contains('active')) {
+      workspaceSelectorSelect(items[0].key);
+    }
+  }
+
+  function workspaceSelectorSelect(selectionKey) {
+    workspaceSelectorCurrent = selectionKey;
+    workspaceSelectorUpdateDisplay(selectionKey);
+    workspaceSelectorClose();
+    document.getElementById('tree-repo-select').value = selectionKey;
+    treeSelectRepo(selectionKey);
+    // Return focus to button for consistent focus state
+    document.getElementById('workspace-selector-btn').focus();
+  }
+
+  function workspaceSelectorUpdateDisplay(selectionKey) {
+    const label = document.getElementById('workspace-selector-label');
+    const count = document.getElementById('workspace-selector-count');
+    const item = workspaceSelectorRepos.find(r => r.key === selectionKey);
+
+    if (item) {
+      label.textContent = item.label;
+      label.classList.remove('empty');
+      count.textContent = (item.count || 0).toLocaleString() + ' symbols';
+    } else {
+      label.textContent = 'Select workspace';
+      label.classList.add('empty');
+      count.textContent = '';
+    }
+
+    // Update selected state
+    document.querySelectorAll('.workspace-selector-option').forEach(opt => {
+      if (opt.getAttribute('data-repo-id') === selectionKey) {
+        opt.classList.add('selected');
+        opt.setAttribute('aria-selected', 'true');
+      } else {
+        opt.classList.remove('selected');
+        opt.setAttribute('aria-selected', 'false');
+      }
+    });
+  }
+
+  function workspaceSelectorToggle() {
+    const btn = document.getElementById('workspace-selector-btn');
+    const isOpen = btn.getAttribute('aria-expanded') === 'true';
+    if (isOpen) {
+      workspaceSelectorClose();
+    } else {
+      workspaceSelectorOpen();
+    }
+  }
+
+  function workspaceSelectorOpen() {
+    const btn = document.getElementById('workspace-selector-btn');
+    const dropdown = document.getElementById('workspace-selector-dropdown');
+    btn.setAttribute('aria-expanded', 'true');
+    dropdown.classList.add('open');
+    workspaceSelectorFocusedIndex = -1;
+    
+    // Scroll to selected option
+    const selected = dropdown.querySelector('.workspace-selector-option.selected');
+    if (selected) {
+      selected.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function workspaceSelectorClose() {
+    const btn = document.getElementById('workspace-selector-btn');
+    const dropdown = document.getElementById('workspace-selector-dropdown');
+    btn.setAttribute('aria-expanded', 'false');
+    dropdown.classList.remove('open');
+    workspaceSelectorFocusedIndex = -1;
+    document.querySelectorAll('.workspace-selector-option').forEach(opt => {
+      opt.classList.remove('focused');
+    });
+  }
+
+  function workspaceSelectorNavigate(direction) {
+    const options = Array.from(document.querySelectorAll('.workspace-selector-option'));
+    if (options.length === 0) return;
+
+    // Remove previous focus
+    if (workspaceSelectorFocusedIndex >= 0 && workspaceSelectorFocusedIndex < options.length) {
+      options[workspaceSelectorFocusedIndex].classList.remove('focused');
+    }
+
+    // Calculate new index
+    if (direction === 'down') {
+      workspaceSelectorFocusedIndex = Math.min(workspaceSelectorFocusedIndex + 1, options.length - 1);
+    } else if (direction === 'up') {
+      workspaceSelectorFocusedIndex = Math.max(workspaceSelectorFocusedIndex - 1, 0);
+    }
+
+    // Apply focus
+    const focused = options[workspaceSelectorFocusedIndex];
+    if (focused) {
+      focused.classList.add('focused');
+      focused.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function workspaceSelectorSelectFocused() {
+    const options = Array.from(document.querySelectorAll('.workspace-selector-option'));
+    if (workspaceSelectorFocusedIndex >= 0 && workspaceSelectorFocusedIndex < options.length) {
+      const repoId = options[workspaceSelectorFocusedIndex].getAttribute('data-repo-id');
+      workspaceSelectorSelect(repoId);
+    }
+  }
+
+  // Event listeners
+  document.addEventListener('DOMContentLoaded', () => {
+    const btn = document.getElementById('workspace-selector-btn');
+    const dropdown = document.getElementById('workspace-selector-dropdown');
+
+    btn.addEventListener('click', () => workspaceSelectorToggle());
+
+    btn.addEventListener('keydown', (e) => {
+      const isOpen = btn.getAttribute('aria-expanded') === 'true';
+      
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        if (isOpen && workspaceSelectorFocusedIndex >= 0) {
+          workspaceSelectorSelectFocused();
+        } else {
+          workspaceSelectorToggle();
+        }
+      } else if (e.key === 'Escape' && isOpen) {
+        e.preventDefault();
+        workspaceSelectorClose();
+        btn.focus();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (!isOpen) {
+          workspaceSelectorOpen();
+          const options = Array.from(document.querySelectorAll('.workspace-selector-option'));
+          if (options.length > 0) {
+            workspaceSelectorFocusedIndex = 0;
+            options[0].classList.add('focused');
+            options[0].scrollIntoView({ block: 'nearest' });
+          }
+        } else {
+          workspaceSelectorNavigate('down');
+        }
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (!isOpen) {
+          workspaceSelectorOpen();
+          const options = Array.from(document.querySelectorAll('.workspace-selector-option'));
+          if (options.length > 0) {
+            workspaceSelectorFocusedIndex = options.length - 1;
+            options[workspaceSelectorFocusedIndex].classList.add('focused');
+            options[workspaceSelectorFocusedIndex].scrollIntoView({ block: 'nearest' });
+          }
+        } else {
+          workspaceSelectorNavigate('up');
+        }
+      }
+    });
+
+    // Close on outside click
+    document.addEventListener('click', (e) => {
+      if (!btn.contains(e.target) && !dropdown.contains(e.target)) {
+        workspaceSelectorClose();
+      }
+    });
+  });
+</script>
+</body>
+</html>

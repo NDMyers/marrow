@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "ingest_wall_ms_max": 300000,
+  "query_wall_ms_max": 180000,
+  "flake_policy": "GitHub-hosted runners are noisy. These caps are smoke-test guards only. For release or Accrualify-scale gating, record results in docs/perf-baseline-runbook.md on a pinned fixture or use a self-hosted runner; allow 2–3 reruns on borderline failures."
+}

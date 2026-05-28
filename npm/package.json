@@ -1,0 +1,47 @@
+{
+  "name": "@nickm-swe/marrow",
+  "version": "0.1.0",
+  "description": "A local, deterministic MCP server that parses multi-language codebases into an AST dependency graph.",
+  "keywords": [
+    "mcp",
+    "ast",
+    "tree-sitter",
+    "rust",
+    "llm",
+    "context"
+  ],
+  "license": "MIT",
+  "author": "NDMyers <99777840+NDMyers@users.noreply.github.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NDMyers/marrow.git"
+  },
+  "homepage": "https://github.com/NDMyers/marrow#readme",
+  "bugs": {
+    "url": "https://github.com/NDMyers/marrow/issues"
+  },
+  "bin": {
+    "marrow": "bin/marrow.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "alpha"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "dependencies": {
+    "axios": "^1.13.6",
+    "tar": "^7.5.9"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,243 @@
+name: Release Marrow
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+' # Triggers when you push a tag like v0.1.0
+
+permissions:
+  contents: read
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # actions/checkout — first-party, pinned to v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Create GitHub Release
+        # softprops/action-gh-release — third-party, pinned to v2.2.2
+        # Exception: Widely-used release action; monitored via Dependabot.
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          generate_release_notes: true
+
+  upload-binaries:
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      
+      - name: Install Rust
+        # dtolnay/rust-toolchain — first-party Rust ecosystem, uses branch refs by design.
+        # Exception: This action uses branch-based refs (stable/nightly) intentionally;
+        # SHA pinning would break automatic toolchain updates.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build and Upload Binary
+        # taiki-e/upload-rust-binary-action — third-party, pinned to v1.25.0
+        # Exception: Widely-used Rust binary release action; monitored via Dependabot.
+        uses: taiki-e/upload-rust-binary-action@0706eed15bb53dd0a5d076afea4e4a0a0e31e5cf # v1.25.0
+        with:
+          # (optional) Comma-separated list of binary names (non-extension portion of filename) to build and upload.
+          # Note that glob pattern is not supported yet.
+          bin: marrow # Must match Cargo.toml [package] name / default binary name
+          # rename the binary in the tarball to 'marrow'
+          archive: marrow-${{ matrix.target }}
+          target: ${{ matrix.target }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          build_args: --locked
+
+  package-macos:
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build DMG
+        run: |
+          chmod +x scripts/package-macos-dmg.sh
+          scripts/package-macos-dmg.sh --target "${{ matrix.target }}" --out-dir dist
+      - name: Upload DMG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" dist/*.dmg --repo "${{ github.repository }}"
+
+  package-linux:
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Install cargo-deb and AppImage tooling
+        run: |
+          set -euo pipefail
+          cargo install cargo-deb --locked
+          sudo apt-get update
+          sudo apt-get install -y desktop-file-utils libfuse2
+          APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          curl -fsSL "$APPIMAGETOOL_URL" -o /tmp/appimagetool
+          echo "$APPIMAGETOOL_SHA256  /tmp/appimagetool" | sha256sum -c -
+          chmod +x /tmp/appimagetool
+      - name: Stage Linux package assets
+        run: |
+          chmod +x scripts/stage-linux-package-assets.sh scripts/package-linux-appimage.sh
+          scripts/stage-linux-package-assets.sh --target x86_64-unknown-linux-gnu --out-dir target/package-assets/linux
+      - name: Build DEB
+        run: cargo deb --target x86_64-unknown-linux-gnu --no-build --output dist/marrow_${{ github.ref_name }}_amd64.deb
+      - name: Build AppImage
+        env:
+          APPIMAGETOOL_BIN: /tmp/appimagetool
+        run: scripts/package-linux-appimage.sh --target x86_64-unknown-linux-gnu --out-dir dist
+      - name: Upload Linux packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" dist/*.deb dist/*.AppImage --repo "${{ github.repository }}"
+
+  package-windows:
+    needs: create-release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install packaging tools
+        shell: pwsh
+        run: |
+          cargo install cargo-wix --locked
+          choco install wixtoolset --no-progress -y
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc --locked
+          cargo wix --no-build --target x86_64-pc-windows-msvc --output dist/Marrow-${{ github.ref_name }}-x86_64-pc-windows-msvc.msi
+      - name: Upload MSI
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" dist/*.msi --repo "${{ github.repository }}"
+
+  generate-checksums:
+    needs:
+      - upload-binaries
+      - package-macos
+      - package-linux
+      - package-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.tar.gz"
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.zip" || true
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.dmg" || true
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.deb" || true
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.AppImage" || true
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir assets --pattern "*.msi" || true
+      
+      - name: Generate SHA256 checksums
+        run: |
+          cd assets
+          required_assets=(
+            marrow-x86_64-unknown-linux-gnu.tar.gz
+            marrow-x86_64-apple-darwin.tar.gz
+            marrow-aarch64-apple-darwin.tar.gz
+            marrow-x86_64-pc-windows-msvc.tar.gz
+          )
+          for asset in "${required_assets[@]}"; do
+            test -f "$asset"
+          done
+          shasum -a 256 * > checksums.sha256
+          cat checksums.sha256
+      
+      - name: Upload checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" --repo "${{ github.repository }}" assets/checksums.sha256
+
+  publish-npm:
+    needs: generate-checksums
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    defaults:
+      run:
+        working-directory: npm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+          cache-dependency-path: npm/package-lock.json
+      - name: Verify release assets and checksums
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir release-assets --pattern checksums.sha256
+
+          required_assets=(
+            marrow-x86_64-unknown-linux-gnu.tar.gz
+            marrow-x86_64-apple-darwin.tar.gz
+            marrow-aarch64-apple-darwin.tar.gz
+            marrow-x86_64-pc-windows-msvc.tar.gz
+          )
+
+          for asset in "${required_assets[@]}"; do
+            gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --dir release-assets --pattern "$asset"
+            test -f "release-assets/$asset"
+            checksum_line="$(awk -v name="$asset" '$2 == name { print; found=1 } END { exit found ? 0 : 1 }' release-assets/checksums.sha256)"
+            printf '%s\n' "$checksum_line" | (cd release-assets && shasum -a 256 -c -)
+          done
+      - run: npm ci --ignore-scripts
+      - run: npm audit --omit=dev --audit-level=moderate
+      - run: npm pack --dry-run --json
+      - run: npm publish --dry-run --access public --tag alpha
+      - run: npm publish --access public --tag alpha --provenance

@@ -1,0 +1,56 @@
+# Rust build artifacts
+/target
+*.pdb
+
+# npm / Node
+node_modules/
+npm-debug.log
+npm-error.log
+yarn.lock
+*.tgz
+coverage/
+.nyc_output/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+.env
+.env.local
+
+# Local config overrides
+*.local.json
+.marrowrc.json
+
+# Marrow runtime data (graph.db, daemon socket, watcher state)
+.marrow/
+
+# Build / distribution outputs
+dist/
+out/
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+
+# Editors / IDEs (generic)
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.sublime-project
+.sublime-workspace

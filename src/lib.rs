@@ -1,0 +1,15 @@
+pub mod activity;
+pub mod context;
+pub mod daemon;
+pub mod dashboard;
+pub mod db;
+pub mod ingestion;
+pub mod ipc;
+pub mod packaging;
+pub mod registry;
+pub mod retrieval;
+pub mod service;
+pub mod skills;
+pub mod state;
+pub mod ui_app;
+pub mod watcher;

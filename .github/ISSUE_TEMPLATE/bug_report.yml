@@ -1,0 +1,80 @@
+name: "🐛 Bug Report"
+description: "Report a bug or unexpected behavior"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug! Please provide as much detail as possible.
+
+  - type: input
+    id: version
+    attributes:
+      label: "Marrow Version"
+      placeholder: "e.g., 0.1.0 (or 'built from source' with commit)"
+      description: "Run `marrow --version` or specify the commit hash if built locally"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: "Operating System"
+      options:
+        - "macOS (Intel)"
+        - "macOS (Apple Silicon)"
+        - "Linux (Ubuntu/Debian)"
+        - "Linux (Fedora/RHEL)"
+        - "Linux (Other)"
+        - "Windows (WSL2)"
+        - "Windows (native)"
+        - "Other"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: "Installation Method"
+      options:
+        - "npm install -g"
+        - "cargo install"
+        - "Native package (deb/MSI/dmg)"
+        - "Built from source"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: "Steps to Reproduce"
+      description: "Minimal reproducible example or exact steps"
+      placeholder: |
+        1. Run: marrow init
+        2. Run: marrow index
+        3. Run: marrow context "my task"
+      validations:
+        required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Expected Behavior"
+      placeholder: "What should happen?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: "Actual Behavior"
+      placeholder: "What actually happened?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Logs, Error Messages, or Stack Traces"
+      description: "Please paste relevant output. Use code blocks (```)"
+      render: shell

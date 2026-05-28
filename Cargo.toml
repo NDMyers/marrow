@@ -1,0 +1,117 @@
+[package]
+name = "marrow"
+version = "0.1.0"
+edition = "2021"
+authors = ["NDMyers <99777840+NDMyers@users.noreply.github.com>"]
+license = "MIT"
+
+[package.metadata.deb]
+name = "marrow"
+maintainer = "NDMyers <99777840+NDMyers@users.noreply.github.com>"
+copyright = "2026, NDMyers"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+extended-description = "Local deterministic AST context engine and desktop dashboard."
+assets = [
+	["target/x86_64-unknown-linux-gnu/release/marrow", "/usr/bin/marrow", "755"],
+	["target/package-assets/linux/marrow.desktop", "/usr/share/applications/marrow.desktop", "644"],
+	["target/package-assets/linux/marrow.png", "/usr/share/icons/hicolor/256x256/apps/marrow.png", "644"],
+]
+maintainer-scripts = "scripts"
+
+[package.metadata.wix]
+product-name = "Marrow"
+manufacturer = "NDMyers"
+upgrade-guid = "E5C6E7AA-6DB4-4C15-97EA-2D4B58ED5C70"
+path-guid = "3DB7B0E9-9793-4D75-9486-2B0F824BAF59"
+license = false
+eula = false
+
+[dependencies]
+# Official Anthropic MCP SDK for Rust
+rmcp = { version = "0.16.0", features = ["server", "macros", "transport-io"] }
+
+# High-performance async runtime
+tokio = { version = "1.36", features = ["full"] }
+
+# SQLite with Write-Ahead Logging support
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+
+# Serialization for MCP Tool schemas
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# JSON Schema derivation (required by rmcp macros)
+schemars = "1.0"
+
+# AST Parsing Core
+tree-sitter = "0.26.6"
+
+# Language Grammars
+tree-sitter-cpp = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-ruby = "0.23"
+
+# Required for tree-sitter query iteration
+streaming-iterator = "0.1"
+
+# Parallel processing for multi-repo ingestion
+rayon = "1.10.0"
+anyhow = "1.0"
+
+# Tokenizer for token reduction delta quantifications
+tiktoken-rs = "0.5.9"
+
+# Respects .gitignore + custom ignore patterns for directory walking
+ignore = "0.4"
+
+# Interactive terminal UI for the integrate installer
+dialoguer = "0.11"
+inquire = "0.7"
+indicatif = "0.17"
+console = "0.15"
+
+# Home directory resolution for global skill paths
+dirs = "5.0"
+
+# Live web dashboard
+axum            = { version = "0.8", features = ["macros"] }
+tower-http      = { version = "0.6", features = ["cors"] }
+open            = "5"
+reqwest          = { version = "0.12", default-features = false, features = ["json"] }
+tokio-stream    = { version = "0.1", features = ["sync"] }
+futures-util    = "0.3"
+
+# Background file watching for live graph updates
+notify              = "7"
+notify-debouncer-mini = "0.5"
+
+# `getrusage` for perf-harness RSS hint (MARROW-PERF-002)
+libc = "0.2"
+
+# Secure tempfile creation for spill files
+tempfile = "3"
+
+# Desktop application (feature-gated)
+wry = { version = "0.49", optional = true }
+tray-icon = { version = "0.19", optional = true }
+tao = { version = "0.33", optional = true }
+image = { version = "0.25", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = { version = "0.55", optional = true }
+mslnk = { version = "0.1", optional = true }
+
+[features]
+default = ["desktop"]
+desktop = ["dep:wry", "dep:tray-icon", "dep:tao", "dep:image", "dep:winreg", "dep:mslnk"]
+
+[dev-dependencies]
+hyper            = { version = "1", features = ["client", "http1"] }
+hyper-util       = { version = "0.1", features = ["tokio"] }
+http-body-util   = "0.1"
+bytes            = "1"
+tower            = { version = "0.5", features = ["util"] }
