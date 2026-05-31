@@ -4409,9 +4409,7 @@ impl ServerHandler for ContextEngine {
                         .unwrap_or_else(|_| PathBuf::from("."))
                         .canonicalize()
                         .unwrap_or_else(|_| PathBuf::from("."));
-                    let home = std::env::var("HOME")
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|_| PathBuf::from("."));
+                    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
                     Ok(CallToolResult::success(vec![Content::text(
                         format_workspace_setup_summary(&cwd, &home),
                     )]))
@@ -8062,7 +8060,10 @@ fn cmd_integrate(args: &[String]) -> Result<()> {
             anyhow::bail!("unknown integration target: {name}");
         }
 
-        let home = std::env::var("HOME").context("$HOME is not set")?;
+        let home = dirs::home_dir()
+            .context("could not resolve home directory")?
+            .to_string_lossy()
+            .into_owned();
         let home_path = PathBuf::from(&home);
 
         // Resolve (scope, method) pair: prompt if we have a skill target, otherwise default.
@@ -8306,7 +8307,10 @@ fn cmd_integrate(args: &[String]) -> Result<()> {
         .context("Could not resolve current executable path")?
         .to_string_lossy()
         .to_string();
-    let home = std::env::var("HOME").context("$HOME is not set")?;
+    let home = dirs::home_dir()
+        .context("could not resolve home directory")?
+        .to_string_lossy()
+        .into_owned();
     let home_path = PathBuf::from(&home);
     let ctx = IntegrationCtx {
         binary,
@@ -8549,9 +8553,7 @@ fn cmd_integrate(args: &[String]) -> Result<()> {
 
 fn cmd_validate() -> Result<()> {
     let workspace_root = current_workspace_root();
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .context("$HOME is not set")?;
+    let home = dirs::home_dir().context("could not resolve home directory")?;
     let db_path =
         std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
     let conn = db::init_db(&db_path)?;
