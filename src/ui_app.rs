@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 
-#[cfg(feature = "desktop")]
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "linux")))]
 use crate::packaging;
 
 /// The dashboard URL served by the daemon.

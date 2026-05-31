@@ -1,7 +1,9 @@
-#[cfg(feature = "desktop")]
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "linux")))]
 use anyhow::Result;
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "linux")))]
+use std::path::Path;
 #[cfg(feature = "desktop")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[cfg(all(feature = "desktop", target_os = "linux"))]
 const LINUX_UI_APP_OPEN_ARGS: &str = "ui-app open";
