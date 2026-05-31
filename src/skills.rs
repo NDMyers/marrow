@@ -468,7 +468,17 @@ fn install(target: &Path, method: Method, central: &Path) -> Result<InstallStatu
             fs::write(target, MARROW_CORE_SKILL_MD)?;
         }
         Method::Symlink => {
-            std::os::unix::fs::symlink(central, target)?;
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(central, target)?;
+            }
+            #[cfg(not(unix))]
+            {
+                // Symlinks on Windows require elevated privileges or Developer
+                // Mode; fall back to copying the central file's content so the
+                // target still ends up managed and in sync.
+                fs::copy(central, target)?;
+            }
         }
     }
 
@@ -732,6 +742,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn dangling_symlink_is_replaced_not_preserved() {
         let tmp = tempdir().unwrap();
@@ -925,6 +936,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_skill_to_dir_symlink_refreshes_managed_central_source() {
         let tmp = tempdir().unwrap();
@@ -946,6 +958,7 @@ mod tests {
         assert!(target.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_skill_to_dir_symlink_preserves_custom_central_source() {
         let tmp = tempdir().unwrap();
@@ -1008,6 +1021,7 @@ mod tests {
         assert!(target.exists(), "global-scope skill file should exist");
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_skill_to_dir_cleans_dangling_symlink() {
         let tmp = tempdir().unwrap();
@@ -1030,6 +1044,7 @@ mod tests {
         assert!(target.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_skill_to_dir_symlink_cleans_dangling_symlink() {
         let tmp = tempdir().unwrap();
