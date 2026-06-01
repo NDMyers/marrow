@@ -7,41 +7,54 @@ use anyhow::Result;
 
 pub const MARROW_CORE_SKILL_MD: &str = r#"---
 # marrow-generated: true
-# marrow-generated-checksum: fnv1a64:4c8a751b3c1b8261
+# marrow-generated-checksum: fnv1a64:aa9240036df20f67
 description: "Marrow context packet and MCP guidance for codebase exploration, symbol tracing, and refactor impact analysis."
 alwaysApply: true
 ---
 # Marrow MCP Optimization Directives
 
-Marrow is a local, deterministic AST graph engine and provider-neutral context compiler. It can prebuild context packets with `marrow context`, or serve targeted MCP graph views during an agent loop.
+Marrow is a local, deterministic AST graph engine and provider-neutral context compiler. Its fastest, cheapest path is the CLI `marrow context` packet — one command that compiles routing, source spans, freshness, and provenance before the model loop ever starts. Reach for the MCP `run_pipeline` loop only as a targeted follow-up.
 
-## First Move — When To Reach for Marrow
+## Default First Move — `marrow context`
 
-Use marrow when your task matches any of these conditions. Otherwise, use native tools.
+For any broad or ambiguous multi-file task, your default first move is:
 
-| Condition | Action |
-|-----------|--------|
-| Preparing broad or ambiguous multi-file context before asking a model | `marrow context "<task>" --repo <repo_id> --budget <tokens> --format markdown|json --profile local-32k` |
-| Exploring unfamiliar code during an active agent loop across **3+ files** | `run_pipeline(intent: "explore_batch", symbols: [...])` |
-| Tracing a call chain or dependency flow | `run_pipeline(intent: "trace_flow")` or `run_pipeline(intent: "dependency_graph")` |
-| Mapping a class, module, or directory structure | `run_pipeline(intent: "map_class")` or `run_pipeline(intent: "get_skeleton")` |
-| Assessing blast radius before a refactor | `run_pipeline(intent: "refactor_symbol")` |
-| Orienting in an unfamiliar repository | `run_pipeline(intent: "analyze_repo")` |
+```
+marrow context "<task>" --repo <repo_id> --budget <tokens> --format markdown|json --profile local-32k
+```
 
-`marrow context` compiles one packet before the LLM/tool loop. Each MCP call adds one LLM turn, so MCP pays off when it replaces 3+ sequential native file reads with a single structured response.
+This compiles a single provider-neutral packet up front. Prefer it over an interactive MCP loop: each `run_pipeline` call costs one extra LLM turn, and the loop has measured overhead of **+146% LLM requests** and **+53.6% input tokens** versus native tooling. Pay that cost only when a single structured response replaces 3+ sequential native file reads.
 
-## Workflow
+## Cold Start — Handling a `needs_index` Packet
 
-1. Prefer `marrow context` when you can prefetch a provider-neutral packet before the model run or benchmark packet-assisted behavior.
-2. During an active agent loop, use `mcp_marrow_run_pipeline`; it routes intents (`analyze_repo`, `find_symbol`, `explore_symbol`, `trace_flow`, `refactor_symbol`, `read_node`, `explore_batch`, `dependency_graph`, `map_class`) to the right graph view.
-3. If a tool reports a missing or stale graph, call `mcp_marrow_ingest_repo` once, then retry.
-4. Use `read_node` through `run_pipeline` to expand condensed signatures from a previous result.
-5. Use `find_symbol` through `run_pipeline` when you only know part of a symbol name.
+If `marrow context` returns a routing outcome of `needs_index`, the graph for that repo is empty or stale. Recover once, then re-run:
+
+1. Index the repository a single time: `marrow index` (or `mcp_marrow_ingest_repo` if you are already in an MCP session).
+2. Re-run the same `marrow context "<task>" --repo <repo_id>` command.
+3. If it still reports `needs_index`, confirm the `--repo` id matches an ingested repository before retrying.
+
+Do not loop on `needs_index` — index once, then re-request the packet.
+
+## Targeted Follow-Up — MCP `run_pipeline`
+
+After the packet (or during an active agent loop on already-indexed code), use `mcp_marrow_run_pipeline` for narrow, structured graph views. It routes intents to the right view:
+
+| Need | Intent |
+|------|--------|
+| Exploring unfamiliar code across **3+ files** | `explore_batch` |
+| Tracing a call chain or dependency flow | `trace_flow` / `dependency_graph` |
+| Mapping a class, module, or directory | `map_class` / `get_skeleton` |
+| Assessing blast radius before a refactor | `refactor_symbol` |
+| Orienting in an unfamiliar repository | `analyze_repo` |
+| Resolving a partially-known symbol name | `find_symbol` |
+| Expanding a condensed signature from a prior result | `read_node` |
+
+Each call adds one LLM turn, so prefer it only when it replaces 3+ native reads. If a pipeline call reports a missing or stale graph, call `mcp_marrow_ingest_repo` once, then retry.
 
 ## Tools
 
-- CLI `marrow context`: Provider-neutral markdown/json packet with routing outcome, source spans, freshness, budget, and provenance.
-- `mcp_marrow_run_pipeline`: Primary entry point — routes intents to the best context view.
+- CLI `marrow context`: Provider-neutral markdown/json packet with routing outcome, source spans, freshness, budget, and provenance. **Default first move.**
+- `mcp_marrow_run_pipeline`: Targeted follow-up — routes intents to the best graph view during an active loop.
 - `mcp_marrow_get_context_capsule`: Pivot symbol source + condensed depth-1 callers, callees, imports.
 - `mcp_marrow_analyze_impact`: Recursive caller/importer map for blast-radius analysis.
 - `mcp_marrow_ingest_repo`: Build or refresh the AST graph for a repository.
@@ -504,6 +517,27 @@ mod tests {
         let checksum = super::generated_checksum(&marked);
         marked = marked.replacen("0000000000000000", &checksum, 1);
         marked
+    }
+
+    #[test]
+    fn marrow_core_skill_md_is_self_consistent_current_managed() {
+        // Exact constant classifies as the current managed template.
+        assert_eq!(
+            super::classify_existing_content(MARROW_CORE_SKILL_MD),
+            super::ExistingContentStatus::CurrentManaged,
+        );
+        // Embedded checksum marker matches the recomputed FNV-1a64 of the body.
+        assert_eq!(
+            super::generated_marker_checksum(MARROW_CORE_SKILL_MD),
+            Some(super::generated_checksum(MARROW_CORE_SKILL_MD).as_str()),
+        );
+        // The marker-stripped form classifies as a refreshable managed template.
+        assert_eq!(
+            super::classify_existing_content(&super::generated_content_for_checksum(
+                MARROW_CORE_SKILL_MD,
+            )),
+            super::ExistingContentStatus::RefreshableManaged,
+        );
     }
 
     #[test]
