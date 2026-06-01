@@ -4990,12 +4990,18 @@ mod tests {
         let target = integration_target_by_name("Cursor").unwrap();
 
         let err = register_integration_target(target, &ctx)
-            .expect_err("automatic writer failures should remain errors");
+            .expect_err("automatic writer failures must stay errors, never downgrade to Guided");
 
+        // The failure must surface as a genuine filesystem error, not be softened
+        // into an `AgentOutcome::Guided`. The OS message differs per platform
+        // (ENOTDIR on Unix, ERROR_ALREADY_EXISTS on Windows), so assert on the
+        // structured `io::Error` in the chain rather than its localized text.
+        let has_io_error = err
+            .chain()
+            .any(|cause| cause.downcast_ref::<std::io::Error>().is_some());
         assert!(
-            err.to_string().contains("Not a directory")
-                || err.to_string().contains("not a directory"),
-            "unexpected writer error: {err}"
+            has_io_error,
+            "writer failure should surface an io::Error, got: {err:#}"
         );
     }
 
@@ -5426,7 +5432,10 @@ mod tests {
 
     #[test]
     fn cmd_integrate_direct_mcp_branch_installs_rule_file_after_mcp_success() {
-        let source = include_str!("main.rs");
+        // Normalize EOLs: this structural check is line-ending agnostic, but a
+        // CRLF checkout (Windows `core.autocrlf`) would otherwise break the
+        // `\n`-anchored searches below.
+        let source = include_str!("main.rs").replace("\r\n", "\n");
         let cmd_start = source
             .rfind("\nfn cmd_integrate(args: &[String]) -> Result<()> {")
             .map(|idx| idx + 1)
@@ -6214,7 +6223,9 @@ mod tests {
 
     #[test]
     fn tool_registry_keeps_compound_intents_run_pipeline_only() {
-        let source = include_str!("main.rs");
+        // Normalize EOLs so the `Tool::new(\n ...)` searches below match on a
+        // CRLF checkout as well as LF.
+        let source = include_str!("main.rs").replace("\r\n", "\n");
         let list_tools_block = source
             .split("fn list_tools(")
             .nth(1)
@@ -6452,12 +6463,13 @@ mod tests {
 
     #[test]
     fn format_rule_plan_line_includes_target_and_source() {
+        let home = Path::new("/tmp/home");
         let line = format_rule_plan_line(
             "GitHub Copilot",
             skills::Agent::GitHubCopilot,
             skills::Scope::Project,
             skills::Method::Symlink,
-            Path::new("/tmp/home"),
+            home,
         );
         assert!(
             line.contains("GitHub Copilot"),
@@ -6467,8 +6479,12 @@ mod tests {
             line.contains(".github/instructions/marrow-optimization.instructions.md"),
             "target path missing: {line}"
         );
+        // Build the expected source via the same join + Display that production
+        // uses so the home prefix renders with the platform separator (e.g.
+        // backslashes on Windows) instead of being hard-coded to POSIX.
+        let expected_source = home.join(".marrow/marrow-optimization.md");
         assert!(
-            line.contains("/tmp/home/.marrow/marrow-optimization.md"),
+            line.contains(&expected_source.display().to_string()),
             "source path missing: {line}"
         );
     }
@@ -7023,25 +7039,34 @@ mod tests {
     #[test]
     fn gui_safe_path_places_binary_dir_first() {
         let path = gui_safe_path("/usr/local/bin/marrow");
-        let first = path.split(':').next().unwrap();
+        // Split on the OS PATH-list separator, matching how the value is consumed.
+        let first = path.split(PATH_LIST_SEP).next().unwrap();
         assert_eq!(first, "/usr/local/bin");
     }
 
     #[test]
     fn gui_safe_path_includes_cargo_bin() {
         let path = gui_safe_path("/some/other/marrow");
+        #[cfg(not(target_os = "windows"))]
         assert!(
             path.contains(".cargo/bin"),
             "expected .cargo/bin in: {path}"
+        );
+        #[cfg(target_os = "windows")]
+        assert!(
+            path.to_ascii_lowercase().contains(".cargo\\bin"),
+            "expected .cargo\\bin in: {path}"
         );
     }
 
     #[test]
     fn gui_safe_path_has_no_duplicate_entries() {
-        // /usr/local/bin is in our static list AND is the binary dir here — must not duplicate.
+        // The binary dir may also appear in the static list / inherited PATH —
+        // it must be emitted only once after platform-aware deduplication.
         let path = gui_safe_path("/usr/local/bin/marrow");
-        let segments: Vec<&str> = path.split(':').collect();
-        let unique: std::collections::HashSet<_> = segments.iter().collect();
+        let segments: Vec<&str> = path.split(PATH_LIST_SEP).collect();
+        let unique: std::collections::HashSet<String> =
+            segments.iter().map(|s| path_dedup_key(s)).collect();
         assert_eq!(
             segments.len(),
             unique.len(),
@@ -7053,7 +7078,15 @@ mod tests {
     fn gui_safe_path_is_non_empty_with_empty_binary() {
         let path = gui_safe_path("");
         assert!(!path.is_empty(), "PATH must never be empty");
+        // The inherited process PATH is always appended, so the result must
+        // contain at least one real directory entry.
+        #[cfg(not(target_os = "windows"))]
         assert!(path.contains("/usr/local/bin"));
+        #[cfg(target_os = "windows")]
+        assert!(
+            path.contains('\\'),
+            "Windows PATH should contain real directories: {path}"
+        );
     }
 
     #[test]
@@ -7078,6 +7111,48 @@ mod tests {
 
     // ── per-agent integration config tests ────────────────────────────────────
 
+    /// Asserts an MCP server entry uses the platform-appropriate login-shell
+    /// wrapper (never the raw binary path) and ultimately invokes `marrow mcp`.
+    /// On Unix that is a `<shell> -lc "marrow mcp"` form; on Windows it is
+    /// `powershell.exe ... -Command "marrow mcp"`. See `mcp_shell_launch_spec`.
+    fn assert_shell_wrapper(cmd: &str, args: &serde_json::Value) {
+        let args_str: Vec<&str> = args
+            .as_array()
+            .expect("args must be an array")
+            .iter()
+            .filter_map(|a| a.as_str())
+            .collect();
+
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                cmd.to_ascii_lowercase().ends_with("powershell.exe"),
+                "expected PowerShell wrapper on Windows, got: {cmd}"
+            );
+            assert!(
+                args_str.iter().any(|a| a.eq_ignore_ascii_case("-Command")),
+                "expected -Command flag on Windows, got: {args_str:?}"
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(
+                cmd.ends_with("zsh") || cmd.ends_with("bash") || cmd.ends_with("sh"),
+                "expected POSIX login shell, got: {cmd}"
+            );
+            assert_eq!(
+                args_str.first().copied(),
+                Some("-lc"),
+                "expected -lc flag on Unix, got: {args_str:?}"
+            );
+        }
+
+        assert!(
+            args_str.iter().any(|a| a.contains("marrow mcp")),
+            "shell invocation must contain 'marrow mcp', got: {args_str:?}"
+        );
+    }
+
     #[test]
     fn integrate_claude_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
@@ -7089,18 +7164,7 @@ mod tests {
         let raw = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
-        assert!(
-            cmd.ends_with("zsh") || cmd.ends_with("bash"),
-            "expected shell binary, got: {cmd}"
-        );
-        assert_eq!(cfg["mcpServers"]["marrow"]["args"][0], "-lc");
-        assert!(
-            cfg["mcpServers"]["marrow"]["args"][1]
-                .as_str()
-                .unwrap()
-                .contains("marrow mcp"),
-            "shell invocation must contain 'marrow mcp'"
-        );
+        assert_shell_wrapper(cmd, &cfg["mcpServers"]["marrow"]["args"]);
         assert!(
             !raw.contains("/absolute/path/to/marrow"),
             "binary path must not leak into config"
@@ -7138,15 +7202,7 @@ mod tests {
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
         // Cursor uses shell wrapper — cmd is the shell binary, not "marrow".
-        assert!(
-            cmd.ends_with("zsh") || cmd.ends_with("bash"),
-            "expected shell binary, got: {cmd}"
-        );
-        assert_eq!(cfg["mcpServers"]["marrow"]["args"][0], "-lc");
-        assert!(cfg["mcpServers"]["marrow"]["args"][1]
-            .as_str()
-            .unwrap()
-            .contains("marrow mcp"));
+        assert_shell_wrapper(cmd, &cfg["mcpServers"]["marrow"]["args"]);
         // ctx.binary must not appear anywhere in the config.
         assert!(
             !raw.contains("/absolute/path/to/marrow"),
@@ -7154,24 +7210,38 @@ mod tests {
         );
     }
 
+    /// VS Code's global MCP config lives at a platform-specific location, kept
+    /// sandbox-relative to `ctx.home` so tests never touch the real user config
+    /// (mirrors the `#[cfg]` branches in `integrate_copilot`).
+    fn vscode_mcp_rel_path() -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            "Library/Application Support/Code/User/mcp.json"
+        }
+        #[cfg(target_os = "linux")]
+        {
+            ".config/Code/User/mcp.json"
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            ".mcp.json"
+        }
+    }
+
     #[test]
     fn integrate_copilot_vscode_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
-        let vscode_dir = home.path().join("Library/Application Support/Code/User");
-        std::fs::create_dir_all(&vscode_dir).unwrap();
+        let vscode_path = home.path().join(vscode_mcp_rel_path());
+        std::fs::create_dir_all(vscode_path.parent().unwrap()).unwrap();
         let ctx = IntegrationCtx {
             binary: "/absolute/path/to/marrow".to_string(),
             home: home.path().to_string_lossy().into_owned(),
         };
         integrate_copilot(&ctx).unwrap();
-        let raw = std::fs::read_to_string(vscode_dir.join("mcp.json")).unwrap();
+        let raw = std::fs::read_to_string(&vscode_path).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["servers"]["marrow"]["command"].as_str().unwrap();
-        assert!(
-            cmd.ends_with("zsh") || cmd.ends_with("bash"),
-            "vscode: expected shell binary, got: {cmd}"
-        );
-        assert_eq!(cfg["servers"]["marrow"]["args"][0], "-lc");
+        assert_shell_wrapper(cmd, &cfg["servers"]["marrow"]["args"]);
         assert!(!raw.contains("/absolute/path/to/marrow"));
     }
 
@@ -7187,11 +7257,7 @@ mod tests {
         let raw = std::fs::read_to_string(home.path().join(".copilot/mcp-config.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
-        assert!(
-            cmd.ends_with("zsh") || cmd.ends_with("bash"),
-            "copilot cli: expected shell binary, got: {cmd}"
-        );
-        assert_eq!(cfg["mcpServers"]["marrow"]["args"][0], "-lc");
+        assert_shell_wrapper(cmd, &cfg["mcpServers"]["marrow"]["args"]);
         assert_eq!(cfg["mcpServers"]["marrow"]["type"], "stdio");
         assert!(!raw.contains("/absolute/path/to/marrow"));
     }
@@ -7212,11 +7278,7 @@ mod tests {
         let raw = std::fs::read_to_string(cline_dir.join("cline_mcp_settings.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
-        assert!(
-            cmd.ends_with("zsh") || cmd.ends_with("bash"),
-            "cline: expected shell binary, got: {cmd}"
-        );
-        assert_eq!(cfg["mcpServers"]["marrow"]["args"][0], "-lc");
+        assert_shell_wrapper(cmd, &cfg["mcpServers"]["marrow"]["args"]);
         assert_eq!(cfg["mcpServers"]["marrow"]["disabled"], false);
         assert!(!raw.contains("/absolute/path/to/marrow"));
     }
@@ -7269,8 +7331,9 @@ mod tests {
         let zed = h.join(".config/zed");
         std::fs::create_dir_all(&zed).unwrap();
         std::fs::write(zed.join("settings.json"), "{}").unwrap();
-        let vscode = h.join("Library/Application Support/Code/User");
-        std::fs::create_dir_all(&vscode).unwrap();
+        // VS Code global MCP config location is platform-specific (sandbox-relative).
+        let vscode_rel = vscode_mcp_rel_path();
+        std::fs::create_dir_all(h.join(vscode_rel).parent().unwrap()).unwrap();
 
         let ctx = IntegrationCtx {
             binary: BINARY.to_string(),
@@ -7289,7 +7352,7 @@ mod tests {
             ".claude.json",
             ".cursor/mcp.json",
             ".copilot/mcp-config.json",
-            "Library/Application Support/Code/User/mcp.json",
+            vscode_rel,
             "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
             ".config/zed/settings.json",
         ];
@@ -7313,22 +7376,25 @@ mod tests {
             "marrow"
         );
 
-        // Shell-wrapper hosts must use a shell binary, not "marrow" directly.
-        for (rel, ptr) in [
-            (".claude.json", "/mcpServers/marrow/command"),
-            (".cursor/mcp.json", "/mcpServers/marrow/command"),
-            ("Library/Application Support/Code/User/mcp.json", "/servers/marrow/command"),
+        // Shell-wrapper hosts must use a platform-appropriate shell, not "marrow" directly.
+        for (rel, base) in [
+            (".claude.json", "/mcpServers/marrow"),
+            (".cursor/mcp.json", "/mcpServers/marrow"),
+            (vscode_rel, "/servers/marrow"),
             ("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-             "/mcpServers/marrow/command"),
+             "/mcpServers/marrow"),
         ] {
             let raw = std::fs::read_to_string(h.join(rel)).unwrap();
             let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            let cmd = cfg.pointer(ptr).and_then(|v| v.as_str())
-                .unwrap_or_else(|| panic!("command missing at {ptr} in {rel}"));
-            assert!(
-                cmd.ends_with("zsh") || cmd.ends_with("bash"),
-                "{rel}: expected shell wrapper, got: {cmd}"
-            );
+            let cmd = cfg
+                .pointer(&format!("{base}/command"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("command missing at {base}/command in {rel}"));
+            let args = cfg
+                .pointer(&format!("{base}/args"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            assert_shell_wrapper(cmd, &args);
         }
     }
 }
@@ -7815,33 +7881,75 @@ fn gui_safe_path(binary_path: &str) -> String {
         }
     }
 
-    // 2. Common install locations for macOS and Linux package managers.
-    let home = std::env::var("HOME").unwrap_or_default();
-    for candidate in [
-        format!("{home}/.cargo/bin"),
-        format!("{home}/.local/bin"),
-        "/opt/homebrew/bin".to_string(),
-        "/opt/homebrew/sbin".to_string(),
-        "/usr/local/bin".to_string(),
-        "/usr/bin".to_string(),
-        "/bin".to_string(),
-    ] {
-        segments.push(candidate);
+    // 2. Common install locations for the host platform's package managers.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        for candidate in [
+            format!("{home}/.cargo/bin"),
+            format!("{home}/.local/bin"),
+            "/opt/homebrew/bin".to_string(),
+            "/opt/homebrew/sbin".to_string(),
+            "/usr/local/bin".to_string(),
+            "/usr/bin".to_string(),
+            "/bin".to_string(),
+        ] {
+            segments.push(candidate);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // cargo/rustup install `marrow` here; winget/scoop/MSI entries already
+        // live on the inherited Windows PATH appended in step 3.
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            segments.push(format!("{profile}\\.cargo\\bin"));
+        }
     }
 
-    // 3. Existing shell PATH last (lowest priority so our entries win).
-    if let Ok(existing) = std::env::var("PATH") {
-        for entry in existing.split(':') {
-            if !entry.is_empty() {
-                segments.push(entry.to_string());
+    // 3. Existing process PATH last (lowest priority so our entries win).
+    //    `split_paths` uses the OS-correct list separator (`;` on Windows,
+    //    `:` elsewhere) and tolerates quoted Windows entries.
+    if let Some(existing) = std::env::var_os("PATH") {
+        for entry in std::env::split_paths(&existing) {
+            let s = entry.to_string_lossy();
+            if !s.is_empty() {
+                segments.push(s.into_owned());
             }
         }
     }
 
-    // Deduplicate, preserving first occurrence.
+    // Deduplicate, preserving first occurrence. On Windows paths are
+    // case-insensitive and `/`/`\` are interchangeable, so the comparison key
+    // is normalized while the original spelling is kept in the output.
     let mut seen = std::collections::HashSet::new();
-    segments.retain(|s| seen.insert(s.clone()));
-    segments.join(":")
+    segments.retain(|s| seen.insert(path_dedup_key(s)));
+    let sep = PATH_LIST_SEP.to_string();
+    segments.join(sep.as_str())
+}
+
+/// OS PATH-list separator: `;` on Windows, `:` everywhere else. Used by both
+/// [`gui_safe_path`] (when joining) and [`validate_marrow_command`] (when
+/// splitting) so the generated PATH round-trips on every platform.
+#[cfg(target_os = "windows")]
+const PATH_LIST_SEP: char = ';';
+#[cfg(not(target_os = "windows"))]
+const PATH_LIST_SEP: char = ':';
+
+/// Normalizes a PATH entry for duplicate detection. Windows paths are
+/// case-insensitive and accept either slash direction, so they are folded to a
+/// canonical key; on other platforms entries are compared verbatim.
+fn path_dedup_key(entry: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        entry
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        entry.to_string()
+    }
 }
 
 /// Checks whether `marrow` is resolvable as an executable on `env_path`.
@@ -7856,7 +7964,7 @@ fn validate_marrow_command(env_path: &str) -> Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    let found = env_path.split(':').any(|dir| {
+    let found = env_path.split(PATH_LIST_SEP).any(|dir| {
         let candidate = std::path::Path::new(dir).join("marrow");
         if !candidate.is_file() {
             return false;
@@ -7877,7 +7985,7 @@ fn validate_marrow_command(env_path: &str) -> Result<()> {
     if found {
         Ok(())
     } else {
-        let searched: Vec<&str> = env_path.split(':').take(10).collect();
+        let searched: Vec<&str> = env_path.split(PATH_LIST_SEP).take(10).collect();
         anyhow::bail!(
             "`marrow` binary not found on the generated PATH.\n\
              Searched: {}\n\
