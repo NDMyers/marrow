@@ -19,6 +19,23 @@ pub struct DatabaseScopeSnapshot {
     pub repos: Vec<IndexedRepoSnapshot>,
 }
 
+/// Normalize a filesystem path to use forward slashes as separators.
+///
+/// Indexed node paths are stored using the host OS separator (via
+/// `Path::to_string_lossy` at ingest time), so on Windows the graph holds
+/// `src\context.rs`. Agents and tooling, however, routinely pass POSIX-style
+/// `src/context.rs`. Normalizing both the caller-supplied filepath and the
+/// stored column to `/` before comparison makes symbol resolution
+/// separator-insensitive, so lookups succeed regardless of which OS produced
+/// the index or which separator the caller used.
+///
+/// Pair this with a `REPLACE(file_path, '\', '/')` expression in the SQL so the
+/// stored column is folded the same way at query time (works on existing
+/// backslash indexes without re-ingest).
+pub fn normalize_path_separators(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
 /// Opens (or creates) the database at `db_path`.
 /// If the filesystem is read-only or the directory cannot be created, falls back
 /// transparently to an in-memory database so the MCP server can still function
@@ -646,11 +663,13 @@ pub fn save_observation(
     filepath: &str,
     observation_text: &str,
 ) -> Result<String> {
+    let filepath = normalize_path_separators(filepath);
     let raw_text: Option<String> = conn
         .query_row(
             "SELECT raw_text
              FROM nodes
-             WHERE repo_id = ?1 AND symbol_name = ?2 AND file_path = ?3
+             WHERE repo_id = ?1 AND symbol_name = ?2
+               AND REPLACE(file_path, '\\', '/') = ?3
              LIMIT 1",
             rusqlite::params![repo_id, symbol_name, filepath],
             |row| row.get(0),
@@ -694,6 +713,12 @@ pub fn get_session_context(
     symbol_name: Option<&str>,
     filepath: Option<&str>,
 ) -> Result<String> {
+    // Fold the caller-supplied path to forward slashes; observations are stored
+    // normalized (see `save_observation`) and the column is folded in SQL, so
+    // backslash and forward-slash inputs both match on every platform.
+    let filepath = filepath.map(normalize_path_separators);
+    let filepath = filepath.as_deref();
+
     type Row = (String, i64, String, String, String, String);
     let mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Row> {
         Ok((
@@ -710,7 +735,8 @@ pub fn get_session_context(
         (Some(repo), Some(sym), Some(fp)) => conn
             .prepare(
                 "SELECT observation_text, is_stale, timestamp, symbol_name, filepath, repo_id
-                 FROM observations WHERE repo_id = ?1 AND symbol_name = ?2 AND filepath = ?3
+                 FROM observations WHERE repo_id = ?1 AND symbol_name = ?2
+                   AND REPLACE(filepath, '\\', '/') = ?3
                  ORDER BY timestamp DESC",
             )?
             .query_map(rusqlite::params![repo, sym, fp], mapper)?
@@ -730,7 +756,7 @@ pub fn get_session_context(
         (Some(repo), None, Some(fp)) => conn
             .prepare(
                 "SELECT observation_text, is_stale, timestamp, symbol_name, filepath, repo_id
-                 FROM observations WHERE repo_id = ?1 AND filepath = ?2
+                 FROM observations WHERE repo_id = ?1 AND REPLACE(filepath, '\\', '/') = ?2
                  ORDER BY timestamp DESC",
             )?
             .query_map(rusqlite::params![repo, fp], mapper)?
@@ -750,7 +776,7 @@ pub fn get_session_context(
         (None, Some(sym), Some(fp)) => conn
             .prepare(
                 "SELECT observation_text, is_stale, timestamp, symbol_name, filepath, repo_id
-                 FROM observations WHERE symbol_name = ?1 AND filepath = ?2
+                 FROM observations WHERE symbol_name = ?1 AND REPLACE(filepath, '\\', '/') = ?2
                  ORDER BY timestamp DESC",
             )?
             .query_map(rusqlite::params![sym, fp], mapper)?
@@ -770,7 +796,7 @@ pub fn get_session_context(
         (None, None, Some(fp)) => conn
             .prepare(
                 "SELECT observation_text, is_stale, timestamp, symbol_name, filepath, repo_id
-                 FROM observations WHERE filepath = ?1
+                 FROM observations WHERE REPLACE(filepath, '\\', '/') = ?1
                  ORDER BY timestamp DESC",
             )?
             .query_map(rusqlite::params![fp], mapper)?
@@ -842,6 +868,21 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use tempfile::tempdir;
+
+    #[test]
+    fn normalize_path_separators_folds_backslashes() {
+        assert_eq!(
+            normalize_path_separators("src\\context.rs"),
+            "src/context.rs"
+        );
+        assert_eq!(normalize_path_separators("a\\b\\c.rs"), "a/b/c.rs");
+        // Forward-slash and separator-free inputs are unchanged.
+        assert_eq!(
+            normalize_path_separators("src/context.rs"),
+            "src/context.rs"
+        );
+        assert_eq!(normalize_path_separators("main.rs"), "main.rs");
+    }
 
     #[test]
     fn init_db_applies_busy_timeout_pragma() {

@@ -2213,10 +2213,15 @@ fn resolve_symbol_or_disambiguate(
     filepath: Option<&str>,
 ) -> Result<SymbolResolution> {
     let candidates: Vec<NodeRow> = if let Some(fp) = filepath {
+        // Fold both the caller-supplied path and the stored column to forward
+        // slashes so a POSIX-style `src/context.rs` matches a Windows-stored
+        // `src\context.rs` (and vice versa) without requiring a re-ingest.
+        let fp = crate::db::normalize_path_separators(fp);
         conn.prepare(
             "SELECT id, symbol_name, symbol_type, file_path, language, raw_text
              FROM nodes
-             WHERE symbol_name = ?1 AND repo_id = ?2 AND file_path = ?3
+             WHERE symbol_name = ?1 AND repo_id = ?2
+               AND REPLACE(file_path, '\\', '/') = ?3
              ORDER BY file_path ASC, id ASC",
         )?
         .query_map(rusqlite::params![symbol_name, repo_id, fp], |row| {
@@ -2640,7 +2645,8 @@ pub fn get_project_skeleton(
                        OR symbol_type LIKE '%enum%' \
                        OR symbol_type LIKE '%impl%' \
                        OR symbol_type LIKE '%module%') \
-                     AND (file_path = ?3 OR file_path LIKE ?4) \
+                     AND (REPLACE(file_path, '\\', '/') = ?3 \
+                       OR REPLACE(file_path, '\\', '/') LIKE ?4) \
                    ORDER BY file_path ASC, rowid ASC \
                    LIMIT ?2";
 
@@ -2652,7 +2658,9 @@ pub fn get_project_skeleton(
     let mut row_count: usize = 0;
 
     if let Some(dir) = target_dir {
-        let exact = dir.trim_end_matches('/').to_string();
+        // Compare against the forward-slash-folded column (see dir_sql) so a
+        // directory filter matches Windows-stored backslash paths too.
+        let exact = crate::db::normalize_path_separators(dir.trim_end_matches('/'));
         let prefix = format!("{}/%", exact);
         let mut stmt = conn.prepare(dir_sql)?;
         let rows = stmt.query_map(rusqlite::params![repo_id, limit, exact, prefix], |row| {
@@ -3887,6 +3895,91 @@ mod tests {
         assert!(
             msg.contains("run_pipeline"),
             "payload must guide agent to retry: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_matches_windows_backslash_path_with_posix_filepath() {
+        // Regression: on Windows, ingest stores `file_path` with the OS
+        // separator (e.g. `src\context.rs` via `Path::to_string_lossy`), but
+        // agents pass POSIX-style `src/context.rs`. Exact equality used to
+        // return "Symbol not found" for explore/dependency/refactor while
+        // find_symbol (no filepath) still worked. Resolution must now be
+        // separator-insensitive.
+        let conn = make_db();
+        insert_node(
+            &conn,
+            "marrow:src\\context.rs:compile_context_packet",
+            "marrow",
+            "src\\context.rs", // backslash-stored, simulating a Windows index
+            "rs",
+            "compile_context_packet",
+            "function",
+            "pub fn compile_context_packet() {}",
+        );
+
+        // POSIX-style filepath must resolve against the backslash-stored path.
+        let posix = get_context_capsule(
+            &conn,
+            "compile_context_packet",
+            "marrow",
+            Some("src/context.rs"),
+        )
+        .expect("posix filepath must resolve against a backslash-stored path");
+        assert!(
+            posix.optimized_text.contains("compile_context_packet"),
+            "expected the resolved capsule, got: {}",
+            posix.optimized_text
+        );
+        assert!(
+            !posix.optimized_text.contains("not found"),
+            "resolution must not fall through to not-found: {}",
+            posix.optimized_text
+        );
+
+        // The native (backslash) filepath must keep working too.
+        let native = get_context_capsule(
+            &conn,
+            "compile_context_packet",
+            "marrow",
+            Some("src\\context.rs"),
+        )
+        .expect("native backslash filepath must still resolve");
+        assert!(
+            native.optimized_text.contains("compile_context_packet"),
+            "native filepath regressed: {}",
+            native.optimized_text
+        );
+    }
+
+    #[test]
+    fn resolve_symbol_matches_posix_stored_path_with_windows_filepath() {
+        // The mirror case: a macOS/Linux index stores forward slashes, but a
+        // caller on Windows (or a tool that reconstructs OS paths) passes a
+        // backslash filepath. Folding both sides keeps this portable.
+        let conn = make_db();
+        insert_node(
+            &conn,
+            "marrow:src/context.rs:compile_context_packet",
+            "marrow",
+            "src/context.rs",
+            "rs",
+            "compile_context_packet",
+            "function",
+            "pub fn compile_context_packet() {}",
+        );
+
+        let result = get_context_capsule(
+            &conn,
+            "compile_context_packet",
+            "marrow",
+            Some("src\\context.rs"),
+        )
+        .expect("backslash filepath must resolve against a forward-slash index");
+        assert!(
+            result.optimized_text.contains("compile_context_packet"),
+            "expected the resolved capsule, got: {}",
+            result.optimized_text
         );
     }
 

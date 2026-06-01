@@ -677,10 +677,12 @@ fn resolve_benchmark_file_path(
     filepath: Option<&str>,
 ) -> anyhow::Result<String> {
     if let Some(filepath) = filepath {
+        let filepath = db::normalize_path_separators(filepath);
         return conn
             .query_row(
                 "SELECT file_path FROM nodes
-                 WHERE symbol_name = ?1 AND repo_id = ?2 AND file_path = ?3
+                 WHERE symbol_name = ?1 AND repo_id = ?2
+                   AND REPLACE(file_path, '\\', '/') = ?3
                  ORDER BY file_path ASC, id ASC
                  LIMIT 1",
                 rusqlite::params![symbol, repo_id, filepath],
