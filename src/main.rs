@@ -7246,6 +7246,138 @@ mod tests {
     }
 
     #[test]
+    fn mcp_json_defines_marrow_detects_both_key_styles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let servers = tmp.path().join("servers.json");
+        let mcp_servers = tmp.path().join("mcpServers.json");
+        let other = tmp.path().join("other.json");
+        let missing = tmp.path().join("missing.json");
+
+        std::fs::write(&servers, r#"{"servers":{"marrow":{"command":"x"}}}"#).unwrap();
+        std::fs::write(&mcp_servers, r#"{"mcpServers":{"marrow":{"command":"x"}}}"#).unwrap();
+        std::fs::write(&other, r#"{"servers":{"other":{}}}"#).unwrap();
+
+        assert!(super::mcp_json_defines_marrow(&servers));
+        assert!(super::mcp_json_defines_marrow(&mcp_servers));
+        assert!(!super::mcp_json_defines_marrow(&other));
+        assert!(!super::mcp_json_defines_marrow(&missing));
+    }
+
+    #[test]
+    fn dedupe_workspace_marrow_removes_workspace_entry_when_global_has_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join(".vscode/mcp.json");
+        let global = tmp.path().join("global.json");
+        std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        std::fs::write(&workspace, r#"{"servers":{"marrow":{"command":"x"}}}"#).unwrap();
+        std::fs::write(&global, r#"{"servers":{"marrow":{"command":"x"}}}"#).unwrap();
+
+        let modified = super::dedupe_workspace_marrow(&workspace, &global).unwrap();
+
+        assert_eq!(modified, Some(workspace.display().to_string()));
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&workspace).unwrap()).unwrap();
+        assert!(
+            cfg["servers"].get("marrow").is_none(),
+            "workspace marrow must be removed when user-global already defines it"
+        );
+    }
+
+    #[test]
+    fn dedupe_workspace_marrow_is_noop_when_global_lacks_marrow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join(".vscode/mcp.json");
+        let global = tmp.path().join("global.json");
+        std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        let original = r#"{"servers":{"marrow":{"command":"x"}}}"#;
+        std::fs::write(&workspace, original).unwrap();
+        std::fs::write(&global, r#"{"servers":{}}"#).unwrap();
+
+        let modified = super::dedupe_workspace_marrow(&workspace, &global).unwrap();
+
+        assert_eq!(modified, None);
+        // Workspace entry is left intact — it is the only canonical definition.
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&workspace).unwrap()).unwrap();
+        assert!(cfg["servers"]["marrow"].is_object());
+    }
+
+    #[test]
+    fn dedupe_workspace_marrow_preserves_other_servers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join(".vscode/mcp.json");
+        let global = tmp.path().join("global.json");
+        std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        std::fs::write(
+            &workspace,
+            r#"{"servers":{"marrow":{"command":"x"},"keep":{"command":"y"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(&global, r#"{"servers":{"marrow":{"command":"x"}}}"#).unwrap();
+
+        super::dedupe_workspace_marrow(&workspace, &global).unwrap();
+
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&workspace).unwrap()).unwrap();
+        assert!(cfg["servers"].get("marrow").is_none());
+        assert!(
+            cfg["servers"]["keep"].is_object(),
+            "unrelated servers must survive dedup"
+        );
+    }
+
+    #[test]
+    fn write_vscode_mcp_config_inner_skips_when_global_defines_marrow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let global = tmp.path().join("global.json");
+        std::fs::write(&global, r#"{"servers":{"marrow":{"command":"x"}}}"#).unwrap();
+
+        super::write_vscode_mcp_config_inner(
+            &workspace_root,
+            super::WriteMode::SafeAppend,
+            Some(&global),
+        )
+        .unwrap();
+
+        // The sentinel file is still created (workspace_is_initialized depends on
+        // it), but it carries no shadowing marrow entry — user-global is canonical.
+        let ws = workspace_root.join(".vscode/mcp.json");
+        assert!(ws.exists(), "workspace mcp.json sentinel must still be created");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ws).unwrap()).unwrap();
+        assert!(
+            cfg["servers"].get("marrow").is_none(),
+            "must not create a shadowing workspace marrow entry"
+        );
+    }
+
+    #[test]
+    fn write_vscode_mcp_config_inner_writes_when_global_lacks_marrow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let global = tmp.path().join("global.json");
+        std::fs::write(&global, r#"{"servers":{}}"#).unwrap();
+
+        super::write_vscode_mcp_config_inner(
+            &workspace_root,
+            super::WriteMode::SafeAppend,
+            Some(&global),
+        )
+        .unwrap();
+
+        let ws = workspace_root.join(".vscode/mcp.json");
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ws).unwrap()).unwrap();
+        assert!(
+            cfg["servers"]["marrow"].is_object(),
+            "must create the workspace entry when no user-global definition exists"
+        );
+    }
+
+    #[test]
     fn integrate_copilot_cli_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".copilot")).unwrap();
@@ -7513,17 +7645,92 @@ Do **not** add a "Made-with: Cursor" tag (or similar editor or tool attribution)
 /// This function is append-only and idempotent: if the Marrow header is already
 /// present in a file it is skipped entirely, preventing duplicate entries and
 /// preserving any user-authored content that precedes the Marrow block.
-/// Creates or merges `.vscode/mcp.json` so that GitHub Copilot / VS Code
-/// can discover the Marrow MCP server. Existing `mcpServers` entries are
-/// preserved — only the `"marrow"` key is inserted/updated.
+/// True if `path` registers a `marrow` MCP server under either the VS Code
+/// `"servers"` key or the Cline/Claude `"mcpServers"` key.
+fn mcp_json_defines_marrow(path: &Path) -> bool {
+    let Ok(cfg) = load_json_or_empty(path) else {
+        return false;
+    };
+    cfg["servers"]["marrow"].is_object() || cfg["mcpServers"]["marrow"].is_object()
+}
+
+/// Enforce "user-global wins": if `user_global_mcp` already defines `marrow`,
+/// strip any `marrow` entry from the workspace `.vscode/mcp.json` so VS Code
+/// does not shadow the started user-global server with an untrusted workspace
+/// duplicate. Unrelated servers are preserved. Returns `Some(path)` when the
+/// workspace file was modified.
+fn dedupe_workspace_marrow(
+    workspace_mcp: &Path,
+    user_global_mcp: &Path,
+) -> Result<Option<String>> {
+    if !workspace_mcp.exists() || !mcp_json_defines_marrow(user_global_mcp) {
+        return Ok(None);
+    }
+
+    let mut cfg = load_json_or_empty(workspace_mcp)?;
+    let mut changed = false;
+    for key in ["servers", "mcpServers"] {
+        if let Some(map) = cfg[key].as_object_mut() {
+            if map.remove("marrow").is_some() {
+                changed = true;
+            }
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+
+    save_json(workspace_mcp, &cfg)?;
+    eprintln!(
+        "Removed duplicate workspace marrow server from {} (user-global config is canonical)",
+        workspace_mcp.display()
+    );
+    Ok(Some(workspace_mcp.display().to_string()))
+}
+
+/// Resolve the platform path of VS Code's user-global `mcp.json`.
+fn vscode_user_global_mcp_path() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    #[cfg(target_os = "macos")]
+    let p = home.join("Library/Application Support/Code/User/mcp.json");
+    #[cfg(target_os = "linux")]
+    let p = home.join(".config/Code/User/mcp.json");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let p = home.join(".mcp.json");
+    Some(p)
+}
+
+/// Creates or merges `.vscode/mcp.json` so that GitHub Copilot / VS Code can
+/// discover the Marrow MCP server. Unrelated server entries are preserved. If
+/// the user-global config already defines `marrow`, the workspace entry is
+/// omitted (and any existing one stripped) so the two scopes don't collide.
 pub fn write_vscode_mcp_config(workspace_root: &Path, mode: WriteMode) -> Result<Option<String>> {
+    let global = vscode_user_global_mcp_path();
+    write_vscode_mcp_config_inner(workspace_root, mode, global.as_deref())
+}
+
+/// Inner form of [`write_vscode_mcp_config`] with the user-global config path
+/// injected so the dedup decision is testable in isolation.
+///
+/// The workspace `.vscode/mcp.json` is always created/merged (it doubles as the
+/// workspace init sentinel and may hold unrelated servers). The `marrow` entry,
+/// however, is only added when the user-global config does *not* already define
+/// it. When user-global is canonical, any workspace `marrow` entry is stripped so
+/// VS Code never shadows the started user-global server with an untrusted
+/// workspace duplicate.
+fn write_vscode_mcp_config_inner(
+    workspace_root: &Path,
+    mode: WriteMode,
+    user_global_mcp: Option<&Path>,
+) -> Result<Option<String>> {
+    let global_defines_marrow = user_global_mcp.is_some_and(mcp_json_defines_marrow);
+
     let vscode_dir = workspace_root.join(".vscode");
     fs::create_dir_all(&vscode_dir)
         .with_context(|| format!("could not create {}", vscode_dir.display()))?;
 
     let mcp_path = vscode_dir.join("mcp.json");
-
-    let marrow_entry = mcp_shell_launch_spec();
 
     // Overwrite mode discards existing config; all other modes preserve it.
     let mut config: serde_json::Value =
@@ -7539,16 +7746,27 @@ pub fn write_vscode_mcp_config(workspace_root: &Path, mode: WriteMode) -> Result
     if !config["servers"].is_object() {
         config["servers"] = serde_json::json!({});
     }
-    config["servers"]["marrow"] = marrow_entry;
+
+    let action = if global_defines_marrow {
+        // User-global wins: strip any shadowing workspace duplicate, add nothing.
+        for key in ["servers", "mcpServers"] {
+            if let Some(map) = config[key].as_object_mut() {
+                map.remove("marrow");
+            }
+        }
+        "deduplicated (user-global is canonical)"
+    } else {
+        config["servers"]["marrow"] = mcp_shell_launch_spec();
+        match mode {
+            WriteMode::Overwrite => "overwritten",
+            _ => "merged",
+        }
+    };
 
     let pretty = serde_json::to_string_pretty(&config).context("could not serialize mcp.json")?;
     fs::write(&mcp_path, pretty)
         .with_context(|| format!("could not write {}", mcp_path.display()))?;
 
-    let action = match mode {
-        WriteMode::Overwrite => "overwritten",
-        _ => "merged",
-    };
     eprintln!(
         "Wrote VS Code MCP config to {} ({})",
         mcp_path.display(),
@@ -8056,6 +8274,13 @@ fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
             let mut vscode_cfg = load_json_or_empty(&vscode_path)?;
             vscode_cfg["servers"]["marrow"] = mcp_shell_launch_spec();
             save_json(&vscode_path, &vscode_cfg)?;
+
+            // User-global is now canonical: remove any workspace `.vscode/mcp.json`
+            // marrow entry in the current repo so VS Code doesn't shadow it with an
+            // untrusted workspace duplicate that never auto-starts.
+            if let Ok(cwd) = std::env::current_dir() {
+                let _ = dedupe_workspace_marrow(&cwd.join(".vscode/mcp.json"), &vscode_path);
+            }
         }
     }
 
