@@ -854,11 +854,12 @@ where
         .iter()
         .filter_map(|path| {
             let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            let rel = canonical
-                .strip_prefix(root_path)
-                .ok()?
-                .to_string_lossy()
-                .to_string();
+            // Store repo-relative paths in canonical forward-slash form so the
+            // graph, freshness notes, and emitted context packets are portable
+            // and stable across platforms (Windows `strip_prefix` yields `\`).
+            let rel = crate::db::normalize_path_separators(
+                canonical.strip_prefix(root_path).ok()?.to_string_lossy().as_ref(),
+            );
             let mtime = std::fs::metadata(path)
                 .ok()?
                 .modified()

@@ -1,0 +1,27 @@
+# Normalize line endings: store text as LF in git and check out LF on every
+# platform. Without this, `core.autocrlf=true` on Windows checks out *.rs as
+# CRLF, which bakes \r\n into `include_str!("main.rs")` and breaks the
+# source-introspection tests that search for \n-delimited structure.
+* text=auto eol=lf
+
+# Source and config files are always text/LF.
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.sh      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+
+# Binary assets must never be normalized.
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.icns    binary
+*.dmg     binary
+*.msi     binary
+*.deb     binary
+*.AppImage binary
+*.db      binary

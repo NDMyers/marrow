@@ -12,7 +12,12 @@ fn repo_file(path: &str) -> PathBuf {
 }
 
 fn read_repo_file(path: &str) -> String {
-    std::fs::read_to_string(repo_file(path)).unwrap_or_else(|err| panic!("read {path}: {err}"))
+    // Normalize EOLs: these assertions check logical file content (and several
+    // match on `\n`-delimited substrings), so a CRLF checkout on Windows
+    // (`core.autocrlf`) must not change the result.
+    std::fs::read_to_string(repo_file(path))
+        .unwrap_or_else(|err| panic!("read {path}: {err}"))
+        .replace("\r\n", "\n")
 }
 
 fn run_marrow(args: &[&str], envs: &[(&str, &Path)]) -> std::process::Output {

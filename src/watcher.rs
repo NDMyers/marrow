@@ -212,8 +212,10 @@ async fn handle_file_change(
         None => return Ok(()),
     };
 
+    // Canonical forward-slash form keeps watcher-driven updates consistent with
+    // the paths stored by `run_ingestion` (Windows `strip_prefix` yields `\`).
     let rel_path = match path.strip_prefix(&root_path) {
-        Ok(p) => p.to_string_lossy().to_string(),
+        Ok(p) => crate::db::normalize_path_separators(p.to_string_lossy().as_ref()),
         Err(_) => return Ok(()),
     };
 

@@ -23,6 +23,26 @@ marrow index                                                     # Index current
 marrow context "trace request flow" --repo my_repo --format markdown
 ```
 
+## Commands
+
+Run `marrow` with no arguments for an interactive TUI menu, or `marrow --help` for the full list. The most common subcommands:
+
+| Command | Purpose |
+|---------|---------|
+| `marrow mcp` | Start the MCP stdio server (used by editor/agent integrations). |
+| `marrow init` | Initialize workspace config (`.marrow/`, `.marrowrc.json`). |
+| `marrow index` | Index the current workspace (same pipeline as MCP `ingest_repo`). |
+| `marrow watch` | Watch the workspace for changes and re-index incrementally. |
+| `marrow context <task>` | Compile a provider-neutral context packet (markdown/JSON). |
+| `marrow query <symbol> <repo_id>` | Print a symbol's context capsule plus impact analysis. |
+| `marrow benchmark [<symbol> <repo_id>]` | Token-reduction benchmark (interactive wizard when run bare). |
+| `marrow integrate` | Write/print MCP setup for supported agent targets. |
+| `marrow validate` | Check workspace setup and integration config. |
+| `marrow maintenance` | WAL checkpoint + `incremental_vacuum` on `graph.db`. |
+| `marrow ui` / `marrow ui-app` | Open the dashboard / manage the desktop app entry. |
+| `marrow daemon [install\|uninstall\|status]` | Background daemon and autostart management. |
+| `marrow status` / `marrow stop` | Show or stop the background daemon. |
+
 ## Overview
 
 Marrow operates by ingesting source code from multiple programming languages (C++, Python, TypeScript, Rust, and Ruby) using `tree-sitter`. It constructs a unified, cross-repository dependency graph and stores it in an optimized local SQLite database (`.marrow/graph.db`). Instead of relying on vector embeddings, provider SDKs, or external graph databases, Marrow uses deterministic graph queries and code condensation to provide AI agents with structural context and dependency insight.
@@ -45,7 +65,11 @@ Marrow operates by ingesting source code from multiple programming languages (C+
 
 ## Local development
 
-**Prerequisites:** A stable Rust toolchain (`rustup` recommended) and a working C compiler (required for `tree-sitter` native code), as on macOS with Xcode Command Line Tools.
+**Prerequisites:** A stable Rust toolchain (`rustup` recommended) and a working C compiler/toolchain (required for `tree-sitter` native code):
+
+- **macOS:** Xcode Command Line Tools (`xcode-select --install`).
+- **Linux:** a C toolchain such as `build-essential` (Debian/Ubuntu) or the `gcc`/`clang` equivalents for your distro.
+- **Windows:** the MSVC build tools (Visual Studio Build Tools with the "Desktop development with C++" workload) used by the default `*-pc-windows-msvc` Rust toolchain.
 
 **Build (from the repository root):**
 
@@ -84,7 +108,7 @@ cargo check
 cargo clippy -- -D warnings
 ```
 
-**Memory tuning (SQLite + ingestion):** Marrow caps SQLite page cache and disables memory-mapped I/O by default so a large `graph.db` is less likely to show as 10+ GB in Activity Monitor. Override when needed:
+**Memory tuning (SQLite + ingestion):** Marrow caps SQLite page cache and disables memory-mapped I/O by default so a large `graph.db` is less likely to show as 10+ GB in your OS process monitor (Activity Monitor, Task Manager, `top`/`htop`). Override when needed:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -123,21 +147,21 @@ Use this whenever you pull changes or modify Marrow source code and need to get 
 ### Full rebuild + install (most common)
 
 ```bash
-# 1. From the marrow repo root:
-cd ~/Coding/marrow
+# 1. From the marrow repo root (wherever you cloned it).
 
 # 2. Verify it compiles cleanly:
 cargo check
 
-# 3. Run the test suite (128 tests, ~1 s):
+# 3. Run the test suite:
 cargo test
 
-# 4. Build optimised release binary and install to ~/.cargo/bin/marrow:
+# 4. Build optimised release binary and install to the Cargo bin dir:
 cargo install --path .
 ```
 
-`cargo install --path .` compiles with full optimisations and replaces the binary at
-`~/.cargo/bin/marrow` in one step (~30 s on Apple Silicon). No separate `cp` needed.
+`cargo install --path .` compiles with full optimisations and replaces the installed
+binary in one step. It installs to Cargo's bin directory — `~/.cargo/bin/marrow` on
+macOS/Linux, `%USERPROFILE%\.cargo\bin\marrow.exe` on Windows. No separate copy step needed.
 
 ### Pick up the new binary in your editor / agents
 
@@ -157,16 +181,19 @@ marrow ui     # re-open dashboard (optional)
 If you only want to test a change without overwriting the installed binary:
 
 ```bash
-cargo build --release          # builds target/release/marrow
-./target/release/marrow index  # run any subcommand against the uninstalled binary
+cargo build --release                 # builds target/release/marrow(.exe)
+cargo run --release -- index          # run any subcommand against the uninstalled binary
+# or invoke it directly:
+#   macOS/Linux: ./target/release/marrow index
+#   Windows:     .\target\release\marrow.exe index
 ```
 
 ### Lint + test only (no build)
 
 ```bash
-cargo check                    # fast syntax + type check (~4 s)
+cargo check                    # fast syntax + type check
 cargo clippy -- -D warnings    # lint; must produce zero warnings
-cargo test                     # 128 unit tests (~1 s)
+cargo test                     # run the full test suite
 ```
 
 ### After a large re-index
@@ -180,13 +207,14 @@ marrow maintenance
 
 ## Global install
 
-**Global install** (puts the binary on your PATH via `~/.cargo/bin`, which must be on `PATH`):
+**Global install** (puts the binary on your PATH via Cargo's bin directory, which must be on `PATH`):
 
 ```bash
 cargo install --path .
 ```
 
-This installs the **`marrow`** executable into `~/.cargo/bin` (ensure that directory is on your `PATH`).
+This installs the **`marrow`** executable into Cargo's bin directory — `~/.cargo/bin` on
+macOS/Linux, `%USERPROFILE%\.cargo\bin` on Windows. Ensure that directory is on your `PATH`.
 
 The npm package (`npm install -g @nickm-swe/marrow`) downloads a verified GitHub release binary and does not register desktop app entries by default. Run `marrow ui-app enable` explicitly if you want desktop app registration.
 
