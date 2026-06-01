@@ -4519,6 +4519,11 @@ mod tests {
     /// `std::env::set_current_dir` behind this mutex so they cannot race.
     static CWD_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Process-global environment variables are shared state; serialize every
+    /// test that mutates `MARROW_DB_PATH` / `MARROW_NO_AUTO_INDEX` so they
+    /// cannot race or leak values across tests.
+    static ENV_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn assert_soft_workspace_guidance(text: &str) {
         assert!(
             text.contains("MARROW AST CONTEXT ENGINE"),
@@ -6798,7 +6803,183 @@ mod tests {
         );
     }
 
-    // ── launch-spec helpers ────────────────────────────────────────────────────
+    // ── resolve_context_repo_id cold-start auto-index / degrade ────────────────
+
+    /// Compile a packet for the resolved repo_id so tests can assert routing.
+    fn compile_for(conn: &rusqlite::Connection, repo_id: &str) -> context::ContextPacket {
+        context::compile_context_packet_for_format(
+            conn,
+            context::ContextRequest {
+                task: "explore".to_string(),
+                repo_id: repo_id.to_string(),
+                budget_tokens: 12_000,
+                profile: context::ModelProfile::Local32k,
+            },
+            context::ContextFormat::Markdown,
+        )
+        .unwrap()
+    }
+
+    fn node_count(conn: &rusqlite::Connection, repo_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
+            rusqlite::params![repo_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_context_repo_id_empty_db_auto_indexes() {
+        let _env_guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("hello.py"), "def hello():\n    pass\n").unwrap();
+        std::env::set_var("MARROW_DB_PATH", dir.path().join("graph.db"));
+        std::env::remove_var("MARROW_NO_AUTO_INDEX");
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = resolve_context_repo_id(&conn, "coldrepo").unwrap();
+        assert_eq!(repo_id, "coldrepo");
+        assert!(
+            node_count(&conn, &repo_id) > 0,
+            "empty-DB cold start should have auto-indexed"
+        );
+        let packet = compile_for(&conn, &repo_id);
+        assert_ne!(packet.routing.outcome, context::RoutingOutcome::NeedsIndex);
+
+        std::env::remove_var("MARROW_DB_PATH");
+    }
+
+    #[test]
+    fn resolve_context_repo_id_populated_db_miss_degrades() {
+        let _env_guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("hello.py"), "def hello():\n    pass\n").unwrap();
+        std::env::set_var("MARROW_DB_PATH", dir.path().join("graph.db"));
+        std::env::remove_var("MARROW_NO_AUTO_INDEX");
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        // Populate the DB with a different repo so the table is non-empty.
+        ingestion::ingest_repo(&conn, "existing", dir.path()).unwrap();
+
+        let repo_id = resolve_context_repo_id(&conn, "typorepo").unwrap();
+        assert_eq!(repo_id, "typorepo");
+        assert_eq!(
+            node_count(&conn, "typorepo"),
+            0,
+            "populated-DB miss must not auto-index"
+        );
+        let packet = compile_for(&conn, &repo_id);
+        assert_eq!(packet.routing.outcome, context::RoutingOutcome::NeedsIndex);
+
+        std::env::remove_var("MARROW_DB_PATH");
+    }
+
+    #[test]
+    fn resolve_context_repo_id_opt_out_degrades() {
+        let _env_guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("hello.py"), "def hello():\n    pass\n").unwrap();
+        std::env::set_var("MARROW_DB_PATH", dir.path().join("graph.db"));
+        std::env::set_var("MARROW_NO_AUTO_INDEX", "1");
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = resolve_context_repo_id(&conn, "coldrepo").unwrap();
+        assert_eq!(repo_id, "coldrepo");
+        assert_eq!(
+            node_count(&conn, "coldrepo"),
+            0,
+            "opt-out must skip auto-indexing"
+        );
+        let packet = compile_for(&conn, &repo_id);
+        assert_eq!(packet.routing.outcome, context::RoutingOutcome::NeedsIndex);
+
+        std::env::remove_var("MARROW_NO_AUTO_INDEX");
+        std::env::remove_var("MARROW_DB_PATH");
+    }
+
+    #[test]
+    fn resolve_context_repo_id_cap_exceeded_degrades() {
+        let _env_guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // Exceed the file cap with many tiny source files.
+        for i in 0..(MARROW_AUTO_INDEX_MAX_FILES + 1) {
+            fs::write(dir.path().join(format!("m{i}.py")), "x = 1\n").unwrap();
+        }
+        std::env::set_var("MARROW_DB_PATH", dir.path().join("graph.db"));
+        std::env::remove_var("MARROW_NO_AUTO_INDEX");
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = resolve_context_repo_id(&conn, "bigrepo").unwrap();
+        assert_eq!(repo_id, "bigrepo");
+        assert_eq!(
+            node_count(&conn, "bigrepo"),
+            0,
+            "cap-exceeded target must not auto-index"
+        );
+        let packet = compile_for(&conn, &repo_id);
+        assert_eq!(packet.routing.outcome, context::RoutingOutcome::NeedsIndex);
+
+        std::env::remove_var("MARROW_DB_PATH");
+    }
+
+    #[test]
+    fn resolve_context_repo_id_idempotency_skips_when_prepopulated() {
+        let _env_guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("hello.py"), "def hello():\n    pass\n").unwrap();
+        std::env::set_var("MARROW_DB_PATH", dir.path().join("graph.db"));
+        std::env::remove_var("MARROW_NO_AUTO_INDEX");
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        // Simulate the TOCTOU race: nodes for the requested repo appear after the
+        // empty-`repositories` check but before the pre-write re-check. Relax the
+        // FK so the seeded node can exist without a `repositories` row (which
+        // would otherwise short-circuit resolution at the top).
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text) \
+             VALUES ('warmrepo:pre.py:seed', 'warmrepo', 'pre.py', 'python', 'seed', 'function', 'def seed(): pass')",
+            [],
+        )
+        .unwrap();
+        let before = node_count(&conn, "warmrepo");
+
+        let repo_id = resolve_context_repo_id(&conn, "warmrepo").unwrap();
+        assert_eq!(repo_id, "warmrepo");
+        assert_eq!(
+            node_count(&conn, "warmrepo"),
+            before,
+            "idempotency re-check should skip indexing when nodes already exist"
+        );
+
+        std::env::remove_var("MARROW_DB_PATH");
+    }
+
+    #[test]
+    fn resolve_context_repo_id_already_indexed_no_regression() {
+        let _env_guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("hello.py"), "def hello():\n    pass\n").unwrap();
+        std::env::set_var("MARROW_DB_PATH", dir.path().join("graph.db"));
+        std::env::remove_var("MARROW_NO_AUTO_INDEX");
+
+        let conn = crate::db::init_db(":memory:").unwrap();
+        ingestion::ingest_repo(&conn, "known", dir.path()).unwrap();
+        let before = node_count(&conn, "known");
+
+        let repo_id = resolve_context_repo_id(&conn, "known").unwrap();
+        assert_eq!(repo_id, "known");
+        assert_eq!(
+            node_count(&conn, "known"),
+            before,
+            "resolving an already-indexed repo must not re-index"
+        );
+        let packet = compile_for(&conn, &repo_id);
+        assert_ne!(packet.routing.outcome, context::RoutingOutcome::NeedsIndex);
+
+        std::env::remove_var("MARROW_DB_PATH");
+    }
 
     #[test]
     fn mcp_launch_spec_is_portable_command_not_absolute_path() {
@@ -8387,13 +8568,109 @@ fn context_usage(program: &str) -> String {
     )
 }
 
+/// Upper bound on source files an empty-DB JIT auto-index will ingest.
+const MARROW_AUTO_INDEX_MAX_FILES: usize = 5000;
+/// Upper bound on total source bytes an empty-DB JIT auto-index will ingest.
+const MARROW_AUTO_INDEX_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Resolve the directory an empty-DB JIT auto-index should ingest: the parent of
+/// `MARROW_DB_PATH` when that env is set, otherwise the current working dir. A
+/// bare-filename `MARROW_DB_PATH` (no parent component) resolves to `.`.
+fn resolve_auto_index_target() -> PathBuf {
+    match std::env::var("MARROW_DB_PATH") {
+        Ok(db_path) => match Path::new(&db_path).parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        },
+        Err(_) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    }
+}
+
+/// Returns `true` only when the target is within both auto-index caps. Counting
+/// reuses ingestion's own file discovery so the scope matches what gets ingested.
+/// Any traversal or metadata failure degrades to `false` (no auto-index).
+fn auto_index_within_caps(target: &Path) -> bool {
+    let files = match ingestion::collect_source_files(target) {
+        Ok(files) => files,
+        Err(_) => return false,
+    };
+    if files.len() > MARROW_AUTO_INDEX_MAX_FILES {
+        return false;
+    }
+    let mut total_bytes: u64 = 0;
+    for file in &files {
+        let len = match std::fs::metadata(file) {
+            Ok(meta) => meta.len(),
+            Err(_) => return false,
+        };
+        total_bytes = total_bytes.saturating_add(len);
+        if total_bytes > MARROW_AUTO_INDEX_MAX_BYTES {
+            return false;
+        }
+    }
+    true
+}
+
+/// Bounded JIT auto-index for the empty-`repositories` cold-start case. Applies
+/// every guardrail (opt-out, non-dir target, file/byte caps, pre-write
+/// idempotency re-check) and ingests `repo_id` at the resolved target on pass.
+/// Any guardrail trip is a silent degrade — the caller still returns `repo_id`
+/// so compile emits a valid NeedsIndex packet.
+fn maybe_auto_index_empty_db(conn: &rusqlite::Connection, repo_id: &str) {
+    if std::env::var("MARROW_NO_AUTO_INDEX")
+        .map(|value| !value.is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let target = resolve_auto_index_target();
+    if !target.is_dir() {
+        return;
+    }
+
+    if !auto_index_within_caps(&target) {
+        return;
+    }
+
+    // Idempotency: re-check immediately before ingesting in case another process
+    // populated the graph since the empty-table check.
+    let symbol_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE repo_id = ?1",
+            rusqlite::params![repo_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if symbol_count != 0 {
+        return;
+    }
+
+    eprintln!(
+        "[MARROW] JIT auto-indexing repo '{}' at {} …",
+        repo_id,
+        target.display()
+    );
+    let t = Instant::now();
+    match ingestion::ingest_repo(conn, repo_id, &target) {
+        Ok(_) => eprintln!(
+            "[MARROW] JIT auto-indexing complete in {}ms.",
+            t.elapsed().as_millis()
+        ),
+        Err(e) => eprintln!(
+            "[MARROW] JIT auto-indexing failed ({e}); continuing with needs_index packet."
+        ),
+    }
+}
+
 /// Resolve a user-supplied `--repo` value to a real `repositories.id` in the graph DB.
 ///
 /// Accepts either a graph repo id (e.g. `Accrualify`) or a registry workspace_id
 /// (e.g. `Accrualify-549bf296`). If the value does not match a row in
 /// `repositories`, attempt to find the matching workspace in the registry and
-/// resolve via its `workspace_root` basename. On total failure, emit a clear
-/// error listing the available repo ids so the caller knows what to pass.
+/// resolve via its `workspace_root` basename. On total failure, fall back to
+/// bounded cold-start auto-indexing (empty DB) or return the requested name
+/// unindexed (populated DB miss) so compile emits a valid NeedsIndex packet.
 fn resolve_context_repo_id(conn: &rusqlite::Connection, requested: &str) -> Result<String> {
     let exists: i64 = conn
         .query_row(
@@ -8453,23 +8730,25 @@ fn resolve_context_repo_id(conn: &rusqlite::Connection, requested: &str) -> Resu
         }
     }
 
-    // Build a friendly error listing the available repo ids.
+    // No earlier resolution path matched. Decide between the empty-DB cold-start
+    // auto-index branch and the populated-DB name-miss degrade branch.
     let mut stmt =
         conn.prepare("SELECT id FROM repositories ORDER BY id")?;
     let available: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .filter_map(|r| r.ok())
         .collect();
-    if available.is_empty() {
-        anyhow::bail!(
-            "context: no repositories in graph database. Run `marrow index` first."
-        );
+    if !available.is_empty() {
+        // POPULATED-DB MISS: likely a typo. Do not auto-index or hard-error;
+        // return the requested name so compile emits a valid NeedsIndex packet.
+        return Ok(requested.to_string());
     }
-    anyhow::bail!(
-        "context: --repo '{}' does not match any repo in the graph. Available: {}",
-        requested,
-        available.join(", ")
-    );
+
+    // EMPTY-DB cold start: attempt bounded JIT auto-indexing of the resolved
+    // target. On any guardrail trip this degrades silently (no index), and the
+    // requested name still flows to compile as a NeedsIndex packet.
+    maybe_auto_index_empty_db(conn, requested);
+    Ok(requested.to_string())
 }
 
 fn cmd_context(program: &str, cli_args: &[String]) -> Result<()> {
