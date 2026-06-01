@@ -315,12 +315,49 @@ fn has_valid_generated_marker(content: &str) -> bool {
             .is_some_and(|checksum| checksum == generated_checksum(content))
 }
 
-fn classify_existing_content(content: &str) -> ExistingContentStatus {
-    if content == MARROW_CORE_SKILL_MD {
+/// Rewrite the value of the `# marrow-generated-checksum:` marker line in place,
+/// preserving every other line and its trailing newline exactly.
+fn rewrite_checksum_marker(content: &str, checksum: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for segment in content.split_inclusive('\n') {
+        let line = segment.trim_end_matches(['\r', '\n']);
+        if line.starts_with(GENERATED_CHECKSUM_PREFIX) {
+            let newline = &segment[line.len()..];
+            out.push_str(GENERATED_CHECKSUM_PREFIX);
+            out.push_str(checksum);
+            out.push_str(newline);
+        } else {
+            out.push_str(segment);
+        }
+    }
+    out
+}
+
+/// The Copilot / VS Code `.instructions.md` flavor of the core directive.
+///
+/// The body is byte-identical to [`MARROW_CORE_SKILL_MD`], but the frontmatter
+/// uses VS Code's `applyTo` glob (which is what actually gates auto-application
+/// of an instructions file) instead of Cursor's `.mdc`-only `alwaysApply` key.
+/// `applyTo: "**"` is the direct translation of `alwaysApply: true` — apply the
+/// directive to every file, regardless of language, so it is never silently
+/// dropped for `.rb`, `.lua`, or any other extension. The generated checksum
+/// marker is recomputed so the file is still recognised as managed on refresh.
+fn marrow_copilot_instructions_md() -> String {
+    let swapped = MARROW_CORE_SKILL_MD.replacen("alwaysApply: true", "applyTo: \"**\"", 1);
+    let checksum = generated_checksum(&swapped);
+    rewrite_checksum_marker(&swapped, &checksum)
+}
+
+/// Classify an existing file's content against a specific managed template.
+/// `classify_existing_content` is the common case keyed on the core template.
+fn classify_against(content: &str, current_template: &str) -> ExistingContentStatus {
+    if content == current_template {
         return ExistingContentStatus::CurrentManaged;
     }
 
-    if content == generated_content_for_checksum(MARROW_CORE_SKILL_MD)
+    if content == generated_content_for_checksum(current_template)
+        || content == MARROW_CORE_SKILL_MD
+        || content == generated_content_for_checksum(MARROW_CORE_SKILL_MD)
         || content == LEGACY_STALE_MARROW_CORE_SKILL_MD
         || content == LEGACY_ENFORCEMENT_MODE_MARROW_CORE_SKILL_MD
     {
@@ -336,6 +373,10 @@ fn classify_existing_content(content: &str) -> ExistingContentStatus {
     } else {
         ExistingContentStatus::Custom
     }
+}
+
+fn classify_existing_content(content: &str) -> ExistingContentStatus {
+    classify_against(content, MARROW_CORE_SKILL_MD)
 }
 
 fn refresh_existing_managed_file(path: &Path) -> Result<InstallStatus> {
@@ -401,6 +442,14 @@ pub fn install_skill(
     }
 
     let target = agent.target_path(scope, home);
+
+    // Copilot/VS Code instruction files need their own `applyTo` frontmatter, so
+    // they are always written as standalone files rather than symlinked to the
+    // shared (Cursor-flavored) central source.
+    if matches!(agent, Agent::GitHubCopilot) {
+        return install_managed_file(&target, &marrow_copilot_instructions_md());
+    }
+
     let central = install_source_path(method, home)
         .unwrap_or_else(|| home.join(".marrow/marrow-optimization.md"));
 
@@ -498,6 +547,52 @@ fn install(target: &Path, method: Method, central: &Path) -> Result<InstallStatu
     Ok(InstallStatus::Written)
 }
 
+/// Write a self-contained managed file holding exactly `content`.
+///
+/// Unlike [`install`], this never symlinks: the file must carry its own
+/// frontmatter (Copilot's `applyTo`), which a shared central source cannot
+/// provide. A user-authored file is preserved; a managed file (including a
+/// symlink to the shared central, the source of the Accrualify bug) is
+/// replaced in place with a standalone `content` file.
+fn install_managed_file(target: &Path, content: &str) -> Result<InstallStatus> {
+    let link_meta = target.symlink_metadata();
+
+    if let Ok(meta) = &link_meta {
+        let is_symlink = meta.file_type().is_symlink();
+
+        // A dangling symlink resolves to nothing — clear it and write fresh.
+        if is_symlink && !target.exists() {
+            fs::remove_file(target)?;
+        } else {
+            // Read through the link (if any) to classify the effective content.
+            let existing = fs::read_to_string(target).unwrap_or_default();
+            return match classify_against(&existing, content) {
+                ExistingContentStatus::CurrentManaged if !is_symlink => {
+                    Ok(InstallStatus::PreservedExisting)
+                }
+                ExistingContentStatus::Custom => Ok(InstallStatus::PreservedExisting),
+                // Managed content (or a symlink, even to current content): replace
+                // with a standalone file so the frontmatter is correct and owned here.
+                _ => {
+                    if is_symlink {
+                        fs::remove_file(target)?;
+                    }
+                    fs::write(target, content)?;
+                    Ok(InstallStatus::Refreshed)
+                }
+            };
+        }
+    }
+
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(target, content)?;
+    Ok(InstallStatus::Written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -538,6 +633,117 @@ mod tests {
             )),
             super::ExistingContentStatus::RefreshableManaged,
         );
+    }
+
+    #[test]
+    fn copilot_instructions_template_uses_applyto_not_alwaysapply() {
+        let md = super::marrow_copilot_instructions_md();
+        // VS Code / Copilot `.instructions.md` files key auto-application on
+        // `applyTo` (a glob), not Cursor's `.mdc` `alwaysApply` field.
+        assert!(
+            md.contains("applyTo: \"**\""),
+            "copilot instructions must declare applyTo: \"**\" so the directive always applies"
+        );
+        assert!(
+            !md.contains("alwaysApply"),
+            "copilot instructions must not carry Cursor's alwaysApply key"
+        );
+    }
+
+    #[test]
+    fn copilot_instructions_template_is_self_consistent_managed() {
+        let md = super::marrow_copilot_instructions_md();
+        assert!(
+            super::has_valid_generated_marker(&md),
+            "rendered copilot template must carry a valid generated checksum marker"
+        );
+        assert_eq!(
+            super::classify_against(&md, &md),
+            super::ExistingContentStatus::CurrentManaged,
+        );
+    }
+
+    #[test]
+    fn copilot_instructions_share_core_directive_body() {
+        // Body (everything after the frontmatter block) must be byte-identical to
+        // the core directive so guidance never drifts between agents.
+        let core_body = MARROW_CORE_SKILL_MD.splitn(3, "---\n").nth(2).unwrap();
+        let copilot = super::marrow_copilot_instructions_md();
+        let copilot_body = copilot.splitn(3, "---\n").nth(2).unwrap();
+        assert_eq!(copilot_body, core_body);
+    }
+
+    #[test]
+    fn install_skill_writes_global_copilot_applyto_instructions() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        fs::create_dir_all(&home).unwrap();
+        let target = Agent::GitHubCopilot.target_path(Scope::Global, &home);
+
+        let status =
+            super::install_skill(Agent::GitHubCopilot, Scope::Global, Method::WriteFile, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::Written);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            super::marrow_copilot_instructions_md()
+        );
+    }
+
+    #[test]
+    fn install_skill_preserves_user_authored_copilot_instructions() {
+        // Complement, never overwrite: a user's own instruction file is left intact.
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        let target = Agent::GitHubCopilot.target_path(Scope::Project, &home);
+        let target = home.join(target);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let custom = "---\napplyTo: \"**\"\n---\n# Team rules\nAsk before indexing.\n";
+        fs::write(&target, custom).unwrap();
+
+        // Project scope writes relative to CWD, so drive install through the lower
+        // level by pointing target_path at the temp home via Global semantics.
+        let status = super::install_managed_file(&target, &super::marrow_copilot_instructions_md())
+            .unwrap();
+
+        assert_eq!(status, InstallStatus::PreservedExisting);
+        assert_eq!(fs::read_to_string(&target).unwrap(), custom);
+    }
+
+    #[test]
+    fn install_skill_converts_legacy_core_symlink_to_standalone_applyto_file() {
+        // Reproduces the Accrualify global-Copilot bug: the prompts file was a
+        // symlink to the shared (Cursor-flavored) central, so it carried
+        // `alwaysApply` and never auto-applied in Copilot. Install must replace
+        // it with a real standalone file using `applyTo`.
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        fs::create_dir_all(&home).unwrap();
+        let target = Agent::GitHubCopilot.target_path(Scope::Global, &home);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let central = home.join(".marrow/marrow-optimization.md");
+        fs::create_dir_all(central.parent().unwrap()).unwrap();
+        fs::write(&central, MARROW_CORE_SKILL_MD).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&central, &target).unwrap();
+        #[cfg(not(unix))]
+        fs::copy(&central, &target).unwrap();
+
+        let status =
+            super::install_skill(Agent::GitHubCopilot, Scope::Global, Method::Symlink, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::Refreshed);
+        // The target is now a regular file, not a symlink.
+        assert!(!target.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            super::marrow_copilot_instructions_md()
+        );
+        // The shared central file is untouched (still core, for Cursor et al.).
+        assert_eq!(fs::read_to_string(&central).unwrap(), MARROW_CORE_SKILL_MD);
     }
 
     #[test]
@@ -885,7 +1091,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, InstallStatus::Refreshed);
-        assert_eq!(fs::read_to_string(&target).unwrap(), MARROW_CORE_SKILL_MD);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            super::marrow_copilot_instructions_md()
+        );
     }
 
     #[test]
@@ -906,7 +1115,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, InstallStatus::Refreshed);
-        assert_eq!(fs::read_to_string(&target).unwrap(), MARROW_CORE_SKILL_MD);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            super::marrow_copilot_instructions_md()
+        );
     }
 
     #[test]
@@ -925,7 +1137,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, InstallStatus::Written);
-        assert_eq!(fs::read_to_string(&target).unwrap(), MARROW_CORE_SKILL_MD);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            super::marrow_copilot_instructions_md()
+        );
     }
 
     #[test]
