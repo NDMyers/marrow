@@ -993,6 +993,10 @@ fn cmd_benchmark_wizard(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 struct ContextEngine {
     db: Arc<Mutex<rusqlite::Connection>>,
     http_client: reqwest::Client,
+    /// Set after the first compliance auto-route notice is sent; later
+    /// auto-routed calls are rewritten silently so the warning doesn't tax
+    /// every response in the session.
+    compliance_notice_sent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ContextEngine {
@@ -1002,6 +1006,7 @@ impl ContextEngine {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             http_client,
+            compliance_notice_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -2901,6 +2906,7 @@ impl ServerHandler for ContextEngine {
     ) -> impl std::future::Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_
     {
         let db = Arc::clone(&self.db);
+        let compliance_notice_sent = Arc::clone(&self.compliance_notice_sent);
 
         async move {
             // Skip auto-init when the agent is explicitly calling workspace_setup —
@@ -4431,11 +4437,15 @@ impl ServerHandler for ContextEngine {
                 }
             }
 
-            // Prepend compliance notice and auto-init notice to successful responses
+            // Prepend compliance notice and auto-init notice to successful responses.
+            // The compliance warning is sent at most once per server session — the
+            // auto-route still happens silently afterwards.
             if let (Some(notice), Ok(ref mut tool_result)) = (&compliance_notice, &mut result) {
-                tool_result
-                    .content
-                    .insert(0, Content::text(notice.as_str()));
+                if !compliance_notice_sent.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tool_result
+                        .content
+                        .insert(0, Content::text(notice.as_str()));
+                }
             }
             if let (Some(notice), Ok(ref mut tool_result)) = (&init_notice, &mut result) {
                 tool_result
@@ -4590,6 +4600,7 @@ mod tests {
                 file_path: "f.py".to_string(),
                 language: "py".to_string(),
                 text: "def foo(): pass".to_string(),
+                start_line: 1,
             },
             neighbors: vec![],
         };
@@ -7344,7 +7355,10 @@ mod tests {
         // The sentinel file is still created (workspace_is_initialized depends on
         // it), but it carries no shadowing marrow entry — user-global is canonical.
         let ws = workspace_root.join(".vscode/mcp.json");
-        assert!(ws.exists(), "workspace mcp.json sentinel must still be created");
+        assert!(
+            ws.exists(),
+            "workspace mcp.json sentinel must still be created"
+        );
         let cfg: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&ws).unwrap()).unwrap();
         assert!(
@@ -7659,10 +7673,7 @@ fn mcp_json_defines_marrow(path: &Path) -> bool {
 /// does not shadow the started user-global server with an untrusted workspace
 /// duplicate. Unrelated servers are preserved. Returns `Some(path)` when the
 /// workspace file was modified.
-fn dedupe_workspace_marrow(
-    workspace_mcp: &Path,
-    user_global_mcp: &Path,
-) -> Result<Option<String>> {
+fn dedupe_workspace_marrow(workspace_mcp: &Path, user_global_mcp: &Path) -> Result<Option<String>> {
     if !workspace_mcp.exists() || !mcp_json_defines_marrow(user_global_mcp) {
         return Ok(None);
     }
@@ -9024,11 +9035,7 @@ fn resolve_context_repo_id(conn: &rusqlite::Connection, requested: &str) -> Resu
     // was ingested under a different repo_id (typically the workspace basename).
     if let Ok(registry) = registry::Registry::open_default() {
         if let Ok(Some(entry)) = registry.find_workspace(requested) {
-            if let Some(basename) = entry
-                .workspace_root
-                .file_name()
-                .and_then(|n| n.to_str())
-            {
+            if let Some(basename) = entry.workspace_root.file_name().and_then(|n| n.to_str()) {
                 let basename_exists: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM repositories WHERE id = ?1",
@@ -9069,8 +9076,7 @@ fn resolve_context_repo_id(conn: &rusqlite::Connection, requested: &str) -> Resu
 
     // No earlier resolution path matched. Decide between the empty-DB cold-start
     // auto-index branch and the populated-DB name-miss degrade branch.
-    let mut stmt =
-        conn.prepare("SELECT id FROM repositories ORDER BY id")?;
+    let mut stmt = conn.prepare("SELECT id FROM repositories ORDER BY id")?;
     let available: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .filter_map(|r| r.ok())
@@ -9984,9 +9990,14 @@ async fn async_main(args: Vec<String>) -> Result<()> {
                 println!("  No downstream dependents found.");
             } else {
                 for n in impact.affected {
+                    let loc = if n.start_line > 0 {
+                        format!("{}:{}", n.file_path, n.start_line)
+                    } else {
+                        n.file_path.clone()
+                    };
                     println!(
                         "  [Depth {}] {} ({}) in {}",
-                        n.depth, n.symbol_name, n.symbol_type, n.file_path
+                        n.depth, n.symbol_name, n.symbol_type, loc
                     );
                 }
             }
@@ -10104,6 +10115,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
     let engine = ContextEngine {
         db: Arc::clone(&db_arc),
         http_client,
+        compliance_notice_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     // Indexing is now decoupled — managed externally via `marrow index` / `marrow watch`.

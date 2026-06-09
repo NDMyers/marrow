@@ -1,0 +1,26 @@
+{
+  "_comment": "Hand-maintained Anthropic API prices. Values here WIN over the live LiteLLM feed, so use this to pin official rates or fix a stale/missing entry. Costs are PER TOKEN in USD (per-million / 1e6). Source of truth: https://platform.claude.com/docs/en/about-claude/pricing . Keys may be a bare model id (claude-opus-4-8) or a family-version (claude-haiku-4-5). Last verified: 2026-06-07.",
+  "_fields": "input_cost_per_token, output_cost_per_token, cache_read_input_token_cost (cache-read, ~0.1x), cache_creation_input_token_cost (5m write, 1.25x), cache_creation_input_token_cost_above_1hr (1h write, 2.0x)",
+
+  "claude-opus-4-8": {
+    "input_cost_per_token": 5e-06,
+    "output_cost_per_token": 2.5e-05,
+    "cache_read_input_token_cost": 5e-07,
+    "cache_creation_input_token_cost": 6.25e-06,
+    "cache_creation_input_token_cost_above_1hr": 1e-05
+  },
+  "claude-sonnet-4-6": {
+    "input_cost_per_token": 3e-06,
+    "output_cost_per_token": 1.5e-05,
+    "cache_read_input_token_cost": 3e-07,
+    "cache_creation_input_token_cost": 3.75e-06,
+    "cache_creation_input_token_cost_above_1hr": 6e-06
+  },
+  "claude-haiku-4-5": {
+    "input_cost_per_token": 1e-06,
+    "output_cost_per_token": 5e-06,
+    "cache_read_input_token_cost": 1e-07,
+    "cache_creation_input_token_cost": 1.25e-06,
+    "cache_creation_input_token_cost_above_1hr": 2e-06
+  }
+}

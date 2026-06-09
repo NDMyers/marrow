@@ -143,6 +143,8 @@ pub struct NodeInfo {
     pub language: String,
     /// Full source for the pivot; condensed body for neighbors.
     pub text: String,
+    /// 1-based line where the symbol starts (0 = unknown).
+    pub start_line: i64,
 }
 
 /// Direction of an edge relative to the pivot node.
@@ -174,6 +176,8 @@ pub struct ImpactNode {
     /// The edge type that makes this node depend on its parent in the chain.
     pub relationship_type: String,
     pub depth: i64,
+    /// 1-based line where the symbol starts (0 = unknown).
+    pub start_line: i64,
 }
 
 #[derive(Debug)]
@@ -329,7 +333,7 @@ pub enum BatchTelemetry {
     },
 }
 
-type NodeRow = (String, String, String, String, String, String);
+type NodeRow = (String, String, String, String, String, String, i64);
 
 #[derive(Debug, Clone)]
 struct NodeBrief {
@@ -339,6 +343,7 @@ struct NodeBrief {
     file_path: String,
     language: String,
     raw_text: String,
+    start_line: i64,
 }
 
 impl From<NodeRow> for NodeBrief {
@@ -350,7 +355,17 @@ impl From<NodeRow> for NodeBrief {
             file_path: row.3,
             language: row.4,
             raw_text: row.5,
+            start_line: row.6,
         }
+    }
+}
+
+/// Render `file_path:start_line` when the line is known (1-based; 0 = unknown).
+fn file_line(file_path: &str, start_line: i64) -> String {
+    if start_line > 0 {
+        format!("{file_path}:{start_line}")
+    } else {
+        file_path.to_string()
     }
 }
 
@@ -390,8 +405,15 @@ pub fn impact_max_rows() -> usize {
     env_usize_positive("MARROW_IMPACT_MAX_ROWS", 5000)
 }
 
+/// Per-response byte budget shared by the larger tool outputs (~8K tokens).
+///
+/// Sized so a single tool response stays well inside agent-harness inline
+/// limits — oversized responses get spilled to disk with only a tiny preview
+/// reaching the model, which wastes the call entirely.
+const DEFAULT_RESPONSE_MAX_BYTES: usize = 32_000;
+
 pub fn batch_max_bytes() -> usize {
-    env_usize_positive("MARROW_BATCH_MAX_BYTES", 100_000)
+    env_usize_positive("MARROW_BATCH_MAX_BYTES", DEFAULT_RESPONSE_MAX_BYTES)
 }
 
 pub fn dependency_graph_max_nodes() -> usize {
@@ -399,7 +421,12 @@ pub fn dependency_graph_max_nodes() -> usize {
 }
 
 pub fn dependency_graph_max_bytes() -> usize {
-    env_usize_positive("MARROW_DEP_GRAPH_MAX_BYTES", 100_000)
+    env_usize_positive("MARROW_DEP_GRAPH_MAX_BYTES", DEFAULT_RESPONSE_MAX_BYTES)
+}
+
+/// Max bytes for `get_skeleton` output before truncation.
+pub fn skeleton_max_bytes() -> usize {
+    env_usize_positive("MARROW_SKELETON_MAX_BYTES", DEFAULT_RESPONSE_MAX_BYTES)
 }
 
 /// Max total bytes for `CapsuleResult::original_text` (concatenated full files touched by the
@@ -659,7 +686,7 @@ pub fn measure_precise_tokens_touched_by_capsule(
     repo_id: &str,
     filepath: Option<&str>,
 ) -> Result<PreciseTokenMeasurement> {
-    let (pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw) =
+    let (pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw, pivot_line) =
         match resolve_symbol_or_disambiguate(conn, symbol_name, repo_id, filepath)? {
             SymbolResolution::Unique(row) => row,
             SymbolResolution::Ambiguous(_) => {
@@ -674,7 +701,7 @@ pub fn measure_precise_tokens_touched_by_capsule(
         };
 
     let capsule = build_context_capsule_from_resolved(
-        conn, pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw,
+        conn, pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw, pivot_line,
     )?;
 
     let touched = touched_paths_for_capsule(&capsule);
@@ -748,7 +775,7 @@ pub fn get_context_capsule(
     filepath: Option<&str>,
 ) -> Result<CapsuleResult> {
     // Resolve or get a structured disambiguation payload.
-    let (pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw) =
+    let (pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw, pivot_line) =
         match resolve_symbol_or_disambiguate(conn, symbol_name, repo_id, filepath)? {
             SymbolResolution::Unique(row) => row,
             SymbolResolution::Ambiguous(payload) => {
@@ -775,7 +802,7 @@ pub fn get_context_capsule(
         };
 
     let capsule = build_context_capsule_from_resolved(
-        conn, pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw,
+        conn, pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw, pivot_line,
     )?;
     let optimized_text = format_capsule(&capsule);
 
@@ -897,6 +924,7 @@ pub fn get_context_capsule(
 
 /// Core builder: builds a `ContextCapsule` from a pre-resolved pivot row.
 /// Shared by `get_context_capsule` and `trace_logic_flow`.
+#[allow(clippy::too_many_arguments)]
 fn build_context_capsule_from_resolved(
     conn: &Connection,
     pivot_id: String,
@@ -905,6 +933,7 @@ fn build_context_capsule_from_resolved(
     pivot_path: String,
     pivot_lang: String,
     pivot_raw: String,
+    pivot_line: i64,
 ) -> Result<ContextCapsule> {
     let pivot = NodeInfo {
         id: pivot_id.clone(),
@@ -913,6 +942,7 @@ fn build_context_capsule_from_resolved(
         file_path: pivot_path,
         language: pivot_lang,
         text: pivot_raw,
+        start_line: pivot_line,
     };
 
     let out_lim = capsule_max_outbound_neighbors() as i64;
@@ -921,40 +951,41 @@ fn build_context_capsule_from_resolved(
     // ── Outbound edges: pivot → targets (things this symbol calls/imports) ──
     let mut outbound_stmt = conn.prepare(
         "SELECT n.id, n.symbol_name, n.symbol_type, n.file_path, n.language,
-                n.raw_text, e.relationship_type
+                n.raw_text, e.relationship_type, n.start_line
          FROM edges e
          JOIN nodes n ON e.source_id = ?1 AND n.id = e.target_id
          WHERE n.id != ?1
          ORDER BY n.symbol_name, n.file_path
          LIMIT ?2",
     )?;
-    let outbound_rows: Vec<(String, String, String, String, String, String, String)> =
-        outbound_stmt
-            .query_map(rusqlite::params![pivot_id, out_lim], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+    type NeighborRow = (String, String, String, String, String, String, String, i64);
+    let outbound_rows: Vec<NeighborRow> = outbound_stmt
+        .query_map(rusqlite::params![pivot_id, out_lim], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
 
     // ── Inbound edges: sources → pivot (things that call this symbol) ──
     let mut inbound_stmt = conn.prepare(
         "SELECT n.id, n.symbol_name, n.symbol_type, n.file_path, n.language,
-                n.raw_text, e.relationship_type
+                n.raw_text, e.relationship_type, n.start_line
          FROM edges e
          JOIN nodes n ON e.target_id = ?1 AND n.id = e.source_id
          WHERE n.id != ?1
          ORDER BY n.symbol_name, n.file_path
          LIMIT ?2",
     )?;
-    let inbound_rows: Vec<(String, String, String, String, String, String, String)> = inbound_stmt
+    let inbound_rows: Vec<NeighborRow> = inbound_stmt
         .query_map(rusqlite::params![pivot_id, in_lim], |row| {
             Ok((
                 row.get(0)?,
@@ -964,6 +995,7 @@ fn build_context_capsule_from_resolved(
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
             ))
         })?
         .filter_map(|r| r.ok())
@@ -971,7 +1003,7 @@ fn build_context_capsule_from_resolved(
 
     let mut neighbors: Vec<NeighborInfo> = Vec::new();
 
-    for (id, sym_name, sym_type, file_path, lang, raw_text, rel_type) in outbound_rows {
+    for (id, sym_name, sym_type, file_path, lang, raw_text, rel_type, start_line) in outbound_rows {
         neighbors.push(NeighborInfo {
             node: NodeInfo {
                 id,
@@ -980,13 +1012,14 @@ fn build_context_capsule_from_resolved(
                 file_path,
                 language: lang.clone(),
                 text: condense(&raw_text, &lang),
+                start_line,
             },
             relationship: rel_type,
             direction: EdgeDirection::Outbound,
         });
     }
 
-    for (id, sym_name, sym_type, file_path, lang, raw_text, rel_type) in inbound_rows {
+    for (id, sym_name, sym_type, file_path, lang, raw_text, rel_type, start_line) in inbound_rows {
         neighbors.push(NeighborInfo {
             node: NodeInfo {
                 id,
@@ -995,6 +1028,7 @@ fn build_context_capsule_from_resolved(
                 file_path,
                 language: lang.clone(),
                 text: condense(&raw_text, &lang),
+                start_line,
             },
             relationship: rel_type,
             direction: EdgeDirection::Inbound,
@@ -1016,19 +1050,34 @@ fn format_capsule(capsule: &ContextCapsule) -> String {
         capsule.pivot.symbol_name, capsule.pivot.language
     )
     .ok();
-    writeln!(out, "File : {}", capsule.pivot.file_path).ok();
+    writeln!(
+        out,
+        "File : {}",
+        file_line(&capsule.pivot.file_path, capsule.pivot.start_line)
+    )
+    .ok();
     writeln!(out, "Type : {}", capsule.pivot.symbol_type).ok();
 
     let max_pivot = capsule_max_pivot_bytes();
     if capsule.pivot.text.len() > max_pivot {
         // Auto-condense oversized pivots (e.g. large classes with hundreds of scopes/methods).
+        // The condensed body is itself hard-capped: a giant function condenses to a giant
+        // skeleton, and an uncapped one can still blow the per-response token budget.
         let condensed = condense(&capsule.pivot.text, &capsule.pivot.language);
+        let shown = prefix_by_bytes(&condensed, max_pivot);
         writeln!(
             out,
             "\n── CONDENSED SOURCE (pivot exceeded {max_pivot}B cap) ─────────────"
         )
         .ok();
-        writeln!(out, "{}", condensed).ok();
+        writeln!(out, "{}", shown).ok();
+        if shown.len() < condensed.len() {
+            writeln!(
+                out,
+                "[Note: condensed body truncated at {max_pivot}B as well.]"
+            )
+            .ok();
+        }
         writeln!(
             out,
             "[Note: full source ({orig}B) condensed to save tokens. \
@@ -1089,7 +1138,7 @@ fn format_capsule(capsule: &ContextCapsule) -> String {
                 rel = n.relationship,
                 name = n.node.symbol_name,
                 lang = n.node.language,
-                path = n.node.file_path,
+                path = file_line(&n.node.file_path, n.node.start_line),
                 sig = signature,
             )
             .ok();
@@ -1121,7 +1170,7 @@ fn format_capsule(capsule: &ContextCapsule) -> String {
                 rel = n.relationship,
                 name = n.node.symbol_name,
                 lang = n.node.language,
-                path = n.node.file_path,
+                path = file_line(&n.node.file_path, n.node.start_line),
             )
             .ok();
         }
@@ -1187,7 +1236,7 @@ pub fn analyze_impact(
              WHERE node_id != ?1
          )
          SELECT n.id, n.symbol_name, n.symbol_type, n.file_path, n.repo_id,
-                r.rel_type, r.depth
+                r.rel_type, r.depth, n.start_line
          FROM ranked r
          JOIN nodes n ON n.id = r.node_id
          WHERE r.rn = 1
@@ -1206,6 +1255,7 @@ pub fn analyze_impact(
                 repo_id: row.get(4)?,
                 relationship_type: row.get(5)?,
                 depth: row.get(6)?,
+                start_line: row.get(7)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -1239,7 +1289,7 @@ pub fn format_impact_result(result: &ImpactResult) -> String {
     } else {
         writeln!(
             out,
-            "{:>5}  {:>10}  {:<20}  {:<10}  {:<14}  FILE",
+            "{:>5}  {:>10}  {:<20}  {:<10}  {:<14}  FILE:LINE",
             "DEPTH", "REL_TYPE", "SYMBOL", "SYM_TYPE", "REPO"
         )
         .ok();
@@ -1253,7 +1303,7 @@ pub fn format_impact_result(result: &ImpactResult) -> String {
                 sym = n.symbol_name,
                 typ = n.symbol_type,
                 repo = n.repo_id,
-                file = n.file_path
+                file = file_line(&n.file_path, n.start_line)
             )
             .ok();
         }
@@ -1630,7 +1680,9 @@ pub fn dependency_graph(
     writeln!(
         out,
         "\nROOT: {} ({}) — {}",
-        root.symbol_name, root.symbol_type, root.file_path
+        root.symbol_name,
+        root.symbol_type,
+        file_line(&root.file_path, root.start_line)
     )
     .ok();
     if options.include_source {
@@ -1757,14 +1809,14 @@ fn fetch_dependency_neighbors(
 ) -> Result<Vec<(String, NodeBrief)>> {
     let sql = match direction {
         DependencyDirection::Callers => {
-            "SELECT e.relationship_type, n.id, n.symbol_name, n.symbol_type, n.file_path, n.language, n.raw_text
+            "SELECT e.relationship_type, n.id, n.symbol_name, n.symbol_type, n.file_path, n.language, n.raw_text, n.start_line
              FROM edges e
              JOIN nodes n ON n.id = e.source_id
              WHERE e.target_id = ?1
              ORDER BY e.relationship_type ASC, n.symbol_name ASC, n.file_path ASC, n.id ASC"
         }
         DependencyDirection::Callees => {
-            "SELECT e.relationship_type, n.id, n.symbol_name, n.symbol_type, n.file_path, n.language, n.raw_text
+            "SELECT e.relationship_type, n.id, n.symbol_name, n.symbol_type, n.file_path, n.language, n.raw_text, n.start_line
              FROM edges e
              JOIN nodes n ON n.id = e.target_id
              WHERE e.source_id = ?1
@@ -1784,6 +1836,7 @@ fn fetch_dependency_neighbors(
                     file_path: row.get(4)?,
                     language: row.get(5)?,
                     raw_text: row.get(6)?,
+                    start_line: row.get(7)?,
                 },
             ))
         })?
@@ -1832,7 +1885,7 @@ fn append_graph_entry_tree(
         entry.relationship_type,
         entry.node.symbol_name,
         entry.node.symbol_type,
-        entry.node.file_path,
+        file_line(&entry.node.file_path, entry.node.start_line),
         seen
     )
     .ok();
@@ -1894,7 +1947,9 @@ pub fn map_class(
     writeln!(
         out,
         "CLASS MAP — {} ({}) — {}",
-        root.symbol_name, root.symbol_type, root.file_path
+        root.symbol_name,
+        root.symbol_type,
+        file_line(&root.file_path, root.start_line)
     )
     .ok();
     writeln!(out, "\n## CAPSULE\n{}", capsule.optimized_text).ok();
@@ -2012,7 +2067,7 @@ pub fn trace_logic_flow(
     filepath: Option<&str>,
 ) -> Result<CapsuleResult> {
     // Resolve the pivot, returning a disambiguation payload on ambiguity.
-    let (pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw) =
+    let (pivot_id, pivot_name, pivot_type, pivot_path, pivot_lang, pivot_raw, pivot_line) =
         match resolve_symbol_or_disambiguate(conn, symbol_name, repo_id, filepath)? {
             SymbolResolution::Unique(row) => row,
             SymbolResolution::Ambiguous(payload) => {
@@ -2044,13 +2099,14 @@ pub fn trace_logic_flow(
         file_path: pivot_path,
         language: pivot_lang,
         text: pivot_raw,
+        start_line: pivot_line,
     };
 
     let out_lim = capsule_max_outbound_neighbors() as i64;
     // Query only outbound edges (what this symbol calls / imports).
     let mut stmt = conn.prepare(
         "SELECT n.id, n.symbol_name, n.symbol_type, n.file_path, n.language,
-                n.raw_text, e.relationship_type
+                n.raw_text, e.relationship_type, n.start_line
          FROM edges e
          JOIN nodes n ON e.source_id = ?1 AND n.id = e.target_id
          WHERE n.id != ?1
@@ -2067,21 +2123,25 @@ pub fn trace_logic_flow(
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })?
         .filter_map(|r| r.ok())
         .map(
-            |(id, sym_name, sym_type, file_path, lang, raw_text, rel_type)| NeighborInfo {
-                node: NodeInfo {
-                    id,
-                    symbol_name: sym_name,
-                    symbol_type: sym_type,
-                    file_path,
-                    language: lang.clone(),
-                    text: condense(&raw_text, &lang),
-                },
-                relationship: rel_type,
-                direction: EdgeDirection::Outbound,
+            |(id, sym_name, sym_type, file_path, lang, raw_text, rel_type, start_line)| {
+                NeighborInfo {
+                    node: NodeInfo {
+                        id,
+                        symbol_name: sym_name,
+                        symbol_type: sym_type,
+                        file_path,
+                        language: lang.clone(),
+                        text: condense(&raw_text, &lang),
+                        start_line,
+                    },
+                    relationship: rel_type,
+                    direction: EdgeDirection::Outbound,
+                }
             },
         )
         .collect();
@@ -2094,7 +2154,12 @@ pub fn trace_logic_flow(
         pivot.symbol_name, pivot.language
     )
     .ok();
-    writeln!(out, "File : {}", pivot.file_path).ok();
+    writeln!(
+        out,
+        "File : {}",
+        file_line(&pivot.file_path, pivot.start_line)
+    )
+    .ok();
     writeln!(out, "Type : {}", pivot.symbol_type).ok();
     writeln!(
         out,
@@ -2131,7 +2196,7 @@ pub fn trace_logic_flow(
                 rel = n.relationship,
                 name = n.node.symbol_name,
                 lang = n.node.language,
-                path = n.node.file_path,
+                path = file_line(&n.node.file_path, n.node.start_line),
             )
             .ok();
             writeln!(out, "{}", n.node.text).ok();
@@ -2218,7 +2283,7 @@ fn resolve_symbol_or_disambiguate(
         // `src\context.rs` (and vice versa) without requiring a re-ingest.
         let fp = crate::db::normalize_path_separators(fp);
         conn.prepare(
-            "SELECT id, symbol_name, symbol_type, file_path, language, raw_text
+            "SELECT id, symbol_name, symbol_type, file_path, language, raw_text, start_line
              FROM nodes
              WHERE symbol_name = ?1 AND repo_id = ?2
                AND REPLACE(file_path, '\\', '/') = ?3
@@ -2232,13 +2297,14 @@ fn resolve_symbol_or_disambiguate(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         })?
         .filter_map(|r| r.ok())
         .collect()
     } else {
         conn.prepare(
-            "SELECT id, symbol_name, symbol_type, file_path, language, raw_text
+            "SELECT id, symbol_name, symbol_type, file_path, language, raw_text, start_line
              FROM nodes
              WHERE symbol_name = ?1 AND repo_id = ?2
              ORDER BY file_path ASC, id ASC",
@@ -2251,6 +2317,7 @@ fn resolve_symbol_or_disambiguate(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         })?
         .filter_map(|r| r.ok())
@@ -2280,8 +2347,11 @@ fn resolve_symbol_or_disambiguate(
                  Please call run_pipeline again with the same intent and target, \
                  but add the specific `filepath` from the list below:\n"
             );
-            for (_, sym_name, sym_type, file_path, _, _) in candidates.iter().take(shown) {
-                payload.push_str(&format!("- {file_path} ({sym_type}: {sym_name})\n"));
+            for (_, sym_name, sym_type, file_path, _, _, start_line) in
+                candidates.iter().take(shown)
+            {
+                let loc = file_line(file_path, *start_line);
+                payload.push_str(&format!("- {loc} ({sym_type}: {sym_name})\n"));
             }
             if omitted > 0 {
                 payload.push_str(&format!(
@@ -2696,14 +2766,32 @@ pub fn get_project_skeleton(
     }
 
     let mut out = String::new();
+    let max_bytes = skeleton_max_bytes();
+    let mut files_shown = 0usize;
+    let total_files = map.len();
+    let mut byte_truncated = false;
     for (file_path, symbols) in &map {
-        writeln!(out, "\u{1f4c1} {}", file_path).ok();
+        let mut section = String::new();
+        writeln!(section, "\u{1f4c1} {}", file_path).ok();
         for (sym_type, sym_name) in symbols {
-            writeln!(out, "   - [{}] {}", sym_type, sym_name).ok();
+            writeln!(section, "   - [{}] {}", sym_type, sym_name).ok();
         }
+        if out.len() + section.len() > max_bytes {
+            byte_truncated = true;
+            break;
+        }
+        out.push_str(&section);
+        files_shown += 1;
     }
 
-    if row_count >= SKELETON_ROW_LIMIT {
+    if byte_truncated {
+        writeln!(
+            out,
+            "\n[WARNING: Skeleton truncated at {max_bytes} bytes — showed {files_shown} of {total_files} files. \
+             Pass `target_dir` to scope the skeleton to one directory, or raise MARROW_SKELETON_MAX_BYTES.]"
+        )
+        .ok();
+    } else if row_count >= SKELETON_ROW_LIMIT {
         writeln!(
             out,
             "\n[WARNING: Repository map truncated for token safety. \
@@ -2736,7 +2824,8 @@ mod tests {
                  id TEXT PRIMARY KEY, repo_id TEXT NOT NULL,
                  file_path TEXT NOT NULL, language TEXT NOT NULL,
                  symbol_name TEXT NOT NULL, symbol_type TEXT NOT NULL,
-                 raw_text TEXT NOT NULL
+                 raw_text TEXT NOT NULL,
+                 start_line INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE edges (
                  source_id TEXT NOT NULL, target_id TEXT NOT NULL,
@@ -2788,8 +2877,8 @@ mod tests {
         raw: &str,
     ) {
         conn.execute(
-            "INSERT INTO nodes VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            rusqlite::params![id, repo_id, file_path, lang, name, sym_type, raw],
+            "INSERT INTO nodes VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![id, repo_id, file_path, lang, name, sym_type, raw, 1i64],
         )
         .unwrap();
     }
