@@ -13,6 +13,10 @@ coverage/
 
 # Python virtual environments
 .venv/
+
+# cc_audit pricing cache (tools/cc_audit.py)
+tools/.cache/
+__pycache__/
 venv/
 env/
 .env
