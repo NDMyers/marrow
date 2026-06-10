@@ -179,6 +179,7 @@ Do not route every lookup through Marrow. Each MCP call adds an LLM turn and con
 pub enum Agent {
     ClaudeCode,
     Antigravity,
+    AntigravityCli,
     Cursor,
     GitHubCopilot,
     Cline,
@@ -210,6 +211,17 @@ impl Agent {
             }
             (Agent::Antigravity, Scope::Global) => {
                 home.join(".antigravity/skills/marrow-optimization.md")
+            }
+
+            // The Antigravity CLI (`agy`) reads workspace skills from the
+            // universal `.agents/skills/` directory and global skills from the
+            // shared `~/.gemini/skills/<name>/SKILL.md` package layout, which
+            // the Antigravity IDE also picks up.
+            (Agent::AntigravityCli, Scope::Project) => {
+                PathBuf::from(".agents/skills/marrow-optimization.md")
+            }
+            (Agent::AntigravityCli, Scope::Global) => {
+                home.join(".gemini/skills/marrow-optimization/SKILL.md")
             }
 
             (Agent::Cursor, Scope::Project) => {
@@ -348,6 +360,22 @@ fn marrow_copilot_instructions_md() -> String {
     rewrite_checksum_marker(&swapped, &checksum)
 }
 
+/// The Antigravity `SKILL.md` flavor of the core directive.
+///
+/// Antigravity (IDE and the `agy` CLI) discovers global skills as
+/// `~/.gemini/skills/<skill-name>/SKILL.md` packages whose frontmatter is keyed
+/// on `name` + `description`. The body is byte-identical to
+/// [`MARROW_CORE_SKILL_MD`]; only Cursor's `.mdc`-specific `alwaysApply` key is
+/// swapped for the `name` field the SKILL.md format expects. The generated
+/// checksum marker is recomputed so the file is still recognised as managed on
+/// refresh.
+fn marrow_antigravity_skill_md() -> String {
+    let swapped =
+        MARROW_CORE_SKILL_MD.replacen("alwaysApply: true", "name: marrow-optimization", 1);
+    let checksum = generated_checksum(&swapped);
+    rewrite_checksum_marker(&swapped, &checksum)
+}
+
 /// Classify an existing file's content against a specific managed template.
 /// `classify_existing_content` is the common case keyed on the core template.
 fn classify_against(content: &str, current_template: &str) -> ExistingContentStatus {
@@ -448,6 +476,14 @@ pub fn install_skill(
     // shared (Cursor-flavored) central source.
     if matches!(agent, Agent::GitHubCopilot) {
         return install_managed_file(&target, &marrow_copilot_instructions_md());
+    }
+
+    // The Antigravity CLI's global skill is a directory-based SKILL.md package
+    // with its own `name` frontmatter, so it is written standalone like the
+    // Copilot file. Its project target is the shared universal `.agents/skills`
+    // file and takes the normal central-source path below.
+    if matches!(agent, Agent::AntigravityCli) && matches!(scope, Scope::Global) {
+        return install_managed_file(&target, &marrow_antigravity_skill_md());
     }
 
     let central = install_source_path(method, home)
@@ -763,6 +799,54 @@ mod tests {
         assert_eq!(
             path,
             Path::new("/tmp/home/Library/Application Support/Code/User/prompts/marrow-optimization.instructions.md")
+        );
+    }
+
+    #[test]
+    fn antigravity_skill_md_shares_core_directive_body() {
+        // Body (everything after the frontmatter block) must be byte-identical to
+        // the core directive so guidance never drifts between agents.
+        let core_body = MARROW_CORE_SKILL_MD.splitn(3, "---\n").nth(2).unwrap();
+        let antigravity = super::marrow_antigravity_skill_md();
+        let antigravity_body = antigravity.splitn(3, "---\n").nth(2).unwrap();
+        assert_eq!(antigravity_body, core_body);
+        assert!(antigravity.contains("name: marrow-optimization"));
+        assert!(!antigravity.contains("alwaysApply"));
+        assert!(super::has_valid_generated_marker(&antigravity));
+    }
+
+    #[test]
+    fn install_skill_writes_global_antigravity_cli_skill_md_package() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        fs::create_dir_all(&home).unwrap();
+        let target = Agent::AntigravityCli.target_path(Scope::Global, &home);
+
+        let status =
+            super::install_skill(Agent::AntigravityCli, Scope::Global, Method::WriteFile, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::Written);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            super::marrow_antigravity_skill_md()
+        );
+    }
+
+    #[test]
+    fn antigravity_cli_project_skill_uses_universal_skills_dir() {
+        let path = Agent::AntigravityCli.target_path(Scope::Project, Path::new("/tmp/home"));
+
+        assert_eq!(path, Path::new(".agents/skills/marrow-optimization.md"));
+    }
+
+    #[test]
+    fn antigravity_cli_global_skill_uses_shared_gemini_skill_package() {
+        let path = Agent::AntigravityCli.target_path(Scope::Global, Path::new("/tmp/home"));
+
+        assert_eq!(
+            path,
+            Path::new("/tmp/home/.gemini/skills/marrow-optimization/SKILL.md")
         );
     }
 
