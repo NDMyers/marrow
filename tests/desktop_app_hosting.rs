@@ -509,22 +509,32 @@ fn interactive_menu_omits_watch_workspace_and_dispatch() {
     );
 
     assert!(
-        main_src.contains("\"3. Desktop App        (Open native dashboard window)\""),
-        "interactive menu must renumber Desktop App to slot 3"
+        main_src.contains("\"3. Context Packet     (Compile provider-neutral task context)\""),
+        "interactive menu must offer the packet-first Context Packet entry in slot 3"
     );
 
     assert!(
-        main_src.contains("\"4. Exit\"") && main_src.contains("\"3. Exit\""),
+        main_src.contains("2 => cmd_context_interactive()?"),
+        "interactive menu must dispatch the context packet flow from selection 2"
+    );
+
+    assert!(
+        main_src.contains("\"4. Desktop App        (Open native dashboard window)\""),
+        "interactive menu must place Desktop App in slot 4"
+    );
+
+    assert!(
+        main_src.contains("\"5. Exit\"") && main_src.contains("\"4. Exit\""),
         "interactive menu must renumber Exit consistently for desktop and non-desktop builds"
     );
 
     assert!(
-        main_src.contains("2 => cmd_desktop_submenu()?"),
-        "interactive menu must dispatch the desktop submenu from selection 2"
+        main_src.contains("3 => cmd_desktop_submenu()?"),
+        "interactive menu must dispatch the desktop submenu from selection 3"
     );
 
     assert!(
-        !main_src.contains("3 => cmd_desktop_submenu()?"),
+        !main_src.contains("2 => cmd_desktop_submenu()?"),
         "interactive menu must not retain the old desktop submenu selection"
     );
 }

@@ -9268,6 +9268,18 @@ fn cmd_context(program: &str, cli_args: &[String]) -> Result<()> {
     }
     let repo_id = repo_id.ok_or_else(|| anyhow::anyhow!("context: --repo is required"))?;
     let task = task_parts.join(" ");
+    run_context_packet(task, repo_id, budget_tokens, profile, format)
+}
+
+/// Shared compile → print → telemetry path for `marrow context` (flag-driven)
+/// and the interactive TUI entry.
+fn run_context_packet(
+    task: String,
+    repo_id: String,
+    budget_tokens: usize,
+    profile: context::ModelProfile,
+    format: context::ContextFormat,
+) -> Result<()> {
     let db_path =
         std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
     let conn = db::init_db_or_memory(&db_path)?;
@@ -9291,6 +9303,77 @@ fn cmd_context(program: &str, cli_args: &[String]) -> Result<()> {
     record_context_packet_telemetry(&conn, &packet, format);
 
     Ok(())
+}
+
+/// Interactive context-packet flow for the TUI main menu: pick an indexed
+/// repository (or type one on cold start), describe the task, choose a
+/// profile, then compile through the same path as `marrow context`.
+fn cmd_context_interactive() -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Input, Select};
+
+    let db_path =
+        std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
+    let repos: Vec<String> = {
+        let conn = db::init_db_or_memory(&db_path)?;
+        let mut stmt = conn.prepare("SELECT id FROM repositories ORDER BY id")?;
+        let repos = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        repos
+    };
+
+    let repo_id = match repos.as_slice() {
+        [] => {
+            // Cold start: resolve_context_repo_id will JIT auto-index when its
+            // guardrails allow, or compile a needs_index packet otherwise.
+            let default_repo = current_workspace_root()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unnamed")
+                .to_string();
+            Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Repository id (nothing indexed yet — cold-start packet)")
+                .default(default_repo)
+                .interact_text()?
+        }
+        [only] => only.clone(),
+        _ => {
+            let idx = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Repository")
+                .items(&repos)
+                .default(0)
+                .interact()?;
+            repos[idx].clone()
+        }
+    };
+
+    let task: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Task (what should the packet cover?)")
+        .interact_text()?;
+    if task.trim().is_empty() {
+        anyhow::bail!("context: task must not be empty");
+    }
+
+    const PROFILES: [context::ModelProfile; 3] = [
+        context::ModelProfile::Local8k,
+        context::ModelProfile::Local32k,
+        context::ModelProfile::CloudCostSensitive,
+    ];
+    let profile_labels: Vec<&str> = PROFILES.iter().map(|p| p.as_str()).collect();
+    let profile_idx = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Profile")
+        .items(&profile_labels)
+        .default(1)
+        .interact()?;
+
+    run_context_packet(
+        task,
+        repo_id,
+        12_000,
+        PROFILES[profile_idx],
+        context::ContextFormat::Markdown,
+    )
 }
 
 /// `marrow perf-harness` — MARROW-PERF-002: ingest via `run_ingestion`, then time capsule + impact.
@@ -9857,12 +9940,13 @@ fn cmd_interactive() -> Result<()> {
     let items = [
         "1. Integrate Agents   (Configure MCP + rules)",
         "2. Index Workspace    (Build the AST graph once)",
+        "3. Context Packet     (Compile provider-neutral task context)",
         #[cfg(feature = "desktop")]
-        "3. Desktop App        (Open native dashboard window)",
+        "4. Desktop App        (Open native dashboard window)",
         #[cfg(feature = "desktop")]
-        "4. Exit",
+        "5. Exit",
         #[cfg(not(feature = "desktop"))]
-        "3. Exit",
+        "4. Exit",
     ];
 
     let selection = Select::with_theme(&ColorfulTheme::default())
@@ -9876,8 +9960,9 @@ fn cmd_interactive() -> Result<()> {
     match selection {
         0 => cmd_integrate(&[])?,
         1 => run_index_command(&workspace_root)?,
+        2 => cmd_context_interactive()?,
         #[cfg(feature = "desktop")]
-        2 => cmd_desktop_submenu()?,
+        3 => cmd_desktop_submenu()?,
         _ => eprintln!("{}", style("Goodbye.").dim()),
     }
 
