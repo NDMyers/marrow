@@ -1510,6 +1510,19 @@ const INTEGRATION_TARGETS: &[IntegrationTarget] = &[
         writer: Some(integrate_antigravity),
     },
     IntegrationTarget {
+        name: "Antigravity CLI",
+        aliases: &["agy", "antigravity-cli", "agy-cli"],
+        support_tier: IntegrationSupportTier::FirstClass,
+        kind: IntegrationTargetKind::Agent,
+        setup_mode: IntegrationSetupMode::Automatic,
+        rule_support: RuleFileSupport::ProjectAndGlobal,
+        rule_agent: Some(skills::Agent::AntigravityCli),
+        workspace_rule_files: &[],
+        baseline_workspace_required: false,
+        allow_config_write: true,
+        writer: Some(integrate_antigravity_cli),
+    },
+    IntegrationTarget {
         name: "Cursor",
         aliases: &["cursor"],
         support_tier: IntegrationSupportTier::FirstClass,
@@ -1922,10 +1935,12 @@ fn interactive_skill_only_agent_target_indices() -> Vec<usize> {
 
 /// Agents that read skills from `.agents/skills/` and are always included in
 /// `marrow integrate`. These correspond to the visible (non-hidden) universal
-/// entries from the Skills CLI upstream registry.
+/// entries from the Skills CLI upstream registry, plus the Antigravity CLI
+/// (`agy`), which discovers workspace skills from the same directory.
 const UNIVERSAL_AGENTS: &[&str] = &[
     "Amp",
     "Antigravity",
+    "Antigravity CLI",
     "Cline",
     "Codex",
     "Cursor",
@@ -4870,6 +4885,7 @@ mod tests {
         for name in [
             "Claude Code",
             "Antigravity",
+            "Antigravity CLI",
             "Cursor",
             "GitHub Copilot",
             "Cline",
@@ -5614,13 +5630,14 @@ mod tests {
     fn universal_agents_contains_expected_visible_upstream_entries() {
         assert_eq!(
             UNIVERSAL_AGENTS.len(),
-            13,
-            "UNIVERSAL_AGENTS should have exactly 13 visible upstream universal agents"
+            14,
+            "UNIVERSAL_AGENTS should have the 13 visible upstream universal agents plus Antigravity CLI"
         );
 
         let expected = [
             "Amp",
             "Antigravity",
+            "Antigravity CLI",
             "Cline",
             "Codex",
             "Cursor",
@@ -7260,6 +7277,42 @@ mod tests {
     }
 
     #[test]
+    fn integrate_antigravity_cli_writes_command_marrow_with_env_path() {
+        let home = tempfile::tempdir().unwrap();
+        // The agy installer marks its presence with ~/.gemini/antigravity-cli/
+        // and pre-creates the shared config as a 0-byte file — reproduce both.
+        std::fs::create_dir_all(home.path().join(".gemini/antigravity-cli")).unwrap();
+        let cfg_path = home.path().join(".gemini/config/mcp_config.json");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(&cfg_path, "").unwrap();
+        let ctx = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+        };
+        integrate_antigravity_cli(&ctx).unwrap();
+        let raw = std::fs::read_to_string(&cfg_path).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cmd = cfg["mcpServers"]["marrow"]["command"].as_str().unwrap();
+        assert_eq!(cmd, "marrow");
+        assert!(cfg["mcpServers"]["marrow"]["env"]["PATH"].is_string());
+    }
+
+    #[test]
+    fn integrate_antigravity_cli_skips_when_cli_not_installed() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home.path().to_string_lossy().into_owned(),
+        };
+        let outcome = integrate_antigravity_cli(&ctx).unwrap();
+        assert_eq!(outcome, AgentOutcome::NotFound);
+        assert!(
+            !home.path().join(".gemini/config/mcp_config.json").exists(),
+            "must not create the shared config when agy is not installed"
+        );
+    }
+
+    #[test]
     fn integrate_cursor_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
@@ -7529,6 +7582,7 @@ mod tests {
         let ag = h.join(".gemini/antigravity/mcp_config.json");
         std::fs::create_dir_all(ag.parent().unwrap()).unwrap();
         std::fs::write(&ag, "{}").unwrap();
+        std::fs::create_dir_all(h.join(".gemini/antigravity-cli")).unwrap();
         let cline = h.join(
             "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings",
         );
@@ -7547,6 +7601,7 @@ mod tests {
 
         integrate_claude(&ctx).unwrap();
         integrate_antigravity(&ctx).unwrap();
+        integrate_antigravity_cli(&ctx).unwrap();
         integrate_cursor(&ctx).unwrap();
         integrate_copilot(&ctx).unwrap();
         integrate_cline(&ctx).unwrap();
@@ -7555,6 +7610,7 @@ mod tests {
         // Every written config file must not contain the sentinel binary path.
         let config_files = [
             ".claude.json",
+            ".gemini/config/mcp_config.json",
             ".cursor/mcp.json",
             ".copilot/mcp-config.json",
             vscode_rel,
@@ -8061,6 +8117,11 @@ enum AgentOutcome {
 fn load_json_or_empty(path: &Path) -> Result<serde_json::Value> {
     if path.exists() {
         let raw = fs::read_to_string(path)?;
+        // Some installers (e.g. agy) pre-create the config as a 0-byte file,
+        // which is not valid JSON — treat blank content as an empty object.
+        if raw.trim().is_empty() {
+            return Ok(serde_json::json!({}));
+        }
         Ok(serde_json::from_str(&raw)?)
     } else {
         Ok(serde_json::json!({}))
@@ -8301,6 +8362,26 @@ fn integrate_antigravity(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     if !path.exists() {
         return Ok(AgentOutcome::NotFound);
     }
+    let mut cfg = load_json_or_empty(&path)?;
+    let mut spec = mcp_launch_spec();
+    spec["env"] = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });
+    cfg["mcpServers"]["marrow"] = spec;
+    save_json(&path, &cfg)?;
+    Ok(AgentOutcome::Installed)
+}
+
+/// ~/.gemini/config/mcp_config.json — shared Antigravity config read by both the
+/// Antigravity CLI (`agy`) and the Antigravity IDE.
+///
+/// The agy installer creates `~/.gemini/antigravity-cli/`; its absence means the
+/// CLI is not installed. The shared config file itself is created as a 0-byte
+/// file by the installer, which `load_json_or_empty` treats as `{}`.
+fn integrate_antigravity_cli(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
+    let cli_dir = PathBuf::from(&ctx.home).join(".gemini/antigravity-cli");
+    if !cli_dir.exists() {
+        return Ok(AgentOutcome::NotFound);
+    }
+    let path = PathBuf::from(&ctx.home).join(".gemini/config/mcp_config.json");
     let mut cfg = load_json_or_empty(&path)?;
     let mut spec = mcp_launch_spec();
     spec["env"] = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });

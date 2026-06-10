@@ -93,7 +93,7 @@ cargo run -- test-capsules        # capsule validation
 
 ## Integration Targets
 
-`marrow integrate` uses an internal registry of setup-facing MCP targets. Verified automatic config writers are limited to Claude Code, Antigravity, Cursor, GitHub Copilot, Cline, and Zed. Those writers preserve the current supported JSON paths and merge formats.
+`marrow integrate` uses an internal registry of setup-facing MCP targets. Verified automatic config writers are limited to Claude Code, Antigravity, Antigravity CLI (`agy`), Cursor, GitHub Copilot, Cline, and Zed. Those writers preserve the current supported JSON paths and merge formats. The Antigravity CLI writer registers Marrow in the shared `~/.gemini/config/mcp_config.json`, which the Antigravity IDE also reads.
 
 First-class guided targets are listed by the installer but do not receive speculative config writes: Windsurf, Continue, Roo Code, Goose, OpenHands, OpenClaw, Codex CLI, Gemini CLI, JetBrains AI Assistant, JetBrains Junie, and LM Studio. OpenClaw is treated as a first-class self-hosted MCP host; until a stable config path and merge format are verified, Marrow prints setup guidance instead of creating hidden IDE or YAML/TOML files.
 
