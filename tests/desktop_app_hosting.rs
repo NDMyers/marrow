@@ -669,10 +669,18 @@ fn windows_webview2_check_path_exists() {
     )
     .expect("read src/ui_app.rs");
 
-    // Verify the Windows WebView2 detection code exists.
+    // Verify the Windows WebView2 detection code exists and uses the official
+    // loader API (GetAvailableCoreWebView2BrowserVersionString via wry).
     assert!(
-        ui_app_src.contains("WebView2"),
-        "ui_app.rs must check for WebView2 runtime on Windows"
+        ui_app_src.contains("wry::webview_version"),
+        "ui_app.rs must detect the WebView2 runtime via wry::webview_version()"
+    );
+
+    // Hand-rolled EdgeUpdate registry sniffing produced false negatives on
+    // 64-bit Windows (wrong GUID + wrong registry view) — it must not return.
+    assert!(
+        !ui_app_src.contains("EdgeUpdate"),
+        "ui_app.rs must not probe EdgeUpdate registry keys for WebView2 detection"
     );
 
     assert!(
