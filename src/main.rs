@@ -130,6 +130,32 @@ fn emit_dashboard_event(http_client: reqwest::Client, event: DashboardEvent) {
     });
 }
 
+/// Synchronous variant of [`emit_dashboard_event`] for CLI commands
+/// (e.g. `marrow context`). Failures are dropped silently: a stopped daemon
+/// is a normal state for CLI use, not an error.
+///
+/// Runs on a dedicated OS thread because CLI handlers are dispatched from
+/// inside the process Tokio runtime (`main` → `block_on(async_main)`), where
+/// a nested `block_on` on the same thread panics.
+fn emit_dashboard_event_blocking(event: DashboardEvent) {
+    let handle = std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let _ = rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_millis(300))
+                .timeout(std::time::Duration::from_secs(2))
+                .build()?;
+            client.post(DASHBOARD_EMIT_URL).json(&event).send().await
+        });
+    });
+    let _ = handle.join();
+}
+
 fn dashboard_events_from_batch_telemetry(
     telemetry: Vec<retrieval::BatchTelemetry>,
     client_name: &str,
@@ -6658,6 +6684,39 @@ mod tests {
     }
 
     #[test]
+    fn context_packet_stats_record_count_outcome_and_tokens() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let packet = context::compile_context_packet(
+            &conn,
+            context::ContextRequest {
+                task: "trace request flow".to_string(),
+                repo_id: "unindexed-repo".to_string(),
+                budget_tokens: 8_000,
+                profile: context::ModelProfile::Local8k,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            packet.routing.outcome,
+            context::RoutingOutcome::NeedsIndex,
+            "empty graph must produce a needs_index packet"
+        );
+
+        record_context_packet_stats(&conn, &packet);
+        record_context_packet_stats(&conn, &packet);
+
+        assert_eq!(crate::db::read_stat(&conn, "context_packets"), 2);
+        assert_eq!(
+            crate::db::read_stat(&conn, "context_packets_needs_index"),
+            2
+        );
+        assert_eq!(
+            crate::db::read_stat(&conn, "context_packet_tokens"),
+            2 * packet.token_accounting.estimated_packet_tokens as i64
+        );
+    }
+
+    #[test]
     fn legacy_strict_config_is_normalized_to_default() {
         let tmp = tempfile::tempdir().unwrap();
         // Acquire CWD_MUTEX before mutating process-global CWD to prevent races
@@ -7849,7 +7908,7 @@ fn write_workspace_rule_files(
                 modified.push(path.display().to_string());
             }
             WriteMode::Symlink => {
-                let central = central_rules_path.as_ref().expect("central path set above");
+                let _central = central_rules_path.as_ref().expect("central path set above");
                 if path.exists() || path.is_symlink() {
                     fs::remove_file(&path).ok();
                 }
@@ -9094,6 +9153,58 @@ fn resolve_context_repo_id(conn: &rusqlite::Connection, requested: &str) -> Resu
     Ok(requested.to_string())
 }
 
+/// Stat key for a packet's routing outcome. Persisted alongside the MCP
+/// counters in the workspace `stats` table so lifetime aggregation can report
+/// the packet-first routing split.
+fn context_packet_outcome_key(outcome: context::RoutingOutcome) -> &'static str {
+    match outcome {
+        context::RoutingOutcome::UseMarrow => "context_packets_use_marrow",
+        context::RoutingOutcome::UseNative => "context_packets_use_native",
+        context::RoutingOutcome::Hybrid => "context_packets_hybrid",
+        context::RoutingOutcome::NeedsIndex => "context_packets_needs_index",
+    }
+}
+
+/// Persist packet counters to the workspace graph DB so the dashboard's
+/// lifetime aggregation can see the packet-first flow.
+fn record_context_packet_stats(conn: &rusqlite::Connection, packet: &context::ContextPacket) {
+    let _ = db::increment_stat(conn, "context_packets", 1);
+    let _ = db::increment_stat(
+        conn,
+        "context_packet_tokens",
+        packet.token_accounting.estimated_packet_tokens as i64,
+    );
+    let _ = db::increment_stat(conn, context_packet_outcome_key(packet.routing.outcome), 1);
+}
+
+/// Persist packet counters and best-effort notify the dashboard Hub.
+/// `marrow context` is the directive default first move, so without this the
+/// dashboard only ever sees the MCP follow-up loop.
+fn record_context_packet_telemetry(
+    conn: &rusqlite::Connection,
+    packet: &context::ContextPacket,
+    format: context::ContextFormat,
+) {
+    record_context_packet_stats(conn, packet);
+
+    let mut task: String = packet.task.chars().take(120).collect();
+    if task.len() < packet.task.len() {
+        task.push('…');
+    }
+    emit_dashboard_event_blocking(DashboardEvent::ContextPacketCompiled {
+        task,
+        repo: packet.repo_id.clone(),
+        outcome: packet.routing.outcome.as_str().to_string(),
+        profile: packet.profile.name.clone(),
+        format: format.as_str().to_string(),
+        budget_tokens: packet.budget.effective_tokens,
+        packet_tokens: packet.token_accounting.estimated_packet_tokens,
+        entry_count: packet.ranked_entries.len(),
+        origin: "cli".to_string(),
+        ts: dashboard::now_ts(),
+    });
+}
+
 fn cmd_context(program: &str, cli_args: &[String]) -> Result<()> {
     let mut task_parts = Vec::new();
     let mut repo_id: Option<String> = None;
@@ -9157,6 +9268,18 @@ fn cmd_context(program: &str, cli_args: &[String]) -> Result<()> {
     }
     let repo_id = repo_id.ok_or_else(|| anyhow::anyhow!("context: --repo is required"))?;
     let task = task_parts.join(" ");
+    run_context_packet(task, repo_id, budget_tokens, profile, format)
+}
+
+/// Shared compile → print → telemetry path for `marrow context` (flag-driven)
+/// and the interactive TUI entry.
+fn run_context_packet(
+    task: String,
+    repo_id: String,
+    budget_tokens: usize,
+    profile: context::ModelProfile,
+    format: context::ContextFormat,
+) -> Result<()> {
     let db_path =
         std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
     let conn = db::init_db_or_memory(&db_path)?;
@@ -9177,7 +9300,80 @@ fn cmd_context(program: &str, cli_args: &[String]) -> Result<()> {
         context::ContextFormat::Json => println!("{}", packet.to_json()?),
     }
 
+    record_context_packet_telemetry(&conn, &packet, format);
+
     Ok(())
+}
+
+/// Interactive context-packet flow for the TUI main menu: pick an indexed
+/// repository (or type one on cold start), describe the task, choose a
+/// profile, then compile through the same path as `marrow context`.
+fn cmd_context_interactive() -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Input, Select};
+
+    let db_path =
+        std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
+    let repos: Vec<String> = {
+        let conn = db::init_db_or_memory(&db_path)?;
+        let mut stmt = conn.prepare("SELECT id FROM repositories ORDER BY id")?;
+        let repos = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        repos
+    };
+
+    let repo_id = match repos.as_slice() {
+        [] => {
+            // Cold start: resolve_context_repo_id will JIT auto-index when its
+            // guardrails allow, or compile a needs_index packet otherwise.
+            let default_repo = current_workspace_root()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unnamed")
+                .to_string();
+            Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Repository id (nothing indexed yet — cold-start packet)")
+                .default(default_repo)
+                .interact_text()?
+        }
+        [only] => only.clone(),
+        _ => {
+            let idx = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Repository")
+                .items(&repos)
+                .default(0)
+                .interact()?;
+            repos[idx].clone()
+        }
+    };
+
+    let task: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Task (what should the packet cover?)")
+        .interact_text()?;
+    if task.trim().is_empty() {
+        anyhow::bail!("context: task must not be empty");
+    }
+
+    const PROFILES: [context::ModelProfile; 3] = [
+        context::ModelProfile::Local8k,
+        context::ModelProfile::Local32k,
+        context::ModelProfile::CloudCostSensitive,
+    ];
+    let profile_labels: Vec<&str> = PROFILES.iter().map(|p| p.as_str()).collect();
+    let profile_idx = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Profile")
+        .items(&profile_labels)
+        .default(1)
+        .interact()?;
+
+    run_context_packet(
+        task,
+        repo_id,
+        12_000,
+        PROFILES[profile_idx],
+        context::ContextFormat::Markdown,
+    )
 }
 
 /// `marrow perf-harness` — MARROW-PERF-002: ingest via `run_ingestion`, then time capsule + impact.
@@ -9744,12 +9940,13 @@ fn cmd_interactive() -> Result<()> {
     let items = [
         "1. Integrate Agents   (Configure MCP + rules)",
         "2. Index Workspace    (Build the AST graph once)",
+        "3. Context Packet     (Compile provider-neutral task context)",
         #[cfg(feature = "desktop")]
-        "3. Desktop App        (Open native dashboard window)",
+        "4. Desktop App        (Open native dashboard window)",
         #[cfg(feature = "desktop")]
-        "4. Exit",
+        "5. Exit",
         #[cfg(not(feature = "desktop"))]
-        "3. Exit",
+        "4. Exit",
     ];
 
     let selection = Select::with_theme(&ColorfulTheme::default())
@@ -9763,8 +9960,9 @@ fn cmd_interactive() -> Result<()> {
     match selection {
         0 => cmd_integrate(&[])?,
         1 => run_index_command(&workspace_root)?,
+        2 => cmd_context_interactive()?,
         #[cfg(feature = "desktop")]
-        2 => cmd_desktop_submenu()?,
+        3 => cmd_desktop_submenu()?,
         _ => eprintln!("{}", style("Goodbye.").dim()),
     }
 

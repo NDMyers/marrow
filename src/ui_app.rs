@@ -141,18 +141,15 @@ fn run_webview() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        // Check for WebView2 runtime on Windows.
-        let webview2_key =
-            "SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BEF-AE91B6C6C5CF}";
-        if winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
-            .open_subkey(webview2_key)
-            .is_err()
-            && winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
-                .open_subkey(webview2_key)
-                .is_err()
-        {
+        // Detect the WebView2 runtime via the official loader API
+        // (GetAvailableCoreWebView2BrowserVersionString), which covers
+        // Evergreen per-machine, per-user, and fixed-version installs.
+        // Do not probe the registry instead: the runtime's keys sit in the
+        // 32-bit (WOW6432Node) view on 64-bit Windows and their layout is
+        // undocumented, which previously caused false negatives here.
+        if let Err(e) = wry::webview_version() {
             eprintln!(
-                "[marrow] Error: Microsoft WebView2 Runtime not found.\n\
+                "[marrow] Error: Microsoft WebView2 Runtime not found ({e}).\n\
                  Please install it from:\n\
                  https://developer.microsoft.com/en-us/microsoft-edge/webview2/\n\
                  \n\

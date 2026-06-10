@@ -154,12 +154,20 @@ impl IpcClient {
 
 fn is_connection_refused(e: &reqwest::Error) -> bool {
     use std::error::Error as StdError;
-    if let Some(src) = e.source() {
-        let msg = src.to_string();
-        msg.contains("connection refused") || msg.contains("No such file")
-    } else {
-        false
+    let mut source: Option<&(dyn StdError + 'static)> = Some(e);
+    while let Some(err) = source {
+        let msg = err.to_string().to_lowercase();
+        if msg.contains("connection refused")
+            || msg.contains("actively refused")
+            || msg.contains("10061")
+            || msg.contains("no such file")
+            || msg.contains("not found")
+        {
+            return true;
+        }
+        source = err.source();
     }
+    false
 }
 
 /// Build the platform-appropriate `IpcClient` pointing at the default socket/port.

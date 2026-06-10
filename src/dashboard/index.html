@@ -347,6 +347,12 @@
       border: 1px solid rgba(112, 99, 189, 0.34);
     }
 
+    .badge-packet {
+      background: var(--specimen-mint-soft);
+      color: var(--specimen-violet);
+      border: 1px solid rgba(112, 99, 189, 0.34);
+    }
+
     /* ── Tool label cell ────────────────────────────────────────────────────── */
     .tool-label {
       font-size: 12px;
@@ -444,7 +450,8 @@
     }
 
     /* ── Lifetime panel ─────────────────────────────────────────────────────── */
-    #lifetime-sub {
+    #lifetime-sub,
+    #lifetime-sub-core {
       font-size: 11px;
       color: var(--dim);
       margin-bottom: 14px;
@@ -1430,6 +1437,7 @@
 
     .card-sub,
     #lifetime-sub,
+    #lifetime-sub-core,
     #scope-path,
     .origin-cell,
     .ts-cell,
@@ -1501,6 +1509,7 @@
     .badge-impact { color: #8a672f; }
     .badge-server { color: var(--specimen-steel); }
     .badge-skeleton { color: #5e7299; }
+    .badge-packet { color: #6450a8; }
 
     .tool-label {
       color: var(--specimen-ink-soft);
@@ -1881,6 +1890,11 @@
           <div class="card-value" id="s-requests">0</div>
         </div>
         <div class="card">
+          <div class="card-label">Context Packets</div>
+          <div class="card-value cyan" id="s-packets">0</div>
+          <div class="card-sub">marrow context compiles</div>
+        </div>
+        <div class="card">
           <div class="card-label">Baseline Tokens</div>
           <div class="card-value cyan" id="s-file-tokens">0</div>
           <div class="card-sub" id="s-file-tokens-sub">estimated unless exact benchmark</div>
@@ -1945,7 +1959,35 @@
         </div>
       </div>
 
-      <p id="lifetime-sub">Persisted summary of core usage impact and the attached database footprint.</p>
+      <p id="lifetime-sub-core">Persisted summary of core usage impact and the attached database footprint.</p>
+
+      <div class="cards-row">
+        <div class="card">
+          <div class="card-label">Context Packets</div>
+          <div class="card-value cyan" id="l-packets">—</div>
+          <div class="card-sub" id="l-packet-tokens">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Routed to Marrow</div>
+          <div class="card-value" id="l-packets-marrow">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Hybrid Routing</div>
+          <div class="card-value" id="l-packets-hybrid">—</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Routed to Native</div>
+          <div class="card-value" id="l-packets-native">—</div>
+          <div class="card-sub">tasks better served by native tools</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Needs Index</div>
+          <div class="card-value amber" id="l-packets-needsindex">—</div>
+          <div class="card-sub">cold-start packets</div>
+        </div>
+      </div>
+
+      <p id="lifetime-sub">Packet-first flow: provider-neutral <code>marrow context</code> packets compiled before any agent loop, split by routing outcome.</p>
       <p id="scope-path">Attached database: <span id="scope-db-path">—</span></p>
 
       <div id="lifetime-advanced-controls">
@@ -2215,6 +2257,7 @@
     fileTokens:   0,
     capsuleTokens: 0,
     tokensSaved:  0,
+    contextPackets: 0,
     reductionPct: 0,
   };
 
@@ -2300,6 +2343,7 @@
       impact:   ['badge-impact',   'impact'],
       server:   ['badge-server',   'server'],
       skeleton: ['badge-skeleton', 'skeleton'],
+      packet:   ['badge-packet',   'packet'],
     };
     const [cls, label] = map[type] || ['badge-server', type];
     return `<span class="badge ${cls}">${escHtml(label)}</span>`;
@@ -2336,6 +2380,7 @@
 
   function updateSessionCards() {
     document.getElementById('s-requests').textContent     = fmtNum(session.requests);
+    document.getElementById('s-packets').textContent      = fmtNum(session.contextPackets);
     document.getElementById('s-file-tokens').textContent  = fmtNum(session.fileTokens);
     document.getElementById('s-tokens-saved').textContent = fmtNum(session.tokensSaved);
     document.getElementById('s-reduction').textContent    = fmtPct(session.reductionPct);
@@ -2350,6 +2395,13 @@
     document.getElementById('l-rejected').textContent = fmtNum(lt.direct_low_level_rejected || 0);
     document.getElementById('l-ambiguous').textContent = fmtNum(lt.ambiguous_symbol_requests || 0);
     document.getElementById('l-stale').textContent = fmtNum(lt.stale_capsule_prevented || 0);
+    document.getElementById('l-packets').textContent = fmtNum(lt.context_packets || 0);
+    document.getElementById('l-packet-tokens').textContent =
+      fmtNum(lt.context_packet_tokens || 0) + ' est. packet tokens';
+    document.getElementById('l-packets-marrow').textContent = fmtNum(lt.context_packets_use_marrow || 0);
+    document.getElementById('l-packets-hybrid').textContent = fmtNum(lt.context_packets_hybrid || 0);
+    document.getElementById('l-packets-native').textContent = fmtNum(lt.context_packets_use_native || 0);
+    document.getElementById('l-packets-needsindex').textContent = fmtNum(lt.context_packets_needs_index || 0);
   }
 
   function updateDatabaseScope(database) {
@@ -2575,9 +2627,25 @@
         break;
       }
 
+      case 'context_packet_compiled': {
+        session.contextPackets++;
+        updateSessionCards();
+        addTableRow(data.origin || 'cli', 'packet', packetToolHtml(data), null, data.ts);
+        break;
+      }
+
       default:
         break;
     }
+  }
+
+  function packetToolHtml(data) {
+    const repo    = escHtml(data.repo || '');
+    const outcome = escHtml(String(data.outcome || '').replace(/_/g, ' '));
+    const entries = fmtNum(data.entry_count || 0);
+    const tokens  = fmtNum(data.packet_tokens || 0);
+    const budget  = fmtNum(data.budget_tokens || 0);
+    return `<span class="sym" title="${escHtml(data.task || '')}">marrow context</span><span class="sep"> · </span><span class="repo">${repo} — ${outcome} · ${entries} entries · ${tokens}/${budget} tok</span>`;
   }
 
   // ── Replay recent_events from /stats ──────────────────────────────────────
@@ -2681,6 +2749,22 @@
         break;
       }
 
+      case 'context_packet_compiled': {
+        removeEmptyRow();
+        const tbody = document.getElementById('event-tbody');
+        while (tbody.rows.length >= MAX_ROWS) tbody.deleteRow(tbody.rows.length - 1);
+        const tsStr = data.ts ? fmtTs(data.ts) : '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td class="origin-cell">${escHtml(data.origin || 'cli')}</td>
+          <td class="tool-label">${badgeHtml('packet')}${packetToolHtml(data)}</td>
+          <td class="pct-cell"><span class="pct-dash">—</span></td>
+          <td class="ts-cell">${escHtml(tsStr)}</td>
+        `;
+        tbody.insertBefore(tr, tbody.firstChild);
+        break;
+      }
+
       default:
         break;
     }
@@ -2693,6 +2777,7 @@
   const _LIFETIME_CARD_IDS = [
     'l-requests', 'l-tokens-saved', 'l-reduction',
     'l-pipeline-compliance', 'l-autorouted', 'l-rejected', 'l-ambiguous', 'l-stale',
+    'l-packets', 'l-packets-marrow', 'l-packets-hybrid', 'l-packets-native', 'l-packets-needsindex',
   ];
 
   function _setLifetimeCardsText(text) {
@@ -2715,10 +2800,11 @@
           const s = body.session;
           // Load authoritative totals from server snapshot.
           // replayEvents() below only populates table rows — it must NOT re-add to these counters.
-          session.requests      = s.total_requests       || 0;
-          session.fileTokens    = s.total_file_tokens    || 0;
-          session.capsuleTokens = s.total_capsule_tokens || 0;
-          session.tokensSaved   = s.total_tokens_saved   || 0;
+          session.requests       = s.total_requests       || 0;
+          session.fileTokens     = s.total_file_tokens    || 0;
+          session.capsuleTokens  = s.total_capsule_tokens || 0;
+          session.tokensSaved    = s.total_tokens_saved   || 0;
+          session.contextPackets = s.context_packets      || 0;
           session.reductionPct  = session.fileTokens > 0
             ? (session.tokensSaved / session.fileTokens) * 100
             : 0;
