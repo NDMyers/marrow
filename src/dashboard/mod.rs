@@ -109,6 +109,21 @@ pub enum DashboardEvent {
         symbols: usize,
         ts: u64,
     },
+    /// A provider-neutral `marrow context` packet was compiled (CLI path).
+    /// This is the packet-first flow's primary event; it carries routing
+    /// outcome and token accounting but no source text.
+    ContextPacketCompiled {
+        task: String,
+        repo: String,
+        outcome: String,
+        profile: String,
+        format: String,
+        budget_tokens: usize,
+        packet_tokens: usize,
+        entry_count: usize,
+        origin: String,
+        ts: u64,
+    },
 }
 
 /// Result of the Hub election attempt.
@@ -136,6 +151,7 @@ pub struct SessionStats {
     pub total_capsule_tokens: usize,
     pub total_file_tokens: usize,
     pub total_tokens_saved: usize,
+    pub context_packets: usize,
     pub recent_events: VecDeque<DashboardEvent>,
     /// Token delta text cache keyed by `"symbol@repo@ts"`.
     /// Populated from the telemetry POST body so the compare endpoint works
@@ -259,6 +275,14 @@ impl SessionStats {
             self.recent_events.pop_back();
         }
     }
+
+    pub fn record_packet(&mut self, event: DashboardEvent) {
+        self.context_packets += 1;
+        self.recent_events.push_front(event);
+        if self.recent_events.len() > 50 {
+            self.recent_events.pop_back();
+        }
+    }
 }
 
 // ── Stats cache ───────────────────────────────────────────────────────────────
@@ -371,6 +395,7 @@ struct SessionSnapshot {
     total_capsule_tokens: usize,
     total_file_tokens: usize,
     total_tokens_saved: usize,
+    context_packets: usize,
     reduction_pct: f64,
     recent_events: Vec<DashboardEvent>,
 }
@@ -387,6 +412,12 @@ struct LifetimeSnapshot {
     ambiguous_symbol_requests: i64,
     stale_capsule_prevented: i64,
     pipeline_compliance_pct: f64,
+    context_packets: i64,
+    context_packet_tokens: i64,
+    context_packets_use_marrow: i64,
+    context_packets_use_native: i64,
+    context_packets_hybrid: i64,
+    context_packets_needs_index: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -426,6 +457,7 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
             total_capsule_tokens: sess.total_capsule_tokens,
             total_file_tokens: sess.total_file_tokens,
             total_tokens_saved: sess.total_tokens_saved,
+            context_packets: sess.context_packets,
             reduction_pct,
             recent_events: sess.recent_events.iter().cloned().collect(),
         }
@@ -476,6 +508,12 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
                 ambiguous_symbol_requests: lifetime_stats.ambiguous_symbol_requests,
                 stale_capsule_prevented: lifetime_stats.stale_capsule_prevented,
                 pipeline_compliance_pct: lifetime_stats.pipeline_compliance_pct,
+                context_packets: lifetime_stats.context_packets,
+                context_packet_tokens: lifetime_stats.context_packet_tokens,
+                context_packets_use_marrow: lifetime_stats.context_packets_use_marrow,
+                context_packets_use_native: lifetime_stats.context_packets_use_native,
+                context_packets_hybrid: lifetime_stats.context_packets_hybrid,
+                context_packets_needs_index: lifetime_stats.context_packets_needs_index,
             };
             let size_mb: f64 = dbs.iter().map(|row| row.size_mb).sum();
             let repo_count: i64 = dbs.iter().map(|row| row.repo_count).sum();
@@ -557,6 +595,12 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
             ambiguous_symbol_requests: lifetime_stats.ambiguous_symbol_requests,
             stale_capsule_prevented: lifetime_stats.stale_capsule_prevented,
             pipeline_compliance_pct: lifetime_stats.pipeline_compliance_pct,
+            context_packets: lifetime_stats.context_packets,
+            context_packet_tokens: lifetime_stats.context_packet_tokens,
+            context_packets_use_marrow: lifetime_stats.context_packets_use_marrow,
+            context_packets_use_native: lifetime_stats.context_packets_use_native,
+            context_packets_hybrid: lifetime_stats.context_packets_hybrid,
+            context_packets_needs_index: lifetime_stats.context_packets_needs_index,
         };
         let size_mb: f64 = dbs.iter().map(|row| row.size_mb).sum();
         let repo_count: i64 = dbs.iter().map(|row| row.repo_count).sum();
@@ -637,6 +681,15 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
             ambiguous_symbol_requests: ambiguous,
             stale_capsule_prevented: stale,
             pipeline_compliance_pct: compliance_pct,
+            context_packets: crate::db::read_stat(&conn, "context_packets"),
+            context_packet_tokens: crate::db::read_stat(&conn, "context_packet_tokens"),
+            context_packets_use_marrow: crate::db::read_stat(&conn, "context_packets_use_marrow"),
+            context_packets_use_native: crate::db::read_stat(&conn, "context_packets_use_native"),
+            context_packets_hybrid: crate::db::read_stat(&conn, "context_packets_hybrid"),
+            context_packets_needs_index: crate::db::read_stat(
+                &conn,
+                "context_packets_needs_index",
+            ),
         }
     };
 
@@ -880,6 +933,9 @@ async fn emit_handler(
                 ..
             } => {
                 sess.record_capsule(*capsule_tokens, *file_tokens, event.clone());
+            }
+            DashboardEvent::ContextPacketCompiled { .. } => {
+                sess.record_packet(event.clone());
             }
             other => {
                 sess.recent_events.push_front(other.clone());
@@ -1364,6 +1420,57 @@ mod tests {
             axum::http::StatusCode::OK,
             "emit must accept valid payloads under 1 MiB"
         );
+    }
+
+    /// ContextPacketCompiled events must increment the session packet counter
+    /// and land in recent_events, and the serde tag must stay in sync with the
+    /// `context_packet_compiled` case in index.html.
+    #[tokio::test]
+    async fn emit_records_context_packet_event_in_session() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+
+        let (tx, _rx) = broadcast::channel(4);
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let session = Arc::new(Mutex::new(SessionStats::default()));
+        let state = AppState {
+            tx,
+            session: session.clone(),
+            db: Arc::new(Mutex::new(conn)),
+            registry: None,
+            activity: None,
+            stats_cache: Arc::new(Mutex::new(None)),
+        };
+
+        let event = DashboardEvent::ContextPacketCompiled {
+            task: "trace request flow".to_string(),
+            repo: "test".to_string(),
+            outcome: "use_marrow".to_string(),
+            profile: "local-32k".to_string(),
+            format: "markdown".to_string(),
+            budget_tokens: 12_000,
+            packet_tokens: 4_321,
+            entry_count: 7,
+            origin: "cli".to_string(),
+            ts: 12345,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"type\":\"context_packet_compiled\""),
+            "serde tag drifted from the dashboard JS handler: {json}"
+        );
+
+        let body = Bytes::from(json.into_bytes());
+        let response = emit_handler(axum::http::HeaderMap::new(), State(state), body).await;
+        let response = axum::response::IntoResponse::into_response(response);
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let sess = session.lock().unwrap();
+        assert_eq!(sess.context_packets, 1);
+        assert!(matches!(
+            sess.recent_events.front(),
+            Some(DashboardEvent::ContextPacketCompiled { .. })
+        ));
     }
 
     #[test]

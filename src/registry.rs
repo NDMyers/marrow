@@ -92,6 +92,12 @@ pub struct GlobalLifetimeStats {
     pub direct_low_level_rejected: i64,
     pub ambiguous_symbol_requests: i64,
     pub stale_capsule_prevented: i64,
+    pub context_packets: i64,
+    pub context_packet_tokens: i64,
+    pub context_packets_use_marrow: i64,
+    pub context_packets_use_native: i64,
+    pub context_packets_hybrid: i64,
+    pub context_packets_needs_index: i64,
     pub reduction_pct: f64,
     pub pipeline_compliance_pct: f64,
     pub workspace_statuses: Vec<DbInventoryRow>,
@@ -326,6 +332,12 @@ impl Registry {
             "direct_low_level_rejected",
             "ambiguous_symbol_requests",
             "stale_capsule_prevented",
+            "context_packets",
+            "context_packet_tokens",
+            "context_packets_use_marrow",
+            "context_packets_use_native",
+            "context_packets_hybrid",
+            "context_packets_needs_index",
         ];
 
         let mut total_requests = 0i64;
@@ -336,6 +348,12 @@ impl Registry {
         let mut direct_low_level_rejected = 0i64;
         let mut ambiguous_symbol_requests = 0i64;
         let mut stale_capsule_prevented = 0i64;
+        let mut context_packets = 0i64;
+        let mut context_packet_tokens = 0i64;
+        let mut context_packets_use_marrow = 0i64;
+        let mut context_packets_use_native = 0i64;
+        let mut context_packets_hybrid = 0i64;
+        let mut context_packets_needs_index = 0i64;
 
         for row in inventory {
             if !matches!(
@@ -361,6 +379,21 @@ impl Registry {
             ambiguous_symbol_requests +=
                 batch.get("ambiguous_symbol_requests").copied().unwrap_or(0);
             stale_capsule_prevented += batch.get("stale_capsule_prevented").copied().unwrap_or(0);
+            context_packets += batch.get("context_packets").copied().unwrap_or(0);
+            context_packet_tokens += batch.get("context_packet_tokens").copied().unwrap_or(0);
+            context_packets_use_marrow += batch
+                .get("context_packets_use_marrow")
+                .copied()
+                .unwrap_or(0);
+            context_packets_use_native += batch
+                .get("context_packets_use_native")
+                .copied()
+                .unwrap_or(0);
+            context_packets_hybrid += batch.get("context_packets_hybrid").copied().unwrap_or(0);
+            context_packets_needs_index += batch
+                .get("context_packets_needs_index")
+                .copied()
+                .unwrap_or(0);
         }
 
         let reduction_pct = if total_file_tokens == 0 {
@@ -385,6 +418,12 @@ impl Registry {
             direct_low_level_rejected,
             ambiguous_symbol_requests,
             stale_capsule_prevented,
+            context_packets,
+            context_packet_tokens,
+            context_packets_use_marrow,
+            context_packets_use_native,
+            context_packets_hybrid,
+            context_packets_needs_index,
             reduction_pct,
             pipeline_compliance_pct,
             workspace_statuses: Vec::new(),
@@ -409,6 +448,12 @@ impl Registry {
             "direct_low_level_rejected",
             "ambiguous_symbol_requests",
             "stale_capsule_prevented",
+            "context_packets",
+            "context_packet_tokens",
+            "context_packets_use_marrow",
+            "context_packets_use_native",
+            "context_packets_hybrid",
+            "context_packets_needs_index",
         ];
 
         let workspaces = self.list_workspaces()?;
@@ -421,6 +466,12 @@ impl Registry {
         let mut direct_low_level_rejected = 0i64;
         let mut ambiguous_symbol_requests = 0i64;
         let mut stale_capsule_prevented = 0i64;
+        let mut context_packets = 0i64;
+        let mut context_packet_tokens = 0i64;
+        let mut context_packets_use_marrow = 0i64;
+        let mut context_packets_use_native = 0i64;
+        let mut context_packets_hybrid = 0i64;
+        let mut context_packets_needs_index = 0i64;
 
         let mut inventory = Vec::with_capacity(workspaces.len());
 
@@ -491,6 +542,23 @@ impl Registry {
                                 batch.get("ambiguous_symbol_requests").copied().unwrap_or(0);
                             stale_capsule_prevented +=
                                 batch.get("stale_capsule_prevented").copied().unwrap_or(0);
+                            context_packets += batch.get("context_packets").copied().unwrap_or(0);
+                            context_packet_tokens +=
+                                batch.get("context_packet_tokens").copied().unwrap_or(0);
+                            context_packets_use_marrow += batch
+                                .get("context_packets_use_marrow")
+                                .copied()
+                                .unwrap_or(0);
+                            context_packets_use_native += batch
+                                .get("context_packets_use_native")
+                                .copied()
+                                .unwrap_or(0);
+                            context_packets_hybrid +=
+                                batch.get("context_packets_hybrid").copied().unwrap_or(0);
+                            context_packets_needs_index += batch
+                                .get("context_packets_needs_index")
+                                .copied()
+                                .unwrap_or(0);
                         }
                     }
                     Err(e) => {
@@ -535,6 +603,12 @@ impl Registry {
             direct_low_level_rejected,
             ambiguous_symbol_requests,
             stale_capsule_prevented,
+            context_packets,
+            context_packet_tokens,
+            context_packets_use_marrow,
+            context_packets_use_native,
+            context_packets_hybrid,
+            context_packets_needs_index,
             reduction_pct,
             pipeline_compliance_pct,
             workspace_statuses: inventory,

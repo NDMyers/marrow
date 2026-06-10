@@ -130,6 +130,32 @@ fn emit_dashboard_event(http_client: reqwest::Client, event: DashboardEvent) {
     });
 }
 
+/// Synchronous variant of [`emit_dashboard_event`] for CLI commands
+/// (e.g. `marrow context`). Failures are dropped silently: a stopped daemon
+/// is a normal state for CLI use, not an error.
+///
+/// Runs on a dedicated OS thread because CLI handlers are dispatched from
+/// inside the process Tokio runtime (`main` → `block_on(async_main)`), where
+/// a nested `block_on` on the same thread panics.
+fn emit_dashboard_event_blocking(event: DashboardEvent) {
+    let handle = std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        let _ = rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_millis(300))
+                .timeout(std::time::Duration::from_secs(2))
+                .build()?;
+            client.post(DASHBOARD_EMIT_URL).json(&event).send().await
+        });
+    });
+    let _ = handle.join();
+}
+
 fn dashboard_events_from_batch_telemetry(
     telemetry: Vec<retrieval::BatchTelemetry>,
     client_name: &str,
@@ -6658,6 +6684,39 @@ mod tests {
     }
 
     #[test]
+    fn context_packet_stats_record_count_outcome_and_tokens() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let packet = context::compile_context_packet(
+            &conn,
+            context::ContextRequest {
+                task: "trace request flow".to_string(),
+                repo_id: "unindexed-repo".to_string(),
+                budget_tokens: 8_000,
+                profile: context::ModelProfile::Local8k,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            packet.routing.outcome,
+            context::RoutingOutcome::NeedsIndex,
+            "empty graph must produce a needs_index packet"
+        );
+
+        record_context_packet_stats(&conn, &packet);
+        record_context_packet_stats(&conn, &packet);
+
+        assert_eq!(crate::db::read_stat(&conn, "context_packets"), 2);
+        assert_eq!(
+            crate::db::read_stat(&conn, "context_packets_needs_index"),
+            2
+        );
+        assert_eq!(
+            crate::db::read_stat(&conn, "context_packet_tokens"),
+            2 * packet.token_accounting.estimated_packet_tokens as i64
+        );
+    }
+
+    #[test]
     fn legacy_strict_config_is_normalized_to_default() {
         let tmp = tempfile::tempdir().unwrap();
         // Acquire CWD_MUTEX before mutating process-global CWD to prevent races
@@ -9094,6 +9153,58 @@ fn resolve_context_repo_id(conn: &rusqlite::Connection, requested: &str) -> Resu
     Ok(requested.to_string())
 }
 
+/// Stat key for a packet's routing outcome. Persisted alongside the MCP
+/// counters in the workspace `stats` table so lifetime aggregation can report
+/// the packet-first routing split.
+fn context_packet_outcome_key(outcome: context::RoutingOutcome) -> &'static str {
+    match outcome {
+        context::RoutingOutcome::UseMarrow => "context_packets_use_marrow",
+        context::RoutingOutcome::UseNative => "context_packets_use_native",
+        context::RoutingOutcome::Hybrid => "context_packets_hybrid",
+        context::RoutingOutcome::NeedsIndex => "context_packets_needs_index",
+    }
+}
+
+/// Persist packet counters to the workspace graph DB so the dashboard's
+/// lifetime aggregation can see the packet-first flow.
+fn record_context_packet_stats(conn: &rusqlite::Connection, packet: &context::ContextPacket) {
+    let _ = db::increment_stat(conn, "context_packets", 1);
+    let _ = db::increment_stat(
+        conn,
+        "context_packet_tokens",
+        packet.token_accounting.estimated_packet_tokens as i64,
+    );
+    let _ = db::increment_stat(conn, context_packet_outcome_key(packet.routing.outcome), 1);
+}
+
+/// Persist packet counters and best-effort notify the dashboard Hub.
+/// `marrow context` is the directive default first move, so without this the
+/// dashboard only ever sees the MCP follow-up loop.
+fn record_context_packet_telemetry(
+    conn: &rusqlite::Connection,
+    packet: &context::ContextPacket,
+    format: context::ContextFormat,
+) {
+    record_context_packet_stats(conn, packet);
+
+    let mut task: String = packet.task.chars().take(120).collect();
+    if task.len() < packet.task.len() {
+        task.push('…');
+    }
+    emit_dashboard_event_blocking(DashboardEvent::ContextPacketCompiled {
+        task,
+        repo: packet.repo_id.clone(),
+        outcome: packet.routing.outcome.as_str().to_string(),
+        profile: packet.profile.name.clone(),
+        format: format.as_str().to_string(),
+        budget_tokens: packet.budget.effective_tokens,
+        packet_tokens: packet.token_accounting.estimated_packet_tokens,
+        entry_count: packet.ranked_entries.len(),
+        origin: "cli".to_string(),
+        ts: dashboard::now_ts(),
+    });
+}
+
 fn cmd_context(program: &str, cli_args: &[String]) -> Result<()> {
     let mut task_parts = Vec::new();
     let mut repo_id: Option<String> = None;
@@ -9176,6 +9287,8 @@ fn cmd_context(program: &str, cli_args: &[String]) -> Result<()> {
         context::ContextFormat::Markdown => println!("{}", packet.to_markdown()),
         context::ContextFormat::Json => println!("{}", packet.to_json()?),
     }
+
+    record_context_packet_telemetry(&conn, &packet, format);
 
     Ok(())
 }
