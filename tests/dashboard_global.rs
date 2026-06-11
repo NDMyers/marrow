@@ -85,9 +85,8 @@ async fn stats_endpoint_returns_workspaces_array_matching_registered_count() {
     );
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
-async fn stats_endpoint_omits_stale_macos_tmp_missing_db_from_workspaces_and_dbs() {
+async fn stats_endpoint_omits_stale_system_tmp_missing_db_from_workspaces_and_dbs() {
     let temp = tempfile::tempdir().unwrap();
     let registry = Registry::open(temp.path().join("registry.db")).unwrap();
     let stale_tmp = tempfile::Builder::new()
@@ -146,7 +145,6 @@ async fn stats_endpoint_omits_stale_macos_tmp_missing_db_from_workspaces_and_dbs
     }));
 }
 
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn stats_endpoint_returns_empty_inventory_when_only_stale_temp_missing_db_rows_exist() {
     let temp = tempfile::tempdir().unwrap();

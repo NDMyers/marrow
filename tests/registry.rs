@@ -131,9 +131,8 @@ fn registry_reports_db_inventory_statuses() {
     assert_eq!(missing_row.status, WorkspaceStatus::MissingDb);
 }
 
-#[cfg(target_os = "macos")]
 #[test]
-fn stats_aggregate_hides_only_stale_macos_tmp_missing_db_rows() {
+fn stats_aggregate_hides_only_stale_system_tmp_missing_db_rows() {
     let temp = tempfile::tempdir().unwrap();
     let registry = Registry::open(temp.path().join("registry.db")).unwrap();
 
@@ -214,6 +213,53 @@ fn stats_aggregate_hides_only_stale_macos_tmp_missing_db_rows() {
     assert!(aggregate.workspaces.iter().any(|row| row.workspace_root
         == tmp_available.path().canonicalize().unwrap()
         && row.status == WorkspaceStatus::Available));
+}
+
+#[test]
+fn stats_aggregate_prunes_dead_system_tmp_rows_from_registry() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Registry::open(temp.path().join("registry.db")).unwrap();
+
+    // A `.tmp*` workspace in the system temp dir whose root is deleted before
+    // aggregation — exactly the residue stale test runs leave behind.
+    let dead_tmp = tempfile::Builder::new()
+        .prefix(".tmp-dead-workspace")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    let dead_root = dead_tmp.path().canonicalize().unwrap();
+    registry.register_workspace(dead_tmp.path(), None).unwrap();
+    drop(dead_tmp);
+
+    // A `.tmp*` workspace whose root still exists stays registered (hidden
+    // from the dashboard, but not deleted).
+    let live_tmp = tempfile::Builder::new()
+        .prefix(".tmp-live-workspace")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    registry.register_workspace(live_tmp.path(), None).unwrap();
+
+    // A real workspace with a missing DB is untouched.
+    let real_missing = temp.path().join("missing");
+    std::fs::create_dir_all(&real_missing).unwrap();
+    registry.register_workspace(&real_missing, None).unwrap();
+
+    assert_eq!(registry.list_workspaces().unwrap().len(), 3);
+
+    let aggregate = registry.stats_aggregate().unwrap();
+    assert!(!aggregate
+        .workspaces
+        .iter()
+        .any(|row| row.workspace_root == dead_root));
+
+    let remaining = registry.list_workspaces().unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(!remaining.iter().any(|row| row.workspace_root == dead_root));
+    assert!(remaining
+        .iter()
+        .any(|row| row.workspace_root == live_tmp.path().canonicalize().unwrap()));
+    assert!(remaining
+        .iter()
+        .any(|row| row.workspace_root.ends_with("missing")));
 }
 
 #[test]

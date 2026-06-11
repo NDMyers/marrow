@@ -1,9 +1,21 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+/// Command for the compiled binary with the workspace registry redirected to
+/// a scratch path so test runs never pollute the user's real ~/.marrow
+/// registry (HOME overrides don't redirect dirs::home_dir() on Windows).
+fn marrow_cmd() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_marrow"));
+    command.env(
+        "MARROW_REGISTRY_PATH",
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("mcp_proxy-registry.db"),
+    );
+    command
+}
+
 #[test]
 fn benchmark_without_args_noninteractive_preserves_usage_error() {
-    let output = Command::new(env!("CARGO_BIN_EXE_marrow"))
+    let output = marrow_cmd()
         .arg("benchmark")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -25,7 +37,7 @@ fn benchmark_scripted_invocation_runs_without_prompt() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("hello.py"), "def hello():\n    return 1\n").unwrap();
 
-    let index = Command::new(env!("CARGO_BIN_EXE_marrow"))
+    let index = marrow_cmd()
         .arg("index")
         .current_dir(root.path())
         .stdin(Stdio::null())
@@ -44,7 +56,7 @@ fn benchmark_scripted_invocation_runs_without_prompt() {
         .file_name()
         .and_then(|name| name.to_str())
         .expect("tempdir basename");
-    let output = Command::new(env!("CARGO_BIN_EXE_marrow"))
+    let output = marrow_cmd()
         .args(["benchmark", "hello", repo_id])
         .current_dir(root.path())
         .stdin(Stdio::null())
@@ -75,7 +87,7 @@ fn benchmark_scripted_invocation_runs_without_prompt() {
 #[test]
 #[ignore = "requires running daemon; run manually with `cargo test -- --ignored`"]
 fn mcp_proxy_forwards_initialize() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_marrow"))
+    let mut child = marrow_cmd()
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -2,6 +2,18 @@ use std::{fs, path::PathBuf, process::Command};
 
 use marrow::{context, db, ingestion};
 
+/// Command for the compiled binary with the workspace registry redirected to
+/// a scratch path so test runs never pollute the user's real ~/.marrow
+/// registry (HOME overrides don't redirect dirs::home_dir() on Windows).
+fn marrow_cmd() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_marrow"));
+    command.env(
+        "MARROW_REGISTRY_PATH",
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("context_packet-registry.db"),
+    );
+    command
+}
+
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/context_packet_repo")
 }
@@ -325,7 +337,7 @@ fn json_packet_accounting_uses_emitted_json_and_reports_budget_truncation() {
 #[test]
 fn cli_emits_markdown_and_json_packets() {
     let (_temp, db_path) = indexed_fixture();
-    let markdown = Command::new(env!("CARGO_BIN_EXE_marrow"))
+    let markdown = marrow_cmd()
         .env("MARROW_DB_PATH", &db_path)
         .args([
             "context",
@@ -349,7 +361,7 @@ fn cli_emits_markdown_and_json_packets() {
     let stdout = String::from_utf8(markdown.stdout).unwrap();
     assert!(stdout.contains("# Marrow Context Packet"), "{stdout}");
 
-    let json = Command::new(env!("CARGO_BIN_EXE_marrow"))
+    let json = marrow_cmd()
         .env("MARROW_DB_PATH", &db_path)
         .args([
             "context",

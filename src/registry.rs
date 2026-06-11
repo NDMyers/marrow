@@ -585,10 +585,20 @@ impl Registry {
             (pipeline_requests as f64 / compliance_total as f64) * 100.0
         };
 
-        let workspaces = workspaces
+        let (workspaces, stale_temp): (Vec<_>, Vec<_>) = workspaces
             .into_iter()
-            .filter(|entry| is_dashboard_visible_workspace(&entry.status, &entry.workspace_root))
-            .collect();
+            .partition(|entry| is_dashboard_visible_workspace(&entry.status, &entry.workspace_root));
+        // Stale `.tmp*` rows under the system temp dir whose root no longer
+        // exists are dead test residue that can never become valid again —
+        // drop them so the registry self-heals instead of accumulating clutter.
+        for entry in &stale_temp {
+            if !entry.workspace_root.exists() {
+                let _ = self.conn.execute(
+                    "DELETE FROM workspaces WHERE workspace_id = ?1",
+                    rusqlite::params![entry.workspace_id],
+                );
+            }
+        }
         let inventory = inventory
             .into_iter()
             .filter(|row| is_dashboard_visible_workspace(&row.status, &row.workspace_root))
@@ -939,6 +949,15 @@ impl Registry {
 }
 
 pub fn default_registry_path() -> PathBuf {
+    // MARROW_REGISTRY_PATH lets tests (and packaging sandboxes) point at a
+    // scratch registry. dirs::home_dir() can't be redirected via env on
+    // Windows, so without this override spawned test binaries would register
+    // their temp workspaces in the user's real ~/.marrow/registry.db.
+    if let Ok(path) = std::env::var("MARROW_REGISTRY_PATH") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".marrow")
@@ -986,10 +1005,15 @@ fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf> {
 }
 
 fn is_dashboard_visible_workspace(status: &WorkspaceStatus, workspace_root: &Path) -> bool {
-    !matches!(status, WorkspaceStatus::MissingDb) || !is_macos_temp_workspace_root(workspace_root)
+    !matches!(status, WorkspaceStatus::MissingDb) || !is_system_temp_workspace_root(workspace_root)
 }
 
-fn is_macos_temp_workspace_root(workspace_root: &Path) -> bool {
+/// True for `.tmpXXXXXX` directories created directly inside the OS temp dir
+/// (tempfile's default layout on every platform: `/var/folders/.../T` on macOS,
+/// `%LOCALAPPDATA%\Temp` on Windows, `/tmp` on Linux). These are throwaway
+/// roots left behind by test runs, never real user workspaces, so stale
+/// entries pointing at them are hidden from the dashboard and pruned.
+fn is_system_temp_workspace_root(workspace_root: &Path) -> bool {
     let Some(name) = workspace_root.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -1004,30 +1028,11 @@ fn is_macos_temp_workspace_root(workspace_root: &Path) -> bool {
     let parent = canonical_or_original(parent);
     let temp_dir = canonical_or_original(&std::env::temp_dir());
 
-    parent == temp_dir && is_macos_system_temp_dir(&temp_dir)
+    parent == temp_dir
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn is_macos_system_temp_dir(path: &Path) -> bool {
-    let components: Vec<_> = path
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(value) => value.to_str(),
-            _ => None,
-        })
-        .collect();
-    let offset = if components.first().copied() == Some("private") {
-        1
-    } else {
-        0
-    };
-
-    components.get(offset).copied() == Some("var")
-        && components.get(offset + 1).copied() == Some("folders")
-        && path.file_name().and_then(|name| name.to_str()) == Some("T")
 }
 
 fn classify_workspace_db(graph_db_path: &Path) -> (WorkspaceStatus, Option<String>) {
