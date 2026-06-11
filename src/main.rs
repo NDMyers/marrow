@@ -1528,7 +1528,9 @@ const INTEGRATION_TARGETS: &[IntegrationTarget] = &[
         support_tier: IntegrationSupportTier::FirstClass,
         kind: IntegrationTargetKind::Client,
         setup_mode: IntegrationSetupMode::Automatic,
-        rule_support: RuleFileSupport::ProjectAndGlobal,
+        // Cursor's global User Rules live in the app's settings store, not on
+        // disk — only the project .cursor/rules/ directory is a file target.
+        rule_support: RuleFileSupport::ProjectOnly,
         rule_agent: Some(skills::Agent::Cursor),
         workspace_rule_files: &[".cursorrules"],
         baseline_workspace_required: true,
@@ -1567,7 +1569,9 @@ const INTEGRATION_TARGETS: &[IntegrationTarget] = &[
         support_tier: IntegrationSupportTier::FirstClass,
         kind: IntegrationTargetKind::Client,
         setup_mode: IntegrationSetupMode::Automatic,
-        rule_support: RuleFileSupport::ProjectAndGlobal,
+        // Zed's global Rules Library is an internal prompt database, not rule
+        // files — only the project-root .rules file is a file target.
+        rule_support: RuleFileSupport::ProjectOnly,
         rule_agent: Some(skills::Agent::Zed),
         workspace_rule_files: &[],
         baseline_workspace_required: false,
@@ -1602,13 +1606,14 @@ const INTEGRATION_TARGETS: &[IntegrationTarget] = &[
     },
     IntegrationTarget {
         name: "Roo Code",
-        aliases: &["roo", "roo-code", "roocode", ".roomrules"],
+        aliases: &["roo", "roo-code", "roocode", ".roorules"],
         support_tier: IntegrationSupportTier::FirstClass,
         kind: IntegrationTargetKind::Client,
         setup_mode: IntegrationSetupMode::Guided,
-        rule_support: RuleFileSupport::ProjectOnly,
+        // Project: bare .roorules fallback file; global: ~/.roo/rules/ directory.
+        rule_support: RuleFileSupport::ProjectAndGlobal,
         rule_agent: Some(skills::Agent::RooCode),
-        workspace_rule_files: &[".roomrules"],
+        workspace_rule_files: &[".roorules"],
         baseline_workspace_required: true,
         allow_config_write: false,
         writer: None,
@@ -2375,7 +2380,7 @@ fn workspace_rule_targets() -> Vec<&'static IntegrationTarget> {
 const LEGACY_WORKSPACE_RULE_FILES_BY_INDEX: &[&[&str]] = &[
     &[".cursorrules"],
     &[".windsurfrules"],
-    &[".clinerules", ".roomrules"],
+    &[".clinerules", ".roorules"],
 ];
 
 fn workspace_rule_target_indices() -> Vec<usize> {
@@ -2512,7 +2517,7 @@ fn fallback_paths_for_agent(agent: skills::Agent, workspace_root: &Path) -> Vec<
     let legacy_fallbacks: &[&str] = match agent {
         skills::Agent::Cursor => &[".cursorrules", ".vscode/mcp.json"],
         skills::Agent::GitHubCopilot => &[".vscode/mcp.json"],
-        skills::Agent::Antigravity => &[".roomrules"],
+        skills::Agent::Antigravity => &[".roorules"],
         _ => &[],
     };
 
@@ -4861,7 +4866,7 @@ mod tests {
             Some("Roo Code")
         );
         assert_eq!(
-            integration_target_by_name(".roomrules").map(|target| target.name),
+            integration_target_by_name(".roorules").map(|target| target.name),
             Some("Roo Code")
         );
     }
@@ -5842,8 +5847,10 @@ mod tests {
     fn windsurf_and_roo_rule_files_are_first_class_coverage_evidence() {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        fs::write(workspace.path().join(".windsurfrules"), "marrow").unwrap();
-        fs::write(workspace.path().join(".roomrules"), "marrow").unwrap();
+        let windsurf_rules = workspace.path().join(".windsurf/rules");
+        fs::create_dir_all(&windsurf_rules).unwrap();
+        fs::write(windsurf_rules.join("marrow-optimization.md"), "marrow").unwrap();
+        fs::write(workspace.path().join(".roorules"), "marrow").unwrap();
 
         let summary = format_agent_coverage_summary(workspace.path(), home.path());
 
@@ -5955,18 +5962,34 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_roomrules_counts_as_fallback_coverage() {
+    fn antigravity_roorules_counts_as_fallback_coverage() {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        fs::write(workspace.path().join(".roomrules"), "marrow").unwrap();
+        fs::write(workspace.path().join(".roorules"), "marrow").unwrap();
 
         let (status, detail) =
             coverage_status_for_agent(skills::Agent::Antigravity, workspace.path(), home.path());
 
         assert_eq!(status, "partial", "Antigravity fallback detail: {detail}");
         assert!(
-            detail.contains(".roomrules"),
-            "Antigravity fallback should cite .roomrules: {detail}"
+            detail.contains(".roorules"),
+            "Antigravity fallback should cite .roorules: {detail}"
+        );
+    }
+
+    #[test]
+    fn legacy_windsurfrules_counts_as_fallback_coverage() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join(".windsurfrules"), "marrow").unwrap();
+
+        let (status, detail) =
+            coverage_status_for_agent(skills::Agent::Windsurf, workspace.path(), home.path());
+
+        assert_eq!(status, "partial", "Windsurf fallback detail: {detail}");
+        assert!(
+            detail.contains(".windsurfrules"),
+            "legacy .windsurfrules should still count as fallback coverage: {detail}"
         );
     }
 
@@ -5981,12 +6004,7 @@ mod tests {
         )
         .unwrap();
 
-        for filename in [
-            ".cursorrules",
-            ".windsurfrules",
-            ".clinerules",
-            ".roomrules",
-        ] {
+        for filename in [".cursorrules", ".windsurfrules", ".clinerules", ".roorules"] {
             let path = workspace.path().join(filename);
             assert!(path.exists(), "missing legacy rule file {filename}");
             let content = fs::read_to_string(path).unwrap();
@@ -7335,26 +7353,15 @@ mod tests {
 
     /// VS Code's global MCP config lives at a platform-specific location, kept
     /// sandbox-relative to `ctx.home` so tests never touch the real user config
-    /// (mirrors the `#[cfg]` branches in `integrate_copilot`).
-    fn vscode_mcp_rel_path() -> &'static str {
-        #[cfg(target_os = "macos")]
-        {
-            "Library/Application Support/Code/User/mcp.json"
-        }
-        #[cfg(target_os = "linux")]
-        {
-            ".config/Code/User/mcp.json"
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            ".mcp.json"
-        }
+    /// (delegates to the same `skills::vscode_user_dir` the writers use).
+    fn vscode_user_mcp_path(home: &Path) -> PathBuf {
+        skills::vscode_user_dir(home).join("mcp.json")
     }
 
     #[test]
     fn integrate_copilot_vscode_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
-        let vscode_path = home.path().join(vscode_mcp_rel_path());
+        let vscode_path = vscode_user_mcp_path(home.path());
         std::fs::create_dir_all(vscode_path.parent().unwrap()).unwrap();
         let ctx = IntegrationCtx {
             binary: "/absolute/path/to/marrow".to_string(),
@@ -7523,10 +7530,8 @@ mod tests {
     #[test]
     fn integrate_cline_uses_shell_wrapper() {
         let home = tempfile::tempdir().unwrap();
-        let cline_dir = home
-            .path()
-            .join("Library/Application Support/Code/User/globalStorage")
-            .join("saoudrizwan.claude-dev/settings");
+        let cline_dir = skills::vscode_user_dir(home.path())
+            .join("globalStorage/saoudrizwan.claude-dev/settings");
         std::fs::create_dir_all(&cline_dir).unwrap();
         let ctx = IntegrationCtx {
             binary: "/absolute/path/to/marrow".to_string(),
@@ -7554,15 +7559,20 @@ mod tests {
         integrate_zed(&ctx).unwrap();
         let raw = std::fs::read_to_string(zed_dir.join("settings.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let path_val = cfg["context_servers"]["marrow"]["command"]["path"]
-            .as_str()
-            .unwrap();
-        assert_eq!(
-            path_val, "marrow",
-            "Zed command.path must be 'marrow', got: {path_val}"
+        // Zed's standardized schema is flat: source/command/args/env at the top
+        // level. The legacy nested {"command": {"path", ...}} form is skipped
+        // as malformed by current Zed.
+        let server = &cfg["context_servers"]["marrow"];
+        assert_eq!(server["source"], "custom");
+        let cmd = server["command"].as_str().unwrap();
+        assert_eq!(cmd, "marrow", "Zed command must be 'marrow', got: {cmd}");
+        assert!(!cmd.starts_with('/'));
+        assert_eq!(server["args"], serde_json::json!(["mcp"]));
+        assert!(server["env"]["PATH"].is_string());
+        assert!(
+            server.get("settings").is_none(),
+            "flat custom entries carry no extension 'settings' object"
         );
-        assert!(!path_val.starts_with('/'));
-        assert!(cfg["context_servers"]["marrow"]["command"]["env"]["PATH"].is_string());
     }
 
     // ── regression guard ──────────────────────────────────────────────────────
@@ -7583,16 +7593,15 @@ mod tests {
         std::fs::create_dir_all(ag.parent().unwrap()).unwrap();
         std::fs::write(&ag, "{}").unwrap();
         std::fs::create_dir_all(h.join(".gemini/antigravity-cli")).unwrap();
-        let cline = h.join(
-            "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings",
-        );
-        std::fs::create_dir_all(&cline).unwrap();
+        let cline_path = skills::vscode_user_dir(h)
+            .join("globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json");
+        std::fs::create_dir_all(cline_path.parent().unwrap()).unwrap();
         let zed = h.join(".config/zed");
         std::fs::create_dir_all(&zed).unwrap();
         std::fs::write(zed.join("settings.json"), "{}").unwrap();
         // VS Code global MCP config location is platform-specific (sandbox-relative).
-        let vscode_rel = vscode_mcp_rel_path();
-        std::fs::create_dir_all(h.join(vscode_rel).parent().unwrap()).unwrap();
+        let vscode_path = vscode_user_mcp_path(h);
+        std::fs::create_dir_all(vscode_path.parent().unwrap()).unwrap();
 
         let ctx = IntegrationCtx {
             binary: BINARY.to_string(),
@@ -7608,49 +7617,49 @@ mod tests {
         integrate_zed(&ctx).unwrap();
 
         // Every written config file must not contain the sentinel binary path.
-        let config_files = [
-            ".claude.json",
-            ".gemini/config/mcp_config.json",
-            ".cursor/mcp.json",
-            ".copilot/mcp-config.json",
-            vscode_rel,
-            "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-            ".config/zed/settings.json",
+        let config_files: Vec<PathBuf> = vec![
+            h.join(".claude.json"),
+            h.join(".gemini/config/mcp_config.json"),
+            h.join(".cursor/mcp.json"),
+            h.join(".copilot/mcp-config.json"),
+            vscode_path.clone(),
+            cline_path.clone(),
+            h.join(".config/zed/settings.json"),
         ];
-        for rel_path in &config_files {
-            let raw = std::fs::read_to_string(h.join(rel_path))
-                .unwrap_or_else(|_| panic!("config not written: {rel_path}"));
+        for path in &config_files {
+            let raw = std::fs::read_to_string(path)
+                .unwrap_or_else(|_| panic!("config not written: {}", path.display()));
             assert!(
                 !raw.contains(BINARY),
-                "{rel_path}: binary path leaked into config:\n{raw}"
+                "{}: binary path leaked into config:\n{raw}",
+                path.display()
             );
         }
 
         // Antigravity must use portable command name.
         // (Claude Code now uses shell wrapper — verified in the shell-wrapper loop below.)
 
-        // Zed must use portable path name in nested command object.
+        // Zed must use the portable command name in the flat custom entry.
         let zed_raw = std::fs::read_to_string(zed.join("settings.json")).unwrap();
         let zed_cfg: serde_json::Value = serde_json::from_str(&zed_raw).unwrap();
-        assert_eq!(
-            zed_cfg["context_servers"]["marrow"]["command"]["path"],
-            "marrow"
-        );
+        assert_eq!(zed_cfg["context_servers"]["marrow"]["source"], "custom");
+        assert_eq!(zed_cfg["context_servers"]["marrow"]["command"], "marrow");
 
         // Shell-wrapper hosts must use a platform-appropriate shell, not "marrow" directly.
-        for (rel, base) in [
-            (".claude.json", "/mcpServers/marrow"),
-            (".cursor/mcp.json", "/mcpServers/marrow"),
-            (vscode_rel, "/servers/marrow"),
-            ("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-             "/mcpServers/marrow"),
+        for (path, base) in [
+            (h.join(".claude.json"), "/mcpServers/marrow"),
+            (h.join(".cursor/mcp.json"), "/mcpServers/marrow"),
+            (vscode_path.clone(), "/servers/marrow"),
+            (cline_path.clone(), "/mcpServers/marrow"),
         ] {
-            let raw = std::fs::read_to_string(h.join(rel)).unwrap();
+            let raw = std::fs::read_to_string(&path).unwrap();
             let cfg: serde_json::Value = serde_json::from_str(&raw).unwrap();
             let cmd = cfg
                 .pointer(&format!("{base}/command"))
                 .and_then(|v| v.as_str())
-                .unwrap_or_else(|| panic!("command missing at {base}/command in {rel}"));
+                .unwrap_or_else(|| {
+                    panic!("command missing at {base}/command in {}", path.display())
+                });
             let args = cfg
                 .pointer(&format!("{base}/args"))
                 .cloned()
@@ -7818,13 +7827,7 @@ fn dedupe_workspace_marrow(workspace_mcp: &Path, user_global_mcp: &Path) -> Resu
 /// Resolve the platform path of VS Code's user-global `mcp.json`.
 fn vscode_user_global_mcp_path() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    #[cfg(target_os = "macos")]
-    let p = home.join("Library/Application Support/Code/User/mcp.json");
-    #[cfg(target_os = "linux")]
-    let p = home.join(".config/Code/User/mcp.json");
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let p = home.join(".mcp.json");
-    Some(p)
+    Some(skills::vscode_user_dir(&home).join("mcp.json"))
 }
 
 /// Creates or merges `.vscode/mcp.json` so that GitHub Copilot / VS Code can
@@ -8403,22 +8406,15 @@ fn integrate_cursor(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
 }
 
 /// GitHub Copilot — writes two config files:
-///   ~/Library/Application Support/Code/User/mcp.json  (VS Code global MCP, macOS)
-///   ~/.copilot/mcp-config.json                         (Copilot CLI, uses "mcpServers" key)
+///   <VS Code user dir>/mcp.json     (VS Code global MCP, platform-specific dir)
+///   ~/.copilot/mcp-config.json      (Copilot CLI, uses "mcpServers" key)
 fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
-    // 1. VS Code global MCP config — location is platform-specific.
-    //    macOS: ~/Library/Application Support/Code/User/mcp.json
-    //    Linux: ~/.config/Code/User/mcp.json
-    //    Windows: %APPDATA%\Code\User\mcp.json
+    // 1. VS Code global MCP config — platform-specific user dir resolved by
+    //    skills::vscode_user_dir (macOS: ~/Library/Application Support/Code/User,
+    //    Windows: ~/AppData/Roaming/Code/User, Linux: ~/.config/Code/User).
     //    Uses shell wrapper — VS Code's extension host resolves command via parent PATH,
     //    so env injection cannot prevent ENOENT for GUI-launched IDE.
-    #[cfg(target_os = "macos")]
-    let vscode_path =
-        PathBuf::from(&ctx.home).join("Library/Application Support/Code/User/mcp.json");
-    #[cfg(target_os = "linux")]
-    let vscode_path = PathBuf::from(&ctx.home).join(".config/Code/User/mcp.json");
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let vscode_path = PathBuf::from(&ctx.home).join(".mcp.json");
+    let vscode_path = skills::vscode_user_dir(Path::new(&ctx.home)).join("mcp.json");
 
     if let Some(parent) = vscode_path.parent() {
         if parent.exists() {
@@ -8446,12 +8442,11 @@ fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     Ok(AgentOutcome::Installed)
 }
 
-/// ~/Library/Application Support/Code/User/globalStorage/
-///   saoudrizwan.claude-dev/settings/cline_mcp_settings.json
+/// <VS Code user dir>/globalStorage/saoudrizwan.claude-dev/settings/
+///   cline_mcp_settings.json — the VS Code user dir is platform-specific.
 fn integrate_cline(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
-    let path = PathBuf::from(&ctx.home)
-        .join("Library/Application Support/Code/User/globalStorage")
-        .join("saoudrizwan.claude-dev/settings/cline_mcp_settings.json");
+    let path = skills::vscode_user_dir(Path::new(&ctx.home))
+        .join("globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json");
     if !path.parent().is_some_and(|p| p.exists()) {
         return Ok(AgentOutcome::NotFound);
     }
@@ -8465,21 +8460,19 @@ fn integrate_cline(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
 }
 
 /// ~/.config/zed/settings.json
-/// Zed uses a nested "command" object inside "context_servers".
+/// Zed's standardized MCP entry is flat — `source: "custom"` plus top-level
+/// command/args/env (zed#33539). The old nested `"command": {path, args, env}`
+/// object is treated as malformed by current Zed and silently skipped.
 fn integrate_zed(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     let path = PathBuf::from(&ctx.home).join(".config/zed/settings.json");
     if !path.exists() {
         return Ok(AgentOutcome::NotFound);
     }
     let mut cfg = load_json_or_empty(&path)?;
-    cfg["context_servers"]["marrow"] = serde_json::json!({
-        "command": {
-            "path": "marrow",
-            "args": ["mcp"],
-            "env":  { "PATH": gui_safe_path(&ctx.binary) }
-        },
-        "settings": {}
-    });
+    let mut spec = mcp_launch_spec();
+    spec["source"] = serde_json::json!("custom");
+    spec["env"] = serde_json::json!({ "PATH": gui_safe_path(&ctx.binary) });
+    cfg["context_servers"]["marrow"] = spec;
     save_json(&path, &cfg)?;
     Ok(AgentOutcome::Installed)
 }

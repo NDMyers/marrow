@@ -190,9 +190,16 @@ pub enum Agent {
 
 impl Agent {
     pub fn supports_scope(self, scope: Scope) -> bool {
+        // No verified on-disk global rule target:
+        // - Windsurf: global rules are a single shared
+        //   ~/.codeium/windsurf/memories/global_rules.md Marrow shouldn't own.
+        // - Cursor: global "User Rules" live inside the app's settings store,
+        //   not in a filesystem rules directory.
+        // - Zed: the global Rules Library is an internal prompt database
+        //   (~/.config/zed/prompts/*.mdb), not loose rule files.
         !matches!(
             (self, scope),
-            (Agent::Windsurf | Agent::RooCode, Scope::Global)
+            (Agent::Windsurf | Agent::Cursor | Agent::Zed, Scope::Global)
         )
     }
 
@@ -230,29 +237,65 @@ impl Agent {
             (Agent::Cursor, Scope::Project) => {
                 PathBuf::from(".cursor/rules/marrow-optimization.mdc")
             }
+            // Unreachable for installs (supports_scope denies Global): Cursor
+            // keeps global User Rules in its app settings, not on disk.
             (Agent::Cursor, Scope::Global) => home.join(".cursor/rules/marrow-optimization.mdc"),
 
             (Agent::GitHubCopilot, Scope::Project) => {
                 PathBuf::from(".github/instructions/marrow-optimization.instructions.md")
             }
-            (Agent::GitHubCopilot, Scope::Global) => home.join(
-                "Library/Application Support/Code/User/prompts/marrow-optimization.instructions.md",
-            ),
+            // VS Code reads global instruction files from <user dir>/prompts/,
+            // which lives at a platform-specific location under home.
+            (Agent::GitHubCopilot, Scope::Global) => {
+                vscode_user_dir(home).join("prompts/marrow-optimization.instructions.md")
+            }
 
             // Cline project target is a bare file at the repo root — no subdirectory.
             (Agent::Cline, Scope::Project) => PathBuf::from(".clinerules"),
-            (Agent::Cline, Scope::Global) => home.join(".cline/rules/marrow-optimization.md"),
+            // Cline's global rules folder is ~/Documents/Cline/Rules on every platform.
+            (Agent::Cline, Scope::Global) => {
+                home.join("Documents/Cline/Rules/marrow-optimization.md")
+            }
 
-            (Agent::Windsurf, Scope::Project) => PathBuf::from(".windsurfrules"),
-            (Agent::Windsurf, Scope::Global) => home.join(".windsurfrules"),
+            // Windsurf reads workspace rules from the .windsurf/rules/ directory;
+            // the legacy single-file .windsurfrules is deprecated and size-capped.
+            (Agent::Windsurf, Scope::Project) => {
+                PathBuf::from(".windsurf/rules/marrow-optimization.md")
+            }
+            // Unreachable for installs (supports_scope denies Global).
+            (Agent::Windsurf, Scope::Global) => home.join(".windsurf/rules/marrow-optimization.md"),
 
-            (Agent::RooCode, Scope::Project) => PathBuf::from(".roomrules"),
-            (Agent::RooCode, Scope::Global) => home.join(".roomrules"),
+            // Roo Code loads .roo/rules/ first and only falls back to a bare
+            // .roorules file; the bare file is written so a user's existing
+            // .roorules is never shadowed by a Marrow-created directory.
+            (Agent::RooCode, Scope::Project) => PathBuf::from(".roorules"),
+            // Roo Code loads global rules from every file in ~/.roo/rules/.
+            (Agent::RooCode, Scope::Global) => home.join(".roo/rules/marrow-optimization.md"),
 
             // Zed project target is a bare file at the repo root — no subdirectory.
             (Agent::Zed, Scope::Project) => PathBuf::from(".rules"),
+            // Unreachable for installs (supports_scope denies Global): Zed's
+            // Rules Library is an internal prompt database, not rule files.
             (Agent::Zed, Scope::Global) => home.join(".config/zed/rules/marrow-optimization.rules"),
         }
+    }
+}
+
+/// VS Code's per-user configuration directory, resolved relative to `home`.
+/// Shared by the Copilot global instructions target and the VS Code / Cline
+/// MCP config writers so every VS Code path is platform-gated in one place.
+pub fn vscode_user_dir(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Application Support/Code/User")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        home.join("AppData/Roaming/Code/User")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        home.join(".config/Code/User")
     }
 }
 
@@ -760,9 +803,13 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         let target = Agent::GitHubCopilot.target_path(Scope::Global, &home);
 
-        let status =
-            super::install_skill(Agent::GitHubCopilot, Scope::Global, Method::WriteFile, &home)
-                .unwrap();
+        let status = super::install_skill(
+            Agent::GitHubCopilot,
+            Scope::Global,
+            Method::WriteFile,
+            &home,
+        )
+        .unwrap();
 
         assert_eq!(status, InstallStatus::Written);
         assert_eq!(
@@ -784,8 +831,8 @@ mod tests {
 
         // Project scope writes relative to CWD, so drive install through the lower
         // level by pointing target_path at the temp home via Global semantics.
-        let status = super::install_managed_file(&target, &super::marrow_copilot_instructions_md())
-            .unwrap();
+        let status =
+            super::install_managed_file(&target, &super::marrow_copilot_instructions_md()).unwrap();
 
         assert_eq!(status, InstallStatus::PreservedExisting);
         assert_eq!(fs::read_to_string(&target).unwrap(), custom);
@@ -837,13 +884,28 @@ mod tests {
     }
 
     #[test]
-    fn copilot_global_skill_uses_profile_prompts_instruction_file() {
-        let path = Agent::GitHubCopilot.target_path(Scope::Global, Path::new("/tmp/home"));
+    fn copilot_global_skill_uses_vscode_user_prompts_instruction_file() {
+        let home = Path::new("/tmp/home");
+        let path = Agent::GitHubCopilot.target_path(Scope::Global, home);
 
         assert_eq!(
             path,
-            Path::new("/tmp/home/Library/Application Support/Code/User/prompts/marrow-optimization.instructions.md")
+            super::vscode_user_dir(home).join("prompts/marrow-optimization.instructions.md")
         );
+    }
+
+    #[test]
+    fn vscode_user_dir_is_platform_specific() {
+        let dir = super::vscode_user_dir(Path::new("/tmp/home"));
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            dir,
+            Path::new("/tmp/home/Library/Application Support/Code/User")
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(dir, Path::new("/tmp/home/AppData/Roaming/Code/User"));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(dir, Path::new("/tmp/home/.config/Code/User"));
     }
 
     #[test]
@@ -866,9 +928,13 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         let target = Agent::AntigravityCli.target_path(Scope::Global, &home);
 
-        let status =
-            super::install_skill(Agent::AntigravityCli, Scope::Global, Method::WriteFile, &home)
-                .unwrap();
+        let status = super::install_skill(
+            Agent::AntigravityCli,
+            Scope::Global,
+            Method::WriteFile,
+            &home,
+        )
+        .unwrap();
 
         assert_eq!(status, InstallStatus::Written);
         assert_eq!(
@@ -922,7 +988,10 @@ mod tests {
                 .unwrap();
 
         assert_eq!(status, InstallStatus::Written);
-        assert!(!legacy.exists(), "managed legacy flat file should be removed");
+        assert!(
+            !legacy.exists(),
+            "managed legacy flat file should be removed"
+        );
         let target = Agent::ClaudeCode.target_path(Scope::Global, &home);
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
@@ -1002,23 +1071,49 @@ mod tests {
     }
 
     #[test]
-    fn windsurf_project_skill_uses_existing_workspace_rule_file() {
+    fn windsurf_project_skill_uses_windsurf_rules_directory() {
         let path = Agent::Windsurf.target_path(Scope::Project, Path::new("/tmp/home"));
 
-        assert_eq!(path, Path::new(".windsurfrules"));
+        assert_eq!(path, Path::new(".windsurf/rules/marrow-optimization.md"));
     }
 
     #[test]
-    fn roo_project_skill_uses_existing_workspace_rule_file() {
+    fn roo_project_skill_uses_bare_roorules_fallback_file() {
         let path = Agent::RooCode.target_path(Scope::Project, Path::new("/tmp/home"));
 
-        assert_eq!(path, Path::new(".roomrules"));
+        // Bare .roorules (not .roo/rules/) so a Marrow-created directory never
+        // shadows a user's existing .roorules file.
+        assert_eq!(path, Path::new(".roorules"));
     }
 
     #[test]
-    fn windsurf_and_roo_do_not_claim_global_rule_support() {
+    fn roo_global_skill_uses_roo_rules_directory() {
+        let path = Agent::RooCode.target_path(Scope::Global, Path::new("/tmp/home"));
+
+        assert_eq!(
+            path,
+            Path::new("/tmp/home/.roo/rules/marrow-optimization.md")
+        );
+        assert!(Agent::RooCode.supports_scope(Scope::Global));
+    }
+
+    #[test]
+    fn cline_global_skill_uses_documents_cline_rules_directory() {
+        let path = Agent::Cline.target_path(Scope::Global, Path::new("/tmp/home"));
+
+        assert_eq!(
+            path,
+            Path::new("/tmp/home/Documents/Cline/Rules/marrow-optimization.md")
+        );
+    }
+
+    #[test]
+    fn agents_without_on_disk_global_rules_do_not_claim_global_support() {
+        // Windsurf: shared global_rules.md; Cursor: in-app User Rules;
+        // Zed: internal Rules Library database. None are Marrow-ownable files.
         assert!(!Agent::Windsurf.supports_scope(Scope::Global));
-        assert!(!Agent::RooCode.supports_scope(Scope::Global));
+        assert!(!Agent::Cursor.supports_scope(Scope::Global));
+        assert!(!Agent::Zed.supports_scope(Scope::Global));
     }
 
     #[test]
