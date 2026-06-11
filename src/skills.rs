@@ -199,11 +199,14 @@ impl Agent {
     /// Resolve the target installation path from the spec's path matrix.
     pub fn target_path(self, scope: Scope, home: &Path) -> PathBuf {
         match (self, scope) {
+            // Claude Code discovers skills only as `<skills-root>/<name>/SKILL.md`
+            // directory packages; a flat `.md` dropped in `.claude/skills/` is
+            // silently ignored by its skill loader.
             (Agent::ClaudeCode, Scope::Project) => {
-                PathBuf::from(".claude/skills/marrow-optimization.md")
+                PathBuf::from(".claude/skills/marrow-optimization/SKILL.md")
             }
             (Agent::ClaudeCode, Scope::Global) => {
-                home.join(".claude/skills/marrow-optimization.md")
+                home.join(".claude/skills/marrow-optimization/SKILL.md")
             }
 
             (Agent::Antigravity, Scope::Project) => {
@@ -360,16 +363,16 @@ fn marrow_copilot_instructions_md() -> String {
     rewrite_checksum_marker(&swapped, &checksum)
 }
 
-/// The Antigravity `SKILL.md` flavor of the core directive.
+/// The directory-package `SKILL.md` flavor of the core directive.
 ///
-/// Antigravity (IDE and the `agy` CLI) discovers global skills as
-/// `~/.gemini/skills/<skill-name>/SKILL.md` packages whose frontmatter is keyed
+/// Claude Code and Antigravity (IDE and the `agy` CLI) discover skills as
+/// `<skills-root>/<skill-name>/SKILL.md` packages whose frontmatter is keyed
 /// on `name` + `description`. The body is byte-identical to
 /// [`MARROW_CORE_SKILL_MD`]; only Cursor's `.mdc`-specific `alwaysApply` key is
 /// swapped for the `name` field the SKILL.md format expects. The generated
 /// checksum marker is recomputed so the file is still recognised as managed on
 /// refresh.
-fn marrow_antigravity_skill_md() -> String {
+fn marrow_skill_package_md() -> String {
     let swapped =
         MARROW_CORE_SKILL_MD.replacen("alwaysApply: true", "name: marrow-optimization", 1);
     let checksum = generated_checksum(&swapped);
@@ -483,7 +486,23 @@ pub fn install_skill(
     // Copilot file. Its project target is the shared universal `.agents/skills`
     // file and takes the normal central-source path below.
     if matches!(agent, Agent::AntigravityCli) && matches!(scope, Scope::Global) {
-        return install_managed_file(&target, &marrow_antigravity_skill_md());
+        return install_managed_file(&target, &marrow_skill_package_md());
+    }
+
+    // Claude Code's skill is a directory-based SKILL.md package at both scopes,
+    // also written standalone. Older Marrow versions wrote a flat
+    // `marrow-optimization.md` that Claude Code never loaded; once the package
+    // is in place, a managed copy of that flat file is removed.
+    if matches!(agent, Agent::ClaudeCode) {
+        let mut status = install_managed_file(&target, &marrow_skill_package_md())?;
+        let legacy = match scope {
+            Scope::Project => PathBuf::from(".claude/skills/marrow-optimization.md"),
+            Scope::Global => home.join(".claude/skills/marrow-optimization.md"),
+        };
+        if remove_superseded_managed_file(&legacy)? && status == InstallStatus::PreservedExisting {
+            status = InstallStatus::Refreshed;
+        }
+        return Ok(status);
     }
 
     let central = install_source_path(method, home)
@@ -581,6 +600,31 @@ fn install(target: &Path, method: Method, central: &Path) -> Result<InstallStatu
     }
 
     Ok(InstallStatus::Written)
+}
+
+/// Remove a superseded legacy file if it is Marrow-managed: known template
+/// content (read through a symlink, if any) or a dangling symlink. User-authored
+/// content is preserved. Returns whether anything was removed.
+fn remove_superseded_managed_file(path: &Path) -> Result<bool> {
+    if path.symlink_metadata().is_err() {
+        return Ok(false);
+    }
+
+    // A dangling symlink resolves to nothing — clear it.
+    if !path.exists() {
+        fs::remove_file(path)?;
+        return Ok(true);
+    }
+
+    let Ok(existing) = fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    if classify_existing_content(&existing) == ExistingContentStatus::Custom {
+        return Ok(false);
+    }
+
+    fs::remove_file(path)?;
+    Ok(true)
 }
 
 /// Write a self-contained managed file holding exactly `content`.
@@ -803,16 +847,16 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_skill_md_shares_core_directive_body() {
+    fn skill_package_md_shares_core_directive_body() {
         // Body (everything after the frontmatter block) must be byte-identical to
         // the core directive so guidance never drifts between agents.
         let core_body = MARROW_CORE_SKILL_MD.splitn(3, "---\n").nth(2).unwrap();
-        let antigravity = super::marrow_antigravity_skill_md();
-        let antigravity_body = antigravity.splitn(3, "---\n").nth(2).unwrap();
-        assert_eq!(antigravity_body, core_body);
-        assert!(antigravity.contains("name: marrow-optimization"));
-        assert!(!antigravity.contains("alwaysApply"));
-        assert!(super::has_valid_generated_marker(&antigravity));
+        let package = super::marrow_skill_package_md();
+        let package_body = package.splitn(3, "---\n").nth(2).unwrap();
+        assert_eq!(package_body, core_body);
+        assert!(package.contains("name: marrow-optimization"));
+        assert!(!package.contains("alwaysApply"));
+        assert!(super::has_valid_generated_marker(&package));
     }
 
     #[test]
@@ -829,8 +873,115 @@ mod tests {
         assert_eq!(status, InstallStatus::Written);
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
-            super::marrow_antigravity_skill_md()
+            super::marrow_skill_package_md()
         );
+    }
+
+    #[test]
+    fn claude_code_skill_uses_skill_md_package_at_both_scopes() {
+        assert_eq!(
+            Agent::ClaudeCode.target_path(Scope::Project, Path::new("/tmp/home")),
+            Path::new(".claude/skills/marrow-optimization/SKILL.md")
+        );
+        assert_eq!(
+            Agent::ClaudeCode.target_path(Scope::Global, Path::new("/tmp/home")),
+            Path::new("/tmp/home/.claude/skills/marrow-optimization/SKILL.md")
+        );
+    }
+
+    #[test]
+    fn install_skill_writes_global_claude_code_skill_md_package() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        fs::create_dir_all(&home).unwrap();
+        let target = Agent::ClaudeCode.target_path(Scope::Global, &home);
+
+        let status =
+            super::install_skill(Agent::ClaudeCode, Scope::Global, Method::WriteFile, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::Written);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            super::marrow_skill_package_md()
+        );
+    }
+
+    #[test]
+    fn install_skill_claude_code_removes_superseded_managed_flat_file() {
+        // Older Marrow wrote `.claude/skills/marrow-optimization.md`, which Claude
+        // Code never loaded. Installing the SKILL.md package must clean it up.
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        let legacy = home.join(".claude/skills/marrow-optimization.md");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, MARROW_CORE_SKILL_MD).unwrap();
+
+        let status =
+            super::install_skill(Agent::ClaudeCode, Scope::Global, Method::WriteFile, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::Written);
+        assert!(!legacy.exists(), "managed legacy flat file should be removed");
+        let target = Agent::ClaudeCode.target_path(Scope::Global, &home);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            super::marrow_skill_package_md()
+        );
+    }
+
+    #[test]
+    fn install_skill_claude_code_reports_refreshed_when_only_legacy_file_changes() {
+        // Package already current; the only on-disk change is removing the
+        // superseded flat file — surface that as Refreshed, not PreservedExisting.
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        let target = Agent::ClaudeCode.target_path(Scope::Global, &home);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, super::marrow_skill_package_md()).unwrap();
+        let legacy = home.join(".claude/skills/marrow-optimization.md");
+        fs::write(&legacy, LEGACY_STALE_MARROW_CORE_SKILL_MD).unwrap();
+
+        let status =
+            super::install_skill(Agent::ClaudeCode, Scope::Global, Method::WriteFile, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::Refreshed);
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn install_skill_claude_code_preserves_custom_flat_file() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        let legacy = home.join(".claude/skills/marrow-optimization.md");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let custom = "# My own Marrow notes\nAsk before indexing.\n";
+        fs::write(&legacy, custom).unwrap();
+
+        let status =
+            super::install_skill(Agent::ClaudeCode, Scope::Global, Method::WriteFile, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::Written);
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), custom);
+    }
+
+    #[test]
+    fn install_skill_claude_code_preserves_user_authored_skill_md() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("fake_home");
+        let target = Agent::ClaudeCode.target_path(Scope::Global, &home);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let custom = "---\nname: marrow-optimization\n---\n# Team rules\n";
+        fs::write(&target, custom).unwrap();
+
+        let status =
+            super::install_skill(Agent::ClaudeCode, Scope::Global, Method::WriteFile, &home)
+                .unwrap();
+
+        assert_eq!(status, InstallStatus::PreservedExisting);
+        assert_eq!(fs::read_to_string(&target).unwrap(), custom);
     }
 
     #[test]

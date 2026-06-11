@@ -2218,12 +2218,10 @@ const AGENT_SKILL_TARGETS: &[AgentSkillTarget] = &[
         scope_support: RuleFileSupport::ProjectOnly,
     },
     // ── Upstream non-universal targets with intentional MCP overlap ────────
-    AgentSkillTarget {
-        name: "Claude Code",
-        aliases: &["claude-code"],
-        skills_dir: ".claude/skills",
-        scope_support: RuleFileSupport::ProjectOnly,
-    },
+    // (Claude Code is intentionally absent: its rule file is the SKILL.md
+    // package owned by skills::Agent::ClaudeCode via INTEGRATION_TARGETS; a
+    // skills_dir entry here would re-create the legacy flat file Claude Code
+    // never loads.)
     AgentSkillTarget {
         name: "Roo Code",
         aliases: &["roo-code", "roo"],
@@ -5553,8 +5551,8 @@ mod tests {
     #[test]
     fn agent_skill_targets_minimum_count() {
         assert!(
-            AGENT_SKILL_TARGETS.len() >= 40,
-            "expected >= 40 agent skill targets, got {}",
+            AGENT_SKILL_TARGETS.len() >= 39,
+            "expected >= 39 agent skill targets, got {}",
             AGENT_SKILL_TARGETS.len()
         );
     }
@@ -5581,7 +5579,7 @@ mod tests {
         // Intentional overlap is allowed for these agents that appear in both
         // INTEGRATION_TARGETS (MCP config) and AGENT_SKILL_TARGETS (skill path).
         let overlap_allowed: std::collections::HashSet<&str> =
-            ["claudecode", "roocode", "windsurf"].into_iter().collect();
+            ["roocode", "windsurf"].into_iter().collect();
         for target in AGENT_SKILL_TARGETS {
             let normalized = normalize_integration_name(target.name);
             if overlap_allowed.contains(normalized.as_str()) {
@@ -5724,11 +5722,13 @@ mod tests {
     }
 
     #[test]
-    fn combined_target_lookup_claude_code_dual_hit() {
+    fn combined_target_lookup_claude_code_mcp_only_with_rule_agent() {
         let (mcp, skill) = combined_target_lookup("Claude Code");
-        assert!(mcp.is_some(), "Claude Code should be an MCP target");
-        assert!(skill.is_some(), "Claude Code should also be a skill target");
-        assert_eq!(skill.unwrap().skills_dir, ".claude/skills");
+        let mcp = mcp.expect("Claude Code should be an MCP target");
+        // The rule file is the SKILL.md package owned by skills::Agent::ClaudeCode;
+        // a duplicate AgentSkillTarget would re-create the legacy flat file.
+        assert!(skill.is_none(), "Claude Code must not be a skill target");
+        assert_eq!(mcp.rule_agent, Some(skills::Agent::ClaudeCode));
     }
 
     #[test]
@@ -8552,8 +8552,12 @@ fn cmd_integrate(args: &[String]) -> Result<()> {
             .into_owned();
         let home_path = PathBuf::from(&home);
 
-        // Resolve (scope, method) pair: prompt if we have a skill target, otherwise default.
-        let (scope, method) = if skill_target.is_some() {
+        // Resolve (scope, method) pair: prompt whenever a rule file will be
+        // written — either a skill target or an MCP target with a rule agent —
+        // otherwise default. NotTTY falls back to (Project, WriteFile).
+        let writes_rule_files =
+            skill_target.is_some() || mcp_target.is_some_and(|target| target.rule_agent.is_some());
+        let (scope, method) = if writes_rule_files {
             let scope = match inquire::Select::new(
                 "Rule file scope",
                 vec!["Global (recommended)", "Project"],
