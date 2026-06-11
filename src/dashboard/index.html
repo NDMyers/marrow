@@ -3058,6 +3058,7 @@
   let treeDragOffsetX = 0;
   let treeDragOffsetY = 0;
   let treeSearchTimer = null;
+  let treeCollapsedDirs = new Set();
   let treeFileGroups  = {};
   let treeFileColors  = {};
   let treeFileEntries = [];
@@ -3179,6 +3180,7 @@
     treeAllEdges = [];
     treeFocusId = null;
     treeActivePath = null;
+    treeCollapsedDirs = new Set();
     treeNodeById = {};
     treeFileGroups = {};
     treeFileEntries = [];
@@ -3784,9 +3786,11 @@
       if (!cur[fname]) cur[fname] = { __children: {}, __isDir: false, __path: fp };
     });
 
-    function renderNode(obj, name, depth, isDir) {
+    function renderNode(obj, name, depth, isDir, dirPath) {
       const div = document.createElement('div');
       div.className = 'dir-item ' + (isDir ? 'dir-dir' : 'dir-file');
+
+      const collapsed = isDir && treeCollapsedDirs.has(dirPath);
 
       const indent = document.createElement('span');
       indent.className = 'dir-item-indent';
@@ -3795,7 +3799,7 @@
 
       const icon = document.createElement('span');
       icon.className = 'dir-item-icon';
-      icon.textContent = isDir ? '▸ ' : '';
+      icon.textContent = isDir ? (collapsed ? '▸ ' : '▾ ') : '';
       div.appendChild(icon);
 
       const label = document.createElement('span');
@@ -3803,13 +3807,21 @@
       label.textContent = name;
       div.appendChild(label);
 
-      if (!isDir && obj.__path) {
+      if (isDir) {
+        div.onclick = () => {
+          if (treeCollapsedDirs.has(dirPath)) treeCollapsedDirs.delete(dirPath);
+          else treeCollapsedDirs.add(dirPath);
+          treeRebuildDirTree();
+        };
+      } else if (obj.__path) {
         const fp = obj.__path;
         const cnt = (fileNodeMap[fp] || []).length;
         const badge = document.createElement('span');
         badge.style.cssText = 'margin-left:auto;padding-right:6px;font-size:9px;color:var(--dim);flex-shrink:0';
         badge.textContent = cnt;
         div.appendChild(badge);
+
+        if (treeActivePath === fp) div.classList.add('dir-active');
 
         div.onclick = () => {
           treeFocusId = null;
@@ -3824,12 +3836,15 @@
 
       container.appendChild(div);
 
+      if (collapsed) return;
+
       // Render children (dirs first, then files)
       const kids = obj.__children || {};
       const dirs  = Object.entries(kids).filter(([, v]) => v.__isDir);
       const files = Object.entries(kids).filter(([, v]) => !v.__isDir);
       [...dirs, ...files].forEach(([childName, childObj]) => {
-        renderNode(childObj, childName, depth + 1, childObj.__isDir);
+        renderNode(childObj, childName, depth + 1, childObj.__isDir,
+                   childObj.__isDir ? (dirPath ? dirPath + '/' + childName : childName) : null);
       });
     }
 
@@ -3837,7 +3852,7 @@
     const dirs  = Object.entries(tree).filter(([, v]) => v.__isDir);
     const files = Object.entries(tree).filter(([, v]) => !v.__isDir);
     [...dirs, ...files].forEach(([name, obj]) => {
-      renderNode(obj, name, 0, obj.__isDir);
+      renderNode(obj, name, 0, obj.__isDir, obj.__isDir ? name : null);
     });
   }
 
