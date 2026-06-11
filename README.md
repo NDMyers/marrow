@@ -5,27 +5,28 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Install size](https://packagephobia.com/badge?p=@nickm-swe/marrow)
 
-Marrow is a high-performance, local, and language-agnostic context compiler and Model Context Protocol (MCP) server written in Rust.
+Marrow is a high-performance, local, and language-agnostic context compiler and Model Context Protocol (MCP) server written in Rust. It parses your codebase with `tree-sitter`, builds a cross-repository dependency graph in a local SQLite database, and serves deterministic structural context — callers, blast radius, condensed code capsules — to AI coding agents. No embeddings, no provider SDKs, no network calls.
 
-## Quick Install
+## Install
 
 ```bash
 npm install -g @nickm-swe/marrow
 ```
 
-Automatic binary download and integrity verification for macOS, Linux, and Windows.
+The npm installer downloads a verified (SHA256) release binary for macOS, Linux, or Windows. To build from source instead, see [Building from source](#building-from-source).
 
-## Quick Example
+## Quick start
 
 ```bash
-marrow init                                                      # Workspace setup
-marrow index                                                     # Index current directory
+marrow init                                                      # workspace setup (.marrow/, .marrowrc.json)
+marrow index                                                     # index the current directory
 marrow context "trace request flow" --repo my_repo --format markdown
+marrow integrate                                                 # wire Marrow into your editor/agent
 ```
 
 ## Commands
 
-Run `marrow` with no arguments for an interactive TUI menu, or `marrow --help` for the full list. The most common subcommands:
+Run `marrow` with no arguments for an interactive TUI menu, or `marrow --help` for the full list.
 
 | Command | Purpose |
 |---------|---------|
@@ -36,6 +37,7 @@ Run `marrow` with no arguments for an interactive TUI menu, or `marrow --help` f
 | `marrow context <task>` | Compile a provider-neutral context packet (markdown/JSON). |
 | `marrow query <symbol> <repo_id>` | Print a symbol's context capsule plus impact analysis. |
 | `marrow benchmark [<symbol> <repo_id>]` | Token-reduction benchmark (interactive wizard when run bare). |
+| `marrow perf-harness` | Ingest + query performance benchmark (`--json` for machine output). |
 | `marrow integrate` | Write/print MCP setup for supported agent targets. |
 | `marrow validate` | Check workspace setup and integration config. |
 | `marrow maintenance` | WAL checkpoint + `incremental_vacuum` on `graph.db`. |
@@ -43,208 +45,101 @@ Run `marrow` with no arguments for an interactive TUI menu, or `marrow --help` f
 | `marrow daemon [install\|uninstall\|status]` | Background daemon and autostart management. |
 | `marrow status` / `marrow stop` | Show or stop the background daemon. |
 
-## Overview
+## How it works
 
-Marrow operates by ingesting source code from multiple programming languages (C++, Python, TypeScript, Rust, and Ruby) using `tree-sitter`. It constructs a unified, cross-repository dependency graph and stores it in an optimized local SQLite database (`.marrow/graph.db`). Instead of relying on vector embeddings, provider SDKs, or external graph databases, Marrow uses deterministic graph queries and code condensation to provide AI agents with structural context and dependency insight.
+Marrow ingests source code in C++, Python, TypeScript/TSX, Rust, and Ruby using `tree-sitter`, with parallel file processing via Rayon. It constructs a unified, cross-repository dependency graph in an optimized local SQLite database (`.marrow/graph.db`, WAL mode). Instead of vector embeddings or external graph databases, Marrow answers structural questions with deterministic graph queries:
 
-## Core Capabilities
+- **Impact analysis (blast radius):** recursive SQLite CTEs map the downstream impact of a proposed change across all files and repositories, with `file:line` locations on every caller row.
+- **Condensed context capsules:** large function and class bodies are replaced with condensed signatures, preserving structural boundaries while minimizing token consumption.
+- **Provider-neutral context packets:** `marrow context <task> --repo <repo_id> [--budget <tokens>] [--format markdown|json] [--profile local-8k|local-32k|cloud-cost-sensitive]` compiles deterministic packets with routing guidance, exact source spans, condensed neighbors, token accounting, freshness, and provenance. See [docs/context-packets.md](docs/context-packets.md).
+- **Multi-repo edge resolution:** cross-repo references and import edges are resolved within a shared workspace.
 
-- **Frictionless Workspace Initialization:** Rapidly ingests local codebases via parallel file processing with simple `marrow init` and `marrow index` commands.
-- **Universal Ingestion Pipeline:** Natively supports mapping complex symbol definitions and cross-file relationships across multiple languages.
-- **Deep Impact Analysis (Blast Radius):** Employs SQLite recursive Common Table Expressions (CTEs) to map the downstream impact of a proposed code change across all files and repositories.
-- **Condensed Context Capsules:** Replaces large function and class bodies with condensed signatures, preserving critical structural boundaries while minimizing token consumption.
-- **Provider-Neutral Context Packets:** `marrow context` compiles deterministic markdown or JSON packets with routing guidance, exact source spans, condensed neighbors, token accounting, freshness, and provenance for any agent harness.
-- **Multi-Repo Edge Resolution:** Intelligently resolves and tracks cross-repo references and import edges within a shared workspace.
+All MCP tool responses are budget-capped (32 KB defaults for dependency graphs, batch exploration, and skeletons) so structural answers stay cheap to inject into an agent's context.
 
-## Technology Stack
+## Measured performance
 
-- **Language:** Rust (2021 edition)
-- **Parser:** `tree-sitter` (Rust bindings with dynamic language loading)
-- **Database:** SQLite (`rusqlite` in WAL mode) for high-throughput batch inserts and fast spatial graph queries.
-- **Protocol:** Official Model Context Protocol (MCP) SDK over stdio.
+We A/B-tested Marrow against native grep/read tooling in Claude Code on this repository (June 2026): identical structural question ("what calls `ingest_repo` and what breaks if its signature changes?"), same model (Sonnet 4.6), exact API-reported token counts. Full methodology and session IDs are in [BENCHMARK_TOKEN_COST_INVESTIGATION.md](BENCHMARK_TOKEN_COST_INVESTIGATION.md); reproduce with `tools/cc_audit.py`.
 
-## Local development
+| Arm | Tool calls | Input tokens | Cost | Fact coverage |
+|-----|-----------:|-------------:|-----:|:-------------:|
+| Marrow (free tool choice) | 7 | 148K | $0.224 | 7/8 |
+| Native grep/read | 16–18 | 368–445K | $0.34 | 4–6/8 |
 
-**Prerequisites:** A stable Rust toolchain (`rustup` recommended) and a working C compiler/toolchain (required for `tree-sitter` native code):
+With Marrow available, the agent answered with **34% lower cost, 61% fewer tool calls, and higher answer accuracy** than the native-tools baseline — one structural `analyze_impact` call replaced a multi-step grep/read hunt.
+
+The same investigation drove output-budgeting fixes (`file:line` on all structural rows, 32 KB response caps, quieter routing notices). Re-running the identical worst-case prompt after those fixes cut its cost **59.5%** ($0.627 → $0.254) and its tool calls **81.5%** (27 → 5), with zero failed calls.
+
+Caveats: these are small-n runs (one repository, one question per arm) measured during local development — treat them as indicative, not universal. For token-reduction claims about your own graph, run `marrow benchmark --precise-file-tokens <symbol> <repo_id>` for exact, reproducible cl100k_base counts.
+
+## Agent integrations
+
+`marrow integrate` uses an internal registry of MCP setup targets, in three tiers:
+
+- **Automatic config writers** (verified merge formats, config written for you): Claude Code, Antigravity, Antigravity CLI (`agy`), Cursor, GitHub Copilot, Cline, and Zed. The Antigravity CLI writer registers Marrow in the shared `~/.gemini/config/mcp_config.json`, which the Antigravity IDE also reads.
+- **Guided targets** (listed by the installer with printed setup instructions, no speculative config writes): Windsurf, Continue, Roo Code, Goose, OpenHands, OpenClaw, Codex CLI, Gemini CLI, JetBrains AI Assistant, JetBrains Junie, and LM Studio.
+- **Secondary guided targets** (configuration guidance only): Kilo Code, Sourcegraph Amp, and Augment Code.
+
+Model/runtime backends such as Ollama, llama.cpp, vLLM, SGLang, LiteLLM, Ramalama, and Docker Model Runner are not `marrow integrate` destinations — use them behind an MCP-capable agent or host that launches `marrow mcp`.
+
+## Configuration
+
+Marrow runs with sensible defaults; everything is tunable through environment variables (SQLite cache size, ingest parallelism, per-file size caps, capsule/impact payload limits, response budgets). See [docs/configuration.md](docs/configuration.md) for the full reference. The most commonly adjusted:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MARROW_DB_PATH` | `.marrow/graph.db` | Graph database location. |
+| `MARROW_MAX_FILE_BYTES` | 2 MiB | Skip oversized (usually generated) files before parse. |
+| `MARROW_INGEST_THREADS` | `min(8, max(2, cores))` | Parallel ingest workers; lower to reduce peak RAM. |
+| `MARROW_IMPACT_MAX_ROWS` | `5000` | Max rows returned by `analyze_impact`. |
+
+## Building from source
+
+**Prerequisites:** a stable Rust toolchain (`rustup` recommended) and a working C compiler for `tree-sitter` native code:
 
 - **macOS:** Xcode Command Line Tools (`xcode-select --install`).
 - **Linux:** a C toolchain such as `build-essential` (Debian/Ubuntu) or the `gcc`/`clang` equivalents for your distro.
 - **Windows:** the MSVC build tools (Visual Studio Build Tools with the "Desktop development with C++" workload) used by the default `*-pc-windows-msvc` Rust toolchain.
 
-**Build (from the repository root):**
-
-```bash
-cargo build              # debug binary: target/debug/marrow
-cargo build --release    # release binary: target/release/marrow
-```
-
-**Run without installing** (same args as the installed binary):
-
-```bash
-cargo run -- mcp                    # MCP stdio server (typical for editor integration)
-cargo run -- init                   # workspace setup
-cargo run -- index                  # ingest current tree (same pipeline as MCP ingest_repo)
-cargo run -- context "trace request flow" --repo my_repo --format markdown
-cargo run -- maintenance            # WAL checkpoint + incremental_vacuum on graph.db
-cargo run -- test-capsules        # capsule validation
-```
-
-**Context packets:** `marrow context <task> --repo <repo_id> --budget <tokens> --format markdown|json --profile local-8k|local-32k|cloud-cost-sensitive` reads only the local SQLite/tree-sitter graph and source files. It does not call model providers, intercept native tools, use embeddings, or perform semantic search. See [docs/context-packets.md](docs/context-packets.md).
-
-## Integration Targets
-
-`marrow integrate` uses an internal registry of setup-facing MCP targets. Verified automatic config writers are limited to Claude Code, Antigravity, Antigravity CLI (`agy`), Cursor, GitHub Copilot, Cline, and Zed. Those writers preserve the current supported JSON paths and merge formats. The Antigravity CLI writer registers Marrow in the shared `~/.gemini/config/mcp_config.json`, which the Antigravity IDE also reads.
-
-First-class guided targets are listed by the installer but do not receive speculative config writes: Windsurf, Continue, Roo Code, Goose, OpenHands, OpenClaw, Codex CLI, Gemini CLI, JetBrains AI Assistant, JetBrains Junie, and LM Studio. OpenClaw is treated as a first-class self-hosted MCP host; until a stable config path and merge format are verified, Marrow prints setup guidance instead of creating hidden IDE or YAML/TOML files.
-
-Secondary guided targets are Kilo Code, Sourcegraph Amp, and Augment Code. They are surfaced as configuration guidance targets, not as fully automated integrations.
-
-Compatibility-only model/runtime backends are not `marrow integrate` destinations: Ollama, llama.cpp, vLLM, SGLang, LiteLLM, Ramalama, and Docker Model Runner. Use them behind an MCP-capable agent, client, or host that launches `marrow mcp`.
-
-**Checks (optional):**
-
-```bash
-cargo check
-cargo clippy -- -D warnings
-```
-
-**Memory tuning (SQLite + ingestion):** Marrow caps SQLite page cache and disables memory-mapped I/O by default so a large `graph.db` is less likely to show as 10+ GB in your OS process monitor (Activity Monitor, Task Manager, `top`/`htop`). Override when needed:
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `MARROW_SQLITE_CACHE_KIB` | `32768` (32 MiB) | SQLite `cache_size` (negative KiB). Lower → less idle RSS; higher → faster queries. |
-| `MARROW_SQLITE_MMAP_BYTES` | `0` | `PRAGMA mmap_size` in bytes; `0` disables mmap. Set positive to re-enable mmap for throughput. |
-| `MARROW_MAX_FILE_BYTES` | `2097152` (2 MiB) | Skip files larger than this before tree-sitter parse. Large generated files (GraphQL schemas, protobuf outputs, bundled JS) produce ASTs 3–10× source size in each parallel worker; skipping them prevents multi-GB RSS spikes with zero loss of architectural signal. |
-| `MARROW_INGEST_THREADS` | `min(8, max(2, cores))` | Rayon workers for hash/parse during ingest; fewer workers lower peak RAM during full reindex. |
-| `MARROW_INGEST_PARSE_QUEUE` | `64` | Max parsed files in the bounded channel between Rayon workers and a drainer thread (serialized to a temp spill file); lower → lower peak RSS on huge reindexes, more back-pressure on workers. Spill reads cap blob size (64 MiB per field) and symbol count per row to limit corrupt-file DoS. |
-| `MARROW_SKIP_POST_INGEST_MAINTENANCE` | *(unset)* | If non-empty, skip WAL checkpoint + `incremental_vacuum` after ingest (faster huge reindexes). Run `marrow maintenance` later. |
-| `MARROW_CROSS_REPO_FULL_SCAN` | *(unset)* | If `1`/`true`/`yes`, scan **all** repos for cross-repo `IMPORTS` after each ingest (legacy). Default: only the repo that was just indexed. |
-| `MARROW_CAPSULE_MAX_OUTBOUND` | `500` | Max outbound edges loaded per capsule / trace (RAM bound). |
-| `MARROW_CAPSULE_ORIGINAL_MODE` | `none` | `none` (default): do not load touched files into MCP `original_text` (saves RAM). `full`: legacy concatenation of full files (see `MARROW_CAPSULE_ORIGINAL_MAX_BYTES`). |
-| `MARROW_CAPSULE_ORIGINAL_LEGACY` | *(unset)* | If `1`/`true`/`yes`, alias for `MARROW_CAPSULE_ORIGINAL_MODE=full` (one-release shim). |
-| `MARROW_CAPSULE_ORIGINAL_MAX_BYTES` | *(unset)* | **Only when mode is `full`.** Cap total bytes for `original_text`. Uses file `metadata().len()` before reading; skips files that would exceed the budget. Unset = unlimited concat (can spike RAM). |
-| `MARROW_CAPSULE_PROOF_MAX_BYTES` | `16384` | Default-mode dashboard proof snapshot cap. This bounded evidence is cached for compare; it is not returned as MCP `original_text`. |
-| `MARROW_CAPSULE_PROOF_MAX_FILES` | `8` | Max touched files included in the default-mode proof snapshot. More touched files are deterministically sampled and labeled as partial. |
-| `MARROW_CAPSULE_MAX_INBOUND_LOAD` | `64` | Max inbound rows loaded from DB (display still capped at 10). |
-| `MARROW_IMPACT_MAX_ROWS` | `5000` | Max rows returned by `analyze_impact`. |
-
-**Capsule benchmark:** `marrow benchmark <symbol> <repo_id>` keeps the scriptable benchmark path and uses the same labeled `file_tokens` baseline as the MCP tools (metadata `len/4` estimate when `MARROW_CAPSULE_ORIGINAL_MODE` is `none`). Add `--precise-file-tokens` for evidence-grade cl100k_base counts summed per touched file (streams one file at a time; no full concat). In an interactive terminal, `marrow benchmark` opens a guided wizard for repository selection, symbol search/filtering, and benchmark mode selection. Choose estimated mode for the default provenance labels, or exact proof mode for the same behavior as `--precise-file-tokens`. Benchmark output includes the symbol, repo ID, tokenizer mode, original/proof modes, precise-token setting, and active caps so reported reductions can be reproduced for the same graph and environment.
-
-Dashboard reduction cards are operational estimates unless the provenance label says otherwise. Use `marrow benchmark --precise-file-tokens <symbol> <repo_id>` or `marrow perf-harness --precise-file-tokens --json` for exact, reproducible token claims.
-
-**Post-ingest DB maintenance:** After a large ingest, or if you used `MARROW_SKIP_POST_INGEST_MAINTENANCE`, run:
-
-```bash
-marrow maintenance
-```
-
-Uses `MARROW_DB_PATH` or defaults to `.marrow/graph.db`. Capsule and impact payload limits are documented inline in the source (see `MARROW_CAPSULE_*` and `MARROW_IMPACT_MAX_ROWS` above).
-
-## Rebuild & deploy
-
-Use this whenever you pull changes or modify Marrow source code and need to get the new binary live.
-
-### Full rebuild + install (most common)
-
-```bash
-# 1. From the marrow repo root (wherever you cloned it).
-
-# 2. Verify it compiles cleanly:
-cargo check
-
-# 3. Run the test suite:
-cargo test
-
-# 4. Build optimised release binary and install to the Cargo bin dir:
-cargo install --path .
-```
-
-`cargo install --path .` compiles with full optimisations and replaces the installed
-binary in one step. It installs to Cargo's bin directory — `~/.cargo/bin/marrow` on
-macOS/Linux, `%USERPROFILE%\.cargo\bin\marrow.exe` on Windows. No separate copy step needed.
-
-### Pick up the new binary in your editor / agents
-
-Marrow is launched fresh as a stdio subprocess each time an agent session starts, so
-**no daemon restart is required** — just reload/restart the editor window (or the agent
-session) and the next `marrow mcp` spawn will use the newly installed binary.
-
-If the dashboard (`marrow ui`) is running as a persistent background process, restart it:
-
-```bash
-marrow stop   # stop background daemon if running
-marrow ui     # re-open dashboard (optional)
-```
-
-### Quick iteration (skip install)
-
-If you only want to test a change without overwriting the installed binary:
-
-```bash
-cargo build --release                 # builds target/release/marrow(.exe)
-cargo run --release -- index          # run any subcommand against the uninstalled binary
-# or invoke it directly:
-#   macOS/Linux: ./target/release/marrow index
-#   Windows:     .\target\release\marrow.exe index
-```
-
-### Lint + test only (no build)
+**Build, test, and install:**
 
 ```bash
 cargo check                    # fast syntax + type check
 cargo clippy -- -D warnings    # lint; must produce zero warnings
-cargo test                     # run the full test suite
+cargo test                     # full test suite
+cargo install --path .         # optimized build, installed to Cargo's bin dir
 ```
 
-### After a large re-index
+`cargo install --path .` places the `marrow` executable in `~/.cargo/bin` (macOS/Linux) or `%USERPROFILE%\.cargo\bin` (Windows); ensure that directory is on your `PATH`.
 
-If you just rebuilt and re-ran `marrow index` against a large codebase, run the post-ingest
-maintenance pass to reclaim WAL space:
+**Quick iteration without installing:**
 
 ```bash
-marrow maintenance
+cargo build --release          # builds target/release/marrow(.exe)
+cargo run --release -- index   # run any subcommand against the uninstalled binary
 ```
 
-## Global install
+**Picking up a new binary:** agents launch `marrow mcp` as a fresh stdio subprocess each session, so no daemon restart is needed — reload your editor window or restart the agent session. If the dashboard daemon is running, `marrow stop` then `marrow ui` restarts it.
 
-**Global install** (puts the binary on your PATH via Cargo's bin directory, which must be on `PATH`):
+After re-indexing a large codebase, run `marrow maintenance` to checkpoint the WAL and reclaim space.
 
-```bash
-cargo install --path .
-```
+## Desktop app and daemon
 
-This installs the **`marrow`** executable into Cargo's bin directory — `~/.cargo/bin` on
-macOS/Linux, `%USERPROFILE%\.cargo\bin` on Windows. Ensure that directory is on your `PATH`.
-
-The npm package (`npm install -g @nickm-swe/marrow`) downloads a verified GitHub release binary and does not register desktop app entries by default. Run `marrow ui-app enable` explicitly if you want desktop app registration.
-
-## Desktop Autostart And Packages
-
-Daemon autostart is opt-in and separate from desktop app registration.
+Daemon autostart is opt-in and separate from desktop app registration:
 
 ```bash
-marrow daemon install
+marrow daemon install          # enable autostart
 marrow daemon status
 marrow daemon uninstall
 ```
 
-`marrow ui-app enable` registers the desktop application entry points only; it does not enable daemon autostart. The temporary compatibility alias below still works for one release and has the same effect as `marrow daemon install`:
+`marrow ui-app enable` registers the desktop application entry points only; it does not enable daemon autostart. The npm package does not register desktop app entries by default. (`marrow service install` remains a one-release compatibility alias for `marrow daemon install`.)
 
-```bash
-marrow service install
-```
+Native package outputs are built by repository scripts and published alongside the npm tarball:
 
-Native package outputs are repository-defined and additive to the existing npm tarball flow:
-
-- macOS: `Marrow-{version}-aarch64-apple-darwin.dmg` and `Marrow-{version}-x86_64-apple-darwin.dmg`
-- Linux: `marrow_{version}_amd64.deb` and `Marrow-{version}-x86_64.AppImage`
+- macOS: `Marrow-{version}-aarch64-apple-darwin.dmg`, `Marrow-{version}-x86_64-apple-darwin.dmg` (`scripts/package-macos-dmg.sh`)
+- Linux: `marrow_{version}_amd64.deb`, `Marrow-{version}-x86_64.AppImage` (`scripts/stage-linux-package-assets.sh`, `scripts/package-linux-appimage.sh`)
 - Windows: `Marrow-{version}-x86_64-pc-windows-msvc.msi`
 
-Repository packaging helpers:
+## License
 
-```bash
-scripts/package-macos-dmg.sh --target aarch64-apple-darwin --out-dir dist
-scripts/package-macos-dmg.sh --target x86_64-apple-darwin --out-dir dist
-scripts/stage-linux-package-assets.sh --target x86_64-unknown-linux-gnu --out-dir target/package-assets/linux
-scripts/package-linux-appimage.sh --target x86_64-unknown-linux-gnu --out-dir dist
-```
+MIT — see [LICENSE](LICENSE).
