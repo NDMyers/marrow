@@ -29,6 +29,10 @@ env/
 # Marrow runtime data (graph.db, daemon socket, watcher state)
 .marrow/
 
+# Local `marrow integrate` dogfooding artifacts (per-machine agent configs)
+.agents/
+tools/marrow-mcp.json
+
 # Build / distribution outputs
 dist/
 out/

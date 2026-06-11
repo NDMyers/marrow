@@ -14,7 +14,8 @@
   "author": "NDMyers <99777840+NDMyers@users.noreply.github.com>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NDMyers/marrow.git"
+    "url": "git+https://github.com/NDMyers/marrow.git",
+    "directory": "npm"
   },
   "homepage": "https://github.com/NDMyers/marrow#readme",
   "bugs": {
@@ -43,5 +44,14 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
 }

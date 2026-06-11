@@ -10,7 +10,7 @@ Marrow is a high-performance, local, and language-agnostic context compiler and 
 ## Install
 
 ```bash
-npm install -g @nickm-swe/marrow
+npm install -g @nickm-swe/marrow@alpha
 ```
 
 The npm installer downloads a verified (SHA256) release binary for macOS, Linux, or Windows. To build from source instead, see [Building from source](#building-from-source).
@@ -79,7 +79,7 @@ Caveats: these are small-n runs (one repository, one question per arm) measured 
 - **Guided targets** (listed by the installer with printed setup instructions, no speculative config writes): Windsurf, Continue, Roo Code, Goose, OpenHands, OpenClaw, Codex CLI, Gemini CLI, JetBrains AI Assistant, JetBrains Junie, and LM Studio.
 - **Secondary guided targets** (configuration guidance only): Kilo Code, Sourcegraph Amp, and Augment Code.
 
-Model/runtime backends such as Ollama, llama.cpp, vLLM, SGLang, LiteLLM, Ramalama, and Docker Model Runner are not `marrow integrate` destinations — use them behind an MCP-capable agent or host that launches `marrow mcp`.
+Model/runtime backends such as Ollama, llama.cpp, vLLM, SGLang, LiteLLM, Ramalama, and Docker Model Runner are compatibility-only: they are not `marrow integrate` destinations — use them behind an MCP-capable agent or host that launches `marrow mcp`.
 
 ## Configuration
 

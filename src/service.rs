@@ -4,6 +4,7 @@ use std::{
     process::Command,
 };
 
+#[cfg(any(target_os = "macos", test))]
 const MACOS_LABEL: &str = "dev.marrow.daemon";
 #[cfg(target_os = "linux")]
 const LINUX_UNIT_NAME: &str = "marrow-daemon.service";
@@ -200,6 +201,7 @@ fn uninstall_macos() -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn generate_plist(exe: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -518,6 +520,7 @@ fn run_optional_command(binary: &str, args: &[&str], warning: Option<String>) {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn home_dir() -> Result<PathBuf> {
     dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))
 }
