@@ -16,9 +16,17 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-/// Helper: path to the compiled (default features) binary.
-fn marrow_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_marrow")
+/// Helper: command for the compiled (default features) binary, with the
+/// workspace registry redirected to a scratch path so test runs never
+/// pollute the user's real ~/.marrow/registry.db (HOME overrides don't
+/// redirect dirs::home_dir() on Windows).
+fn marrow_cmd() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_marrow"));
+    command.env(
+        "MARROW_REGISTRY_PATH",
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("desktop_app_hosting-registry.db"),
+    );
+    command
 }
 
 // ─── AC-1: daemon binds 127.0.0.1:8765 serving dashboard routes + IPC ────────
@@ -28,7 +36,7 @@ fn ac1_daemon_starts_and_serves_dashboard_on_8765() {
     // Start daemon in a tempdir so it uses a clean DB.
     let tmpdir = tempfile::tempdir().unwrap();
 
-    let mut daemon = Command::new(marrow_bin())
+    let mut daemon = marrow_cmd()
         .arg("daemon")
         .current_dir(tmpdir.path())
         .stdin(Stdio::null())
@@ -69,7 +77,7 @@ fn ac1_daemon_starts_and_serves_dashboard_on_8765() {
     }
 
     // Secondary verification: check stderr for the dashboard binding message.
-    let output = Command::new(marrow_bin())
+    let output = marrow_cmd()
         .arg("daemon")
         .current_dir(tmpdir.path())
         .stdin(Stdio::null())
@@ -97,7 +105,7 @@ fn ac2_mcp_mode_does_not_bind_port_8765() {
     let tmpdir = tempfile::tempdir().unwrap();
 
     // Start the MCP server with stdin piped (it will exit when stdin closes).
-    let mut mcp = Command::new(marrow_bin())
+    let mut mcp = marrow_cmd()
         .arg("mcp")
         .current_dir(tmpdir.path())
         .stdin(Stdio::piped())
@@ -137,7 +145,7 @@ fn ac3_ui_app_open_compiled_in_default_features() {
     // bounded time, and treat "still running" as PASS (the launch path worked).
     let tmpdir = tempfile::tempdir().unwrap();
 
-    let mut child = Command::new(marrow_bin())
+    let mut child = marrow_cmd()
         .args(["ui-app", "open"])
         .current_dir(tmpdir.path())
         .stdin(Stdio::null())
@@ -209,7 +217,7 @@ fn ac3_ui_app_open_compiled_in_default_features() {
 
 #[test]
 fn ac5_ui_app_status_reports_state() {
-    let output = Command::new(marrow_bin())
+    let output = marrow_cmd()
         .args(["ui-app", "status"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -231,7 +239,7 @@ fn ac5_ui_app_status_reports_state() {
 #[test]
 fn ac5_ui_app_disable_is_noop_when_not_registered() {
     // Calling disable when not registered should not crash.
-    let output = Command::new(marrow_bin())
+    let output = marrow_cmd()
         .args(["ui-app", "disable"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -726,7 +734,7 @@ fn single_instance_lockfile_mechanism_exists() {
 #[test]
 #[ignore] // requires writable ~/Applications
 fn enable_creates_valid_icns() {
-    let output = std::process::Command::new(marrow_bin())
+    let output = marrow_cmd()
         .args(["ui-app", "enable"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -753,7 +761,7 @@ fn enable_creates_valid_icns() {
     );
 
     // Cleanup.
-    let _ = std::process::Command::new(marrow_bin())
+    let _ = marrow_cmd()
         .args(["ui-app", "disable"])
         .output();
 }
@@ -762,7 +770,7 @@ fn enable_creates_valid_icns() {
 #[test]
 #[ignore]
 fn enable_desktop_entry_has_icon_and_version() {
-    let output = std::process::Command::new(marrow_bin())
+    let output = marrow_cmd()
         .args(["ui-app", "enable"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -791,7 +799,7 @@ fn enable_desktop_entry_has_icon_and_version() {
     );
 
     // Cleanup.
-    let _ = std::process::Command::new(marrow_bin())
+    let _ = marrow_cmd()
         .args(["ui-app", "disable"])
         .output();
 }
@@ -800,7 +808,7 @@ fn enable_desktop_entry_has_icon_and_version() {
 #[test]
 #[ignore]
 fn enable_creates_valid_lnk() {
-    let output = std::process::Command::new(marrow_bin())
+    let output = marrow_cmd()
         .args(["ui-app", "enable"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -827,14 +835,14 @@ fn enable_creates_valid_lnk() {
     );
 
     // Cleanup.
-    let _ = std::process::Command::new(marrow_bin())
+    let _ = marrow_cmd()
         .args(["ui-app", "disable"])
         .output();
 }
 
 #[test]
 fn status_reports_app_path_and_launcher_target() {
-    let output = std::process::Command::new(marrow_bin())
+    let output = marrow_cmd()
         .args(["ui-app", "status"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

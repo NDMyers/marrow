@@ -20,9 +20,17 @@ fn read_repo_file(path: &str) -> String {
         .replace("\r\n", "\n")
 }
 
+/// Scratch registry path so spawned binaries never touch the user's real
+/// ~/.marrow/registry.db (HOME overrides don't redirect dirs::home_dir() on
+/// Windows). Explicit envs passed by a test still take precedence.
+fn scratch_registry_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sprint2-registry.db")
+}
+
 fn run_marrow(args: &[&str], envs: &[(&str, &Path)]) -> std::process::Output {
     let mut command = Command::new(marrow_bin());
     command.args(args);
+    command.env("MARROW_REGISTRY_PATH", scratch_registry_path());
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -34,6 +42,7 @@ fn run_marrow(args: &[&str], envs: &[(&str, &Path)]) -> std::process::Output {
 fn run_marrow_with_path(args: &[&str], home: &Path, path: &Path) -> std::process::Output {
     Command::new(marrow_bin())
         .args(args)
+        .env("MARROW_REGISTRY_PATH", scratch_registry_path())
         .env("HOME", home)
         .env("PATH", path)
         .output()
