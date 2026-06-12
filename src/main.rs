@@ -7967,7 +7967,8 @@ fn write_workspace_rule_files(
                 modified.push(path.display().to_string());
             }
             WriteMode::Symlink => {
-                let _central = central_rules_path.as_ref().expect("central path set above");
+                #[cfg_attr(not(unix), allow(unused_variables))]
+                let central = central_rules_path.as_ref().expect("central path set above");
                 if path.exists() || path.is_symlink() {
                     fs::remove_file(&path).ok();
                 }
