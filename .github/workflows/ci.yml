@@ -60,6 +60,12 @@ jobs:
 
   cargo-audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # audit-check reports results via the Checks API on push events;
+      # without checks:write it fails with "Resource not accessible by
+      # integration" even when the audit itself is clean.
+      checks: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # rustsec/audit-check — official RustSec advisory-db integration, pinned to v2.0.0
