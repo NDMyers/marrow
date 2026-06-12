@@ -93,7 +93,9 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
+          # macos-13 was retired from the hosted runner fleet (jobs queue
+          # forever); macos-15-intel is the free x64 successor label.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     permissions:
