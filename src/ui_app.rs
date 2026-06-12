@@ -237,7 +237,7 @@ pub fn enable() -> Result<()> {
         eprintln!(
             "[marrow] Warning: The binary appears to be in an npm cache directory.\n\
              Registration may break if the cache is cleared.\n\
-             Consider installing globally: npm install -g marrow"
+             Consider installing globally: npm install -g @nickm-swe/marrow@alpha"
         );
     }
 

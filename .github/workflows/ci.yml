@@ -20,6 +20,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Install Linux desktop build dependencies (wry/tao/tray-icon)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
       - run: cargo test
       - run: cargo clippy -- -D warnings
 
@@ -38,6 +42,10 @@ jobs:
           grep -q '"/usr/share/icons/hicolor/256x256/apps/marrow.png"' Cargo.toml
           test -f scripts/postinst
           bash -n scripts/postinst scripts/deb-postinst.sh scripts/stage-linux-package-assets.sh scripts/package-linux-appimage.sh scripts/package-macos-dmg.sh
+      - name: Install Linux desktop build dependencies (wry/tao/tray-icon)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
       - name: Stage Linux package assets
         run: |
           set -euo pipefail
@@ -55,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # rustsec/audit-check — official RustSec advisory-db integration, pinned to v2.0.0
-      - uses: rustsec/audit-check@057f4c4d04f8cb2e15c54c41a03a5a01e84e3b52 # v2.0.0
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -79,6 +87,10 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux desktop build dependencies (wry/tao/tray-icon)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
       - run: cargo build --release
       - name: perf-harness synthetic fixture + thresholds
         run: |

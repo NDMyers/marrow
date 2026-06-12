@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 authors = ["NDMyers <99777840+NDMyers@users.noreply.github.com>"]
 license = "MIT"
+description = "Local, deterministic AST context engine and MCP server that parses multi-language codebases into a dependency graph."
+repository = "https://github.com/NDMyers/marrow"
+homepage = "https://github.com/NDMyers/marrow"
+readme = "README.md"
+keywords = ["mcp", "ast", "tree-sitter", "llm", "context"]
+categories = ["development-tools", "command-line-utilities"]
 
 [package.metadata.deb]
 name = "marrow"
