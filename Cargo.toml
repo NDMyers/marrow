@@ -106,7 +106,7 @@ tempfile = "3"
 # Desktop application (feature-gated)
 wry = { version = "0.49", optional = true }
 tray-icon = { version = "0.19", optional = true }
-tao = { version = "0.33", optional = true }
+tao = { version = "0.35", optional = true }
 image = { version = "0.25", optional = true }
 # Not used directly: wry depends on cookie 0.18, whose blanket `From` impl
 # collides (E0119) with impls added in time 0.3.48. `cargo install` ignores
