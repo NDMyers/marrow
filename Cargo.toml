@@ -94,7 +94,7 @@ tokio-stream    = { version = "0.1", features = ["sync"] }
 futures-util    = "0.3"
 
 # Background file watching for live graph updates
-notify              = "7"
+notify              = "8"
 notify-debouncer-mini = "0.5"
 
 # `getrusage` for perf-harness RSS hint (MARROW-PERF-002)
