@@ -1,6 +1,6 @@
 [package]
 name = "marrow"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["NDMyers <99777840+NDMyers@users.noreply.github.com>"]
 license = "MIT"
@@ -108,13 +108,18 @@ wry = { version = "0.49", optional = true }
 tray-icon = { version = "0.19", optional = true }
 tao = { version = "0.33", optional = true }
 image = { version = "0.25", optional = true }
+# Not used directly: wry depends on cookie 0.18, whose blanket `From` impl
+# collides (E0119) with impls added in time 0.3.48. `cargo install` ignores
+# Cargo.lock and resolves to the latest `time`, so cap it below 0.3.48 here.
+# Remove once cookie ships a release that builds against time >= 0.3.48.
+time = { version = ">=0.3, <0.3.48", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 mslnk = { version = "0.1", optional = true }
 
 [features]
 default = ["desktop"]
-desktop = ["dep:wry", "dep:tray-icon", "dep:tao", "dep:image", "dep:mslnk"]
+desktop = ["dep:wry", "dep:tray-icon", "dep:tao", "dep:image", "dep:mslnk", "dep:time"]
 
 [dev-dependencies]
 hyper            = { version = "1", features = ["client", "http1"] }

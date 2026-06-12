@@ -2702,7 +2702,7 @@ impl ServerHandler for ContextEngine {
         ServerInfo {
             server_info: Implementation {
                 name: "marrow-ast-context-engine".to_string(),
-                version: "0.1.0".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 title: Some("Marrow".to_string()),
                 description: Some(
                     "Local, deterministic MCP server: parses multi-language codebases \
