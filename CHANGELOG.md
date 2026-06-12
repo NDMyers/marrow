@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-05-27
+## [0.1.0] - 2026-06-12
 
 ### Added
 
@@ -21,8 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `marrow init` — Workspace initialization
   - `marrow index` — Incremental repository ingestion
   - `marrow context` — Query and generate context packets (markdown/JSON)
+  - `marrow integrate` — Interactive installer that registers Marrow with MCP-capable agents and writes skill/rule files
   - `marrow benchmark` — Performance testing and profiling
   - `marrow maintenance` — WAL checkpoint and vacuum operations
+  - `marrow ui-app` — Desktop app registration and launch (`enable`/`open`/`disable`)
+  - `marrow daemon` — Opt-in background daemon with autostart install/uninstall
+  - `marrow perf-harness` — Reproducible ingest/query performance measurements (used by CI smoke thresholds)
 - **MCP Integration:**
   - Model Context Protocol (MCP) stdio server for agent integration
   - First-class support for Claude Code, Cursor, Cline, GitHub Copilot, Windsurf, Zed, and others
