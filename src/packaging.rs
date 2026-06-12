@@ -46,7 +46,8 @@ pub fn stage_macos_bundle(base_root: &Path, exe_path: &Path) -> Result<PathBuf> 
     icns_data.extend_from_slice(&png_data);
     std::fs::write(resources_dir.join("Marrow.icns"), icns_data)?;
 
-    let plist_content = r#"<?xml version="1.0" encoding="UTF-8"?>
+    let plist_content = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -57,15 +58,17 @@ pub fn stage_macos_bundle(base_root: &Path, exe_path: &Path) -> Result<PathBuf> 
     <key>CFBundleName</key>
     <string>Marrow</string>
     <key>CFBundleVersion</key>
-    <string>0.1.0</string>
+    <string>{version}</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>{version}</string>
     <key>CFBundleIconFile</key>
     <string>Marrow</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
 </dict>
-</plist>"#;
+</plist>"#,
+        version = env!("CARGO_PKG_VERSION")
+    );
     std::fs::write(app_path.join("Contents/Info.plist"), plist_content)?;
 
     let bundled_binary_path = app_dir.join("marrow");
