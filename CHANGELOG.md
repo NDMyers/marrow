@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `cargo install marrow` / `cargo install --path .` failing with E0119 in the transitive `cookie` crate: `time` 0.3.48 (published 2026-06-12) added trait impls that conflict with `cookie` 0.18's blanket `From` impl, and `cargo install` resolves dependencies fresh instead of using `Cargo.lock`. `time` is now capped below 0.3.48 (via an optional constraint dependency on the `desktop` feature) until `cookie` ships a compatible release.
+
 ## [0.1.0] - 2026-06-12
 
 ### Added
