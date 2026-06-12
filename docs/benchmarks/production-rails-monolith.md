@@ -72,9 +72,21 @@ pivoting on a spreadsheet-export module (identifiers lightly anonymized; the str
 condensation, and numbers are verbatim engine output).
 
 Without Marrow, an agent answering "how does XLSX export work?" reads the pivot file **plus
-the six files its dependencies live in — 206,591 characters (~51,600 tokens)**. Marrow's
-capsule delivers the same structural knowledge in **6,580 characters (~1,600 tokens): a 96.8%
-reduction** — full source for the pivot, signatures only for everything it touches:
+the six files its dependencies live in — 206,591 characters (~51,600 tokens)** (file names
+anonymized, sizes real):
+
+| File | Size |
+|---|---|
+| app/reports/exporters/xlsx.rb (pivot) | 5.3 KB |
+| app/reports/base_report.rb | 6.0 KB |
+| app/controllers/exports_controller.rb | 2.9 KB |
+| app/models/report.rb | 10.6 KB |
+| app/services/payment_gateway_service.rb | 26.0 KB |
+| test/reports/listing_report_test.rb | 29.2 KB |
+| test/reports/large_listing_test.rb | 126.5 KB |
+
+Marrow's capsule delivers the same structural knowledge in **6,580 characters (~1,600 tokens):
+a 96.8% reduction** — full source for the pivot, signatures only for everything it touches:
 
 ```text
 CONTEXT CAPSULE — pivot: Exporters (rb)
