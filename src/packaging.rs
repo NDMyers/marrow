@@ -11,6 +11,8 @@ const LINUX_UI_APP_OPEN_ARGS: &str = "ui-app open";
 #[cfg(all(feature = "desktop", target_os = "linux"))]
 pub struct LinuxDesktopAssets {
     pub desktop_path: PathBuf,
+    // Read only by tests today; kept so callers can locate the staged icon.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub icon_path: PathBuf,
 }
 
