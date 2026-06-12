@@ -71,7 +71,7 @@ jobs:
       - name: Build and Upload Binary
         # taiki-e/upload-rust-binary-action — third-party, pinned to v1.25.0
         # Exception: Widely-used Rust binary release action; monitored via Dependabot.
-        uses: taiki-e/upload-rust-binary-action@31389c348ad0130069bed8448bf507fe8617f67f # v1.25.0
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
           # (optional) Comma-separated list of binary names (non-extension portion of filename) to build and upload.
           # Note that glob pattern is not supported yet.
