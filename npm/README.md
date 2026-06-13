@@ -3,7 +3,7 @@
 Marrow is a local, deterministic Rust MCP server and CLI. The npm package is a thin wrapper that downloads the matching GitHub release archive, verifies it against `checksums.sha256`, extracts the `marrow` binary securely, and runs it from the package `dist/` directory.
 
 ```bash
-npm install -g @nickm-swe/marrow@alpha
+npm install -g @nickm-swe/marrow
 marrow mcp
 ```
 

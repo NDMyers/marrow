@@ -8,5 +8,5 @@ Use this checklist before publishing an alpha release.
 - Create a version tag and let the release workflow build GitHub release binaries and native packages.
 - Verify the workflow generated `checksums.sha256` after all installer-required archives were uploaded (all four `marrow-<target>.tar.gz`, including Windows).
 - Confirm the npm publish job completed `npm audit`, `npm pack --dry-run --json`, and publish dry-run before the alpha publish step.
-- Install the npm package in a clean environment with `npm install -g @nickm-swe/marrow@alpha` and run `marrow --help`; run `marrow ui-app enable` only when desktop registration is desired.
+- Install the npm package in a clean environment with `npm install -g @nickm-swe/marrow` and run `marrow --help`; run `marrow ui-app enable` only when desktop registration is desired.
 - Confirm the publish job moved the `latest` dist-tag to the new version (`npm view @nickm-swe/marrow dist-tags`). The website reads `latest` from the registry and shows the new version within an hour — no website change or deploy is needed for a release.
