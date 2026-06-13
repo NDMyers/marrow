@@ -10,7 +10,7 @@ Marrow is a high-performance, local, and language-agnostic context compiler and 
 ## Install
 
 ```bash
-npm install -g @nickm-swe/marrow@alpha
+npm install -g @nickm-swe/marrow
 ```
 
 The npm installer downloads a verified (SHA256) release binary for macOS, Linux, or Windows. To build from source instead, see [Building from source](#building-from-source).

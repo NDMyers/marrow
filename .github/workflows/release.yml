@@ -269,3 +269,5 @@ jobs:
       - run: npm pack --dry-run --json
       - run: npm publish --dry-run --access public --tag alpha
       - run: npm publish --access public --tag alpha --provenance
+      - name: Move latest dist-tag to this release
+        run: npm dist-tag add "@nickm-swe/marrow@${GITHUB_REF_NAME#v}" latest
