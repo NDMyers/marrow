@@ -1,0 +1,12 @@
+# Advisory exceptions for `cargo audit` (kept in sync with the `ignore` input
+# of the cargo-audit job in .github/workflows/ci.yml).
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0189: DNS rebinding in rmcp's Streamable HTTP server
+    # transport. Marrow builds rmcp with only server+macros+transport-io
+    # (stdio); the HTTP transport feature is not enabled and rmcp pulls no
+    # HTTP stack in Cargo.lock, so the affected code is not compiled.
+    # Remove this exception when rmcp is upgraded to >=1.4.0.
+    "RUSTSEC-2026-0189",
+]
