@@ -680,11 +680,13 @@ pub fn save_observation(
         Some(ref text) => hash_raw_text(text),
         None => {
             return Err(anyhow::anyhow!(
-                "No indexed node found for symbol '{}' in '{}'. \
-                 Run ingest_repo first, then supply the relative file path \
-                 as stored in the graph (e.g. 'src/main.rs').",
+                "No indexed node found for symbol '{}' at '{}'. Use \
+                 run_pipeline(intent: \"find_symbol\", target: \"{}\") to \
+                 discover the stored relative path and retry; if the repo was \
+                 never indexed, run ingest_repo first.",
                 symbol_name,
-                filepath
+                filepath,
+                symbol_name
             ))
         }
     };
