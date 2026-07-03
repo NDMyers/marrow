@@ -154,6 +154,8 @@ The same investigation drove output-budgeting fixes (`file:line` on all structur
 
 Caveats: the Claude Code A/B runs are small-n (one repository, one question per arm) measured during local development — treat them as indicative, not universal. For token-reduction claims about your own graph, run `marrow benchmark --precise-file-tokens <symbol> <repo_id>` for exact, reproducible cl100k_base counts.
 
+**Where Marrow does *not* win:** a follow-up independent A/B (July 2026, llama.cpp — 16k symbols, three exact-name caller-enumeration tasks, cold-start agents, ground truth fixed before any run) found **parity on answer quality with native grep slightly cheaper (~11% tokens) and faster (~38%)**. Exact-string search is grep's home turf, and Marrow's own agent guidance routes that work to native tools — the free-choice agents in the test followed it. Marrow's advantage concentrates where the alternative is *reading code into context*: condensed capsules (the token-reduction numbers above), unknown-symbol discovery, and separating direct callers from transitive impact.
+
 ## Agent integrations
 
 `marrow integrate` uses an internal registry of MCP setup targets, in three tiers:
