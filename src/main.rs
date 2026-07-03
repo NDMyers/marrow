@@ -28,9 +28,9 @@ use anyhow::{Context as _, Result};
 use dashboard::DashboardEvent;
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, Content, Implementation, InitializeRequestParams,
-        InitializeResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
-        Tool, ToolsCapability,
+        CallToolRequestParams, CallToolResult, ContentBlock, Implementation,
+        InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
     transport::stdio,
@@ -2824,32 +2824,27 @@ impl ServerHandler for ContextEngine {
     // ── Server identity ───────────────────────────────────────────────────────
 
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            server_info: Implementation {
-                name: "marrow-ast-context-engine".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: Some("Marrow".to_string()),
-                description: Some(
-                    "Local, deterministic MCP server: parses multi-language codebases \
-                     via tree-sitter into an AST dependency graph and serves condensed \
-                     Context Capsules to reduce LLM token usage."
-                        .to_string(),
-                ),
-                icons: None,
-                website_url: None,
-            },
-            capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability { list_changed: None }),
-                ..Default::default()
-            },
-            instructions: Some(
-                "Use Marrow for structural questions (callers, blast radius, repo maps, class maps), \
-                 including explore_batch, dependency_graph, and map_class. Use native read/search \
-                 for single-file, line-level, config/docs, or exact-search work."
-                    .to_string(),
-            ),
-            ..Default::default()
-        }
+        // rmcp 2.x marks the info/capability structs #[non_exhaustive]; build
+        // them through their constructors and mutate the public fields.
+        let mut implementation =
+            Implementation::new("marrow-ast-context-engine", env!("CARGO_PKG_VERSION"));
+        implementation.title = Some("Marrow".to_string());
+        implementation.description = Some(
+            "Local, deterministic MCP server: parses multi-language codebases \
+             via tree-sitter into an AST dependency graph and serves condensed \
+             Context Capsules to reduce LLM token usage."
+                .to_string(),
+        );
+
+        let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
+        info.server_info = implementation;
+        info.instructions = Some(
+            "Use Marrow for structural questions (callers, blast radius, repo maps, class maps), \
+             including explore_batch, dependency_graph, and map_class. Use native read/search \
+             for single-file, line-level, config/docs, or exact-search work."
+                .to_string(),
+        );
+        info
     }
 
     // ── Initialize override: capture client name ──────────────────────────────
@@ -2863,19 +2858,15 @@ impl ServerHandler for ContextEngine {
         // Capture the connecting client's name from the MCP handshake (best-effort).
         let _ = CLIENT_NAME.set(request.client_info.name.clone());
 
-        // Delegate to the default peer-info storage behaviour and return our ServerInfo.
+        // Delegate to the default peer-info storage behaviour and return our
+        // ServerInfo (an alias for InitializeResult). The rmcp service layer
+        // negotiates protocol_version on the response after this handler
+        // returns, so no version handling is needed here.
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
         }
         let info = self.get_info();
-        async move {
-            Ok(InitializeResult {
-                protocol_version: rmcp::model::ProtocolVersion::default(),
-                capabilities: info.capabilities,
-                server_info: info.server_info,
-                instructions: info.instructions,
-            })
-        }
+        async move { Ok(info) }
     }
 
     // ── Tool registry ─────────────────────────────────────────────────────────
@@ -3111,7 +3102,7 @@ impl ServerHandler for ContextEngine {
 
                     let cwd = current_workspace_root();
                     if let Some(msg) = self.maybe_jit_index(&repo_id, &cwd) {
-                        return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                     }
 
                     let sym_for_event = symbol_name.clone();
@@ -3230,7 +3221,7 @@ impl ServerHandler for ContextEngine {
                         }
                     });
 
-                    Ok(CallToolResult::success(vec![Content::text(out)]))
+                    Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
                 }
 
                 // ── analyze_impact ────────────────────────────────────────────
@@ -3244,7 +3235,7 @@ impl ServerHandler for ContextEngine {
 
                     let cwd = current_workspace_root();
                     if let Some(msg) = self.maybe_jit_index(&repo_id, &cwd) {
-                        return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                     }
 
                     let sym_clone = symbol_name.clone();
@@ -3268,7 +3259,7 @@ impl ServerHandler for ContextEngine {
 
                     // Short-circuit: return the disambiguation payload if the symbol was ambiguous.
                     if let Some(payload) = result.pivot_id.strip_prefix("DISAMBIGUATION:") {
-                        return Ok(CallToolResult::success(vec![Content::text(
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(
                             payload.to_string(),
                         )]));
                     }
@@ -3299,7 +3290,7 @@ impl ServerHandler for ContextEngine {
                         }
                     });
 
-                    Ok(CallToolResult::success(vec![Content::text(out)]))
+                    Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
                 }
 
                 // ── ingest_repo ───────────────────────────────────────────────
@@ -3339,7 +3330,7 @@ impl ServerHandler for ContextEngine {
                     ];
                     for blocked_root in blocked_roots {
                         if root_path == blocked_root || root_path.starts_with(blocked_root) {
-                            return Ok(CallToolResult::success(vec![Content::text(
+                            return Ok(CallToolResult::success(vec![ContentBlock::text(
                                 "CRITICAL SECURITY: Cannot index protected system directories.",
                             )]));
                         }
@@ -3360,7 +3351,7 @@ impl ServerHandler for ContextEngine {
                              4. If the user replies \"yes\", re-run the `ingest_repo` tool with the exact same path, but add the parameter `\"user_confirmed\": true`.",
                             target_path = root_path.display()
                         );
-                        return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                     }
 
                     let mut registered_workspace_id = None;
@@ -3481,7 +3472,7 @@ impl ServerHandler for ContextEngine {
                         }
                     });
 
-                    Ok(CallToolResult::success(vec![Content::text(format!(
+                    Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Ingested {symbols} symbols; resolved {edges} cross-repo edges.\n\
                          {self_check_line}"
                     ))]))
@@ -3515,7 +3506,7 @@ impl ServerHandler for ContextEngine {
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-                    Ok(CallToolResult::success(vec![Content::text(result)]))
+                    Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
                 }
 
                 // ── get_session_context ───────────────────────────────────────
@@ -3553,7 +3544,7 @@ impl ServerHandler for ContextEngine {
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-                    Ok(CallToolResult::success(vec![Content::text(result)]))
+                    Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
                 }
 
                 // ── get_skeleton ──────────────────────────────────────────────
@@ -3577,7 +3568,7 @@ impl ServerHandler for ContextEngine {
                             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                     };
                     if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
-                        return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                     }
 
                     let result = tokio::task::spawn_blocking(move || {
@@ -3589,7 +3580,7 @@ impl ServerHandler for ContextEngine {
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-                    Ok(CallToolResult::success(vec![Content::text(result)]))
+                    Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
                 }
 
                 // ── run_pipeline ──────────────────────────────────────────────
@@ -3617,7 +3608,7 @@ impl ServerHandler for ContextEngine {
                         .unwrap_or_else(|| "Unknown Agent".to_string());
 
                     if let Some(msg) = state::run_pipeline_guard_message() {
-                        return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                        return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                     }
 
                     // M-13 FIX: If the graph is empty, perform bounded JIT
@@ -3656,7 +3647,7 @@ impl ServerHandler for ContextEngine {
                                 );
                                 jit_auto_indexed = true;
                             } else {
-                                return Ok(CallToolResult::success(vec![Content::text(
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(
                                     "[SYSTEM NOTE: The Marrow graph is empty and the workspace \
                                      directory is not accessible. Run ingest_repo first.]",
                                 )]));
@@ -3692,7 +3683,7 @@ impl ServerHandler for ContextEngine {
                                 id
                             };
                             if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
-                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                             }
 
                             let execution = tokio::task::spawn_blocking(move || {
@@ -3741,7 +3732,7 @@ impl ServerHandler for ContextEngine {
                                 emit_dashboard_event(self.http_client.clone(), event);
                             }
 
-                            Ok(CallToolResult::success(vec![Content::text(text)]))
+                            Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
                         }
 
                         "dependency_graph" => {
@@ -3779,7 +3770,7 @@ impl ServerHandler for ContextEngine {
                                 id
                             };
                             if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
-                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                             }
 
                             let (result, repo_used) = tokio::task::spawn_blocking(move || {
@@ -3836,7 +3827,7 @@ impl ServerHandler for ContextEngine {
                                 }
                             });
 
-                            Ok(CallToolResult::success(vec![Content::text(result)]))
+                            Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
                         }
 
                         "map_class" => {
@@ -3873,7 +3864,7 @@ impl ServerHandler for ContextEngine {
                                 id
                             };
                             if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
-                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                             }
 
                             let (result, repo_used) = tokio::task::spawn_blocking(move || {
@@ -3929,7 +3920,7 @@ impl ServerHandler for ContextEngine {
                                 }
                             });
 
-                            Ok(CallToolResult::success(vec![Content::text(result)]))
+                            Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
                         }
 
                         "analyze_repo" => {
@@ -3966,7 +3957,7 @@ impl ServerHandler for ContextEngine {
                                 id
                             };
                             if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
-                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                             }
 
                             let (result, repo_used) = tokio::task::spawn_blocking(move || {
@@ -4029,7 +4020,7 @@ impl ServerHandler for ContextEngine {
                                 }
                             });
 
-                            Ok(CallToolResult::success(vec![Content::text(result)]))
+                            Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
                         }
 
                         "find_symbol" => {
@@ -4067,7 +4058,7 @@ impl ServerHandler for ContextEngine {
                                 id
                             };
                             if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
-                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                             }
 
                             let (result, _repo_used) = tokio::task::spawn_blocking(move || {
@@ -4132,7 +4123,7 @@ impl ServerHandler for ContextEngine {
                                 }
                             });
 
-                            Ok(CallToolResult::success(vec![Content::text(result)]))
+                            Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
                         }
 
                         // "read_node" is a navigation alias for explore_symbol.
@@ -4172,7 +4163,7 @@ impl ServerHandler for ContextEngine {
                                 id
                             };
                             if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
-                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                             }
 
                             let (out, original_text, capsule_tokens, file_tokens, abs_file_path, repo_used, proof_snapshot, provenance) =
@@ -4270,7 +4261,7 @@ impl ServerHandler for ContextEngine {
                                 }
                             });
 
-                            Ok(CallToolResult::success(vec![Content::text(out)]))
+                            Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
                         }
 
                         // ── trace_flow ────────────────────────────────────────
@@ -4308,7 +4299,7 @@ impl ServerHandler for ContextEngine {
                                 id
                             };
                             if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
-                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                             }
 
                             let (
@@ -4426,7 +4417,7 @@ impl ServerHandler for ContextEngine {
                                 }
                             });
 
-                            Ok(CallToolResult::success(vec![Content::text(out)]))
+                            Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
                         }
 
                         "refactor_symbol" => {
@@ -4463,7 +4454,7 @@ impl ServerHandler for ContextEngine {
                                 id
                             };
                             if let Some(msg) = self.maybe_jit_index(&jit_repo_id, &cwd) {
-                                return Ok(CallToolResult::success(vec![Content::text(msg)]));
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                             }
 
                             let (result, repo_used) = tokio::task::spawn_blocking(move || {
@@ -4502,7 +4493,7 @@ impl ServerHandler for ContextEngine {
 
                             // Short-circuit: return the disambiguation payload if the symbol was ambiguous.
                             if let Some(payload) = result.pivot_id.strip_prefix("DISAMBIGUATION:") {
-                                return Ok(CallToolResult::success(vec![Content::text(
+                                return Ok(CallToolResult::success(vec![ContentBlock::text(
                                     payload.to_string(),
                                 )]));
                             }
@@ -4533,7 +4524,7 @@ impl ServerHandler for ContextEngine {
                                 }
                             });
 
-                            Ok(CallToolResult::success(vec![Content::text(out)]))
+                            Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
                         }
 
                         _ => Err(rmcp::ErrorData::invalid_params(
@@ -4568,7 +4559,7 @@ impl ServerHandler for ContextEngine {
                         .canonicalize()
                         .unwrap_or_else(|_| PathBuf::from("."));
                     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-                    Ok(CallToolResult::success(vec![Content::text(
+                    Ok(CallToolResult::success(vec![ContentBlock::text(
                         format_workspace_setup_summary(&cwd, &home),
                     )]))
                 }
@@ -4594,20 +4585,20 @@ impl ServerHandler for ContextEngine {
                 if !compliance_notice_sent.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     tool_result
                         .content
-                        .insert(0, Content::text(notice.as_str()));
+                        .insert(0, ContentBlock::text(notice.as_str()));
                 }
             }
             if let (Some(notice), Ok(ref mut tool_result)) = (&init_notice, &mut result) {
                 tool_result
                     .content
-                    .insert(0, Content::text(notice.as_str()));
+                    .insert(0, ContentBlock::text(notice.as_str()));
             }
             // M-13 FIX: Prepend auto-indexed system note when JIT ran
             if jit_auto_indexed {
                 if let Ok(ref mut tool_result) = result {
                     tool_result
                         .content
-                        .insert(0, Content::text("[SYSTEM NOTE: Auto-Indexed]\n\n"));
+                        .insert(0, ContentBlock::text("[SYSTEM NOTE: Auto-Indexed]\n\n"));
                 }
             }
 

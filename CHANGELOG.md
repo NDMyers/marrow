@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Upgraded the MCP SDK (`rmcp`) from 0.16 to 2.1, aligning marrow with the MCP 2025-11-25 specification. Protocol version negotiation with older clients is handled by the SDK's service layer. Resolves RUSTSEC-2026-0189 for good; the cargo-audit exception added in 0.1.2 is removed.
+
 ## [0.1.2] - 2026-07-03
 
 ### Added
