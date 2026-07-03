@@ -153,6 +153,7 @@ pub fn build_router(state: DaemonState) -> Router {
         .route("/api/activity/start", post(handle_activity_start))
         .route("/api/activity/finish", post(handle_activity_finish))
         .route("/api/workspace-graph", get(handle_workspace_graph))
+        .route("/api/query-failures", get(handle_query_failures))
         .route("/api/cleanup/unregister", post(handle_cleanup_unregister))
         .route("/api/cleanup/clear-index", post(handle_cleanup_clear_index))
         .route("/api/cleanup/delete-db", post(handle_cleanup_delete_db))
@@ -177,6 +178,7 @@ pub fn build_dashboard_router(
         .route("/api/activity/start", post(handle_activity_start))
         .route("/api/activity/finish", post(handle_activity_finish))
         .route("/api/workspace-graph", get(handle_workspace_graph))
+        .route("/api/query-failures", get(handle_query_failures))
         .route("/api/cleanup/unregister", post(handle_cleanup_unregister))
         .route("/api/cleanup/clear-index", post(handle_cleanup_clear_index))
         .route("/api/cleanup/delete-db", post(handle_cleanup_delete_db))
@@ -327,6 +329,61 @@ async fn handle_workspace_graph(
         });
     match result {
         Ok(graph) => (StatusCode::OK, Json(json!(graph))),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+    }
+}
+
+#[derive(Deserialize)]
+struct QueryFailuresQuery {
+    workspace_id: String,
+}
+
+/// Per-workspace query-failure telemetry: lifetime counters by category plus
+/// the recent-failure ring buffer (agents route around hard failures
+/// silently, so this endpoint is how a human finds out they happened).
+async fn handle_query_failures(
+    State(state): State<DaemonState>,
+    Query(params): Query<QueryFailuresQuery>,
+) -> impl IntoResponse {
+    let Some(registry) = &state.registry else {
+        return registry_unavailable();
+    };
+    let entry = registry
+        .lock()
+        .map_err(|_| "registry mutex poisoned".to_string())
+        .and_then(|registry| {
+            registry
+                .find_workspace(&params.workspace_id)
+                .map_err(|e| e.to_string())
+        });
+    let result = entry.and_then(|entry| {
+        let Some(entry) = entry else {
+            return Err(format!("unknown workspace '{}'", params.workspace_id));
+        };
+        let conn = rusqlite::Connection::open_with_flags(
+            &entry.graph_db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| e.to_string())?;
+        let recent = crate::db::recent_query_failures(&conn, 20).map_err(|e| e.to_string())?;
+        Ok(json!({
+            "workspace_id": entry.workspace_id,
+            "tool_calls_total": crate::db::read_stat(&conn, "tool_calls_total"),
+            "query_failures_total": crate::db::read_stat(&conn, "query_failures_total"),
+            "categories": {
+                "symbol_not_found": crate::db::read_stat(&conn, "query_failures_symbol_not_found"),
+                "repo_not_found": crate::db::read_stat(&conn, "query_failures_repo_not_found"),
+                "invalid_params": crate::db::read_stat(&conn, "query_failures_invalid_params"),
+                "internal": crate::db::read_stat(&conn, "query_failures_internal"),
+                "other": crate::db::read_stat(&conn, "query_failures_other"),
+            },
+            "recent": recent,
+        }))
+    });
+    match result {
+        Ok(payload) => (StatusCode::OK, Json(payload)),
         Err(error) => (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
     }
 }
