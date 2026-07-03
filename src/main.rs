@@ -1363,7 +1363,7 @@ fn ensure_repo_ready(
             > 0;
         if !exists {
             return Err(anyhow::anyhow!(
-                "Repo '{}' not found in the Marrow database. Run ingest_repo first.",
+                "Repo '{}' not found in this workspace's Marrow database.",
                 repo_id
             ));
         }
@@ -1396,6 +1396,130 @@ fn ensure_repo_ready(
     }
 
     Ok(repo_id)
+}
+
+/// A repo-scoped database connection: either the current workspace's shared
+/// connection, or a read-only connection to another registered workspace's
+/// graph DB when the requested repo lives there (cross-workspace routing).
+enum RepoConn<'a> {
+    Local(std::sync::MutexGuard<'a, rusqlite::Connection>),
+    Remote(rusqlite::Connection),
+}
+
+impl std::ops::Deref for RepoConn<'_> {
+    type Target = rusqlite::Connection;
+    fn deref(&self) -> &rusqlite::Connection {
+        match self {
+            RepoConn::Local(guard) => guard,
+            RepoConn::Remote(conn) => conn,
+        }
+    }
+}
+
+/// Lock the workspace DB and resolve the request's repo id, extending
+/// `ensure_repo_ready` with cross-workspace routing: when an explicitly
+/// requested repo_id is not in this workspace's DB but is indexed in another
+/// registered workspace, serve it read-only from that workspace's graph DB.
+/// `ingest_repo` writes out-of-workspace graphs into the target repo's own
+/// workspace DB (see the ingest handler), so without this hop every
+/// cross-workspace query failed with a misleading "run ingest_repo first".
+fn ensure_repo_conn<'a>(
+    db: &'a Arc<Mutex<rusqlite::Connection>>,
+    explicit_repo_id: Option<&str>,
+    workspace_root: &Path,
+) -> anyhow::Result<(RepoConn<'a>, String)> {
+    let conn = db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+    let local_err = match ensure_repo_ready(&conn, explicit_repo_id, workspace_root) {
+        Ok(repo_id) => return Ok((RepoConn::Local(conn), repo_id)),
+        Err(err) => err,
+    };
+    // Routing only applies to an explicit repo_id miss; auto-detected repos
+    // always belong to this workspace.
+    let Some(repo_id) = explicit_repo_id else {
+        return Err(local_err);
+    };
+    let local_repos = known_repo_ids(&conn);
+    // Release the local lock before touching other workspace DBs.
+    drop(conn);
+
+    match open_repo_in_registered_workspace(&registry::default_registry_path(), repo_id) {
+        Ok(Some((remote, owner_root))) => {
+            eprintln!(
+                "[marrow] serving repo '{repo_id}' read-only from workspace {}",
+                owner_root.display()
+            );
+            Ok((RepoConn::Remote(remote), repo_id.to_string()))
+        }
+        Ok(None) => {
+            let known = if local_repos.is_empty() {
+                "No repos are indexed in this workspace yet.".to_string()
+            } else {
+                format!(
+                    "Repos indexed in this workspace: {}.",
+                    local_repos.join(", ")
+                )
+            };
+            Err(anyhow::anyhow!(
+                "Repo '{repo_id}' not found in this workspace's Marrow database ({}) \
+                 or in any registered workspace. If it was never indexed, run \
+                 ingest_repo with its root_path. {known}",
+                workspace_root.display()
+            ))
+        }
+        // Registry unavailable — report the local miss rather than invent a cause.
+        Err(_) => Err(local_err),
+    }
+}
+
+fn known_repo_ids(conn: &rusqlite::Connection) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare("SELECT id FROM repositories ORDER BY id") else {
+        return out;
+    };
+    if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+        for repo in rows.flatten() {
+            out.push(repo);
+        }
+    }
+    out
+}
+
+/// Scan the registry for a workspace whose graph DB contains `repo_id` and
+/// open that DB read-only. Returns the connection plus the owning workspace
+/// root, or `None` when no registered workspace owns the repo.
+fn open_repo_in_registered_workspace(
+    registry_path: &Path,
+    repo_id: &str,
+) -> anyhow::Result<Option<(rusqlite::Connection, PathBuf)>> {
+    let registry = registry::Registry::open(registry_path)?;
+    for entry in registry.list_workspaces()? {
+        if !entry.graph_db_path.is_file() {
+            continue;
+        }
+        let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &entry.graph_db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        ) else {
+            continue;
+        };
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(5_000));
+        // A foreign DB may be empty or mid-migration; treat errors as "not here".
+        let owns_repo: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM repositories WHERE id = ?1",
+                rusqlite::params![repo_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if owns_repo > 0 {
+            return Ok(Some((conn, entry.workspace_root)));
+        }
+    }
+    Ok(None)
 }
 
 fn path_contains_marrow_marker(path: &Path) -> bool {
@@ -3001,11 +3125,9 @@ impl ServerHandler for ContextEngine {
                         proof_snapshot,
                         provenance,
                     ) = tokio::task::spawn_blocking(move || {
-                        let conn = db
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
                         let cwd = current_workspace_root();
-                        let _resolved_repo_id = ensure_repo_ready(&conn, Some(&repo_id), &cwd)?;
+                        let (conn, _resolved_repo_id) =
+                            ensure_repo_conn(&db, Some(&repo_id), &cwd)?;
 
                         let capsule_result = retrieval::get_context_capsule(
                             &conn,
@@ -3128,11 +3250,9 @@ impl ServerHandler for ContextEngine {
                     let repo_clone = repo_id.clone();
 
                     let result = tokio::task::spawn_blocking(move || {
-                        let conn = db
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
                         let cwd = current_workspace_root();
-                        let _resolved_repo_id = ensure_repo_ready(&conn, Some(&repo_id), &cwd)?;
+                        let (conn, _resolved_repo_id) =
+                            ensure_repo_conn(&db, Some(&repo_id), &cwd)?;
 
                         retrieval::analyze_impact(
                             &conn,
@@ -3442,11 +3562,8 @@ impl ServerHandler for ContextEngine {
                     }
 
                     let result = tokio::task::spawn_blocking(move || {
-                        let conn = db
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
                         let cwd = current_workspace_root();
-                        let repo_id = ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
+                        let (conn, repo_id) = ensure_repo_conn(&db, repo_id_arg.as_deref(), &cwd)?;
                         retrieval::get_project_skeleton(&conn, &repo_id, target_dir.as_deref())
                     })
                     .await
@@ -3561,17 +3678,13 @@ impl ServerHandler for ContextEngine {
 
                             let execution = tokio::task::spawn_blocking(move || {
                                 let t_lock = Instant::now();
-                                let conn = db
-                                    .lock()
-                                    .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                let cwd = current_workspace_root();
+                                let (conn, repo_id) =
+                                    ensure_repo_conn(&db, repo_id_arg.as_deref(), &cwd)?;
                                 trace!(
                                     "explore_batch: db lock acquired [{:?}ms]",
                                     t_lock.elapsed().as_millis()
                                 );
-
-                                let cwd = current_workspace_root();
-                                let repo_id =
-                                    ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
                                 let execution = retrieval::execute_batch_queries(
                                     &conn,
                                     &queries,
@@ -3652,17 +3765,13 @@ impl ServerHandler for ContextEngine {
 
                             let (result, repo_used) = tokio::task::spawn_blocking(move || {
                                 let t_lock = Instant::now();
-                                let conn = db
-                                    .lock()
-                                    .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                let cwd = current_workspace_root();
+                                let (conn, repo_id) =
+                                    ensure_repo_conn(&db, repo_id_arg.as_deref(), &cwd)?;
                                 trace!(
                                     "dependency_graph: db lock acquired [{:?}ms]",
                                     t_lock.elapsed().as_millis()
                                 );
-
-                                let cwd = current_workspace_root();
-                                let repo_id =
-                                    ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
                                 let result = retrieval::dependency_graph(
                                     &conn,
                                     &repo_id,
@@ -3750,17 +3859,13 @@ impl ServerHandler for ContextEngine {
 
                             let (result, repo_used) = tokio::task::spawn_blocking(move || {
                                 let t_lock = Instant::now();
-                                let conn = db
-                                    .lock()
-                                    .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                let cwd = current_workspace_root();
+                                let (conn, repo_id) =
+                                    ensure_repo_conn(&db, repo_id_arg.as_deref(), &cwd)?;
                                 trace!(
                                     "map_class: db lock acquired [{:?}ms]",
                                     t_lock.elapsed().as_millis()
                                 );
-
-                                let cwd = current_workspace_root();
-                                let repo_id =
-                                    ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
                                 let result = retrieval::map_class(
                                     &conn,
                                     &repo_id,
@@ -3847,17 +3952,13 @@ impl ServerHandler for ContextEngine {
 
                             let (result, repo_used) = tokio::task::spawn_blocking(move || {
                                 let t_lock = Instant::now();
-                                let conn = db
-                                    .lock()
-                                    .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                let cwd = current_workspace_root();
+                                let (conn, repo_id) =
+                                    ensure_repo_conn(&db, repo_id_arg.as_deref(), &cwd)?;
                                 trace!(
                                     "analyze_repo: db lock acquired [{:?}ms]",
                                     t_lock.elapsed().as_millis()
                                 );
-
-                                let cwd = current_workspace_root();
-                                let repo_id =
-                                    ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
 
                                 let t_skel = Instant::now();
                                 let skeleton = retrieval::get_project_skeleton(
@@ -3952,17 +4053,13 @@ impl ServerHandler for ContextEngine {
 
                             let (result, _repo_used) = tokio::task::spawn_blocking(move || {
                                 let t_lock = Instant::now();
-                                let conn = db
-                                    .lock()
-                                    .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                let cwd = current_workspace_root();
+                                let (conn, repo_id) =
+                                    ensure_repo_conn(&db, repo_id_arg.as_deref(), &cwd)?;
                                 trace!(
                                     "find_symbol: db lock acquired [{:?}ms]",
                                     t_lock.elapsed().as_millis()
                                 );
-
-                                let cwd = current_workspace_root();
-                                let repo_id =
-                                    ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
 
                                 let t_find = Instant::now();
                                 let result = dispatch_run_pipeline_find_symbol(
@@ -4062,12 +4159,10 @@ impl ServerHandler for ContextEngine {
                             let (out, original_text, capsule_tokens, file_tokens, abs_file_path, repo_used, proof_snapshot, provenance) =
                                 tokio::task::spawn_blocking(move || {
                                     let t_lock = Instant::now();
-                                    let conn = db.lock().map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
-                                    trace!("explore_symbol: db lock acquired [{:?}ms]", t_lock.elapsed().as_millis());
-
                                     let cwd = current_workspace_root();
-                                    let repo_id =
-                                        ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
+                                    let (conn, repo_id) =
+                                        ensure_repo_conn(&db, repo_id_arg.as_deref(), &cwd)?;
+                                    trace!("explore_symbol: db lock acquired [{:?}ms]", t_lock.elapsed().as_millis());
 
                                     let t_cap = Instant::now();
                                     let capsule_result = retrieval::get_context_capsule(&conn, &symbol_name, &repo_id, filepath_arg.as_deref())?;
@@ -4206,17 +4301,13 @@ impl ServerHandler for ContextEngine {
                                 provenance,
                             ) = tokio::task::spawn_blocking(move || {
                                 let t_lock = Instant::now();
-                                let conn = db
-                                    .lock()
-                                    .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                let cwd = current_workspace_root();
+                                let (conn, repo_id) =
+                                    ensure_repo_conn(&db, repo_id_arg.as_deref(), &cwd)?;
                                 trace!(
                                     "trace_flow: db lock acquired [{:?}ms]",
                                     t_lock.elapsed().as_millis()
                                 );
-
-                                let cwd = current_workspace_root();
-                                let repo_id =
-                                    ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
 
                                 let t_trace = Instant::now();
                                 let result = retrieval::trace_logic_flow(
@@ -4358,17 +4449,13 @@ impl ServerHandler for ContextEngine {
 
                             let (result, repo_used) = tokio::task::spawn_blocking(move || {
                                 let t_lock = Instant::now();
-                                let conn = db
-                                    .lock()
-                                    .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                                let cwd = current_workspace_root();
+                                let (conn, repo_id) =
+                                    ensure_repo_conn(&db, repo_id_arg.as_deref(), &cwd)?;
                                 trace!(
                                     "refactor_symbol: db lock acquired [{:?}ms]",
                                     t_lock.elapsed().as_millis()
                                 );
-
-                                let cwd = current_workspace_root();
-                                let repo_id =
-                                    ensure_repo_ready(&conn, repo_id_arg.as_deref(), &cwd)?;
 
                                 let t_impact = Instant::now();
                                 let result = retrieval::analyze_impact(
@@ -6894,9 +6981,12 @@ mod tests {
             ensure_repo_ready(&conn, Some("nonexistent_repo"), &current_root_path).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not found"), "expected not-found error: {msg}");
+        // The low-level miss must NOT tell agents to re-run ingest_repo: the
+        // repo may simply live in another workspace. ensure_repo_conn adds
+        // accurate follow-up guidance after checking the registry.
         assert!(
-            msg.contains("ingest_repo"),
-            "expected guidance to ingest: {msg}"
+            !msg.contains("Run ingest_repo first"),
+            "local miss must not repeat the misleading ingest advice: {msg}"
         );
     }
 
@@ -6922,6 +7012,60 @@ mod tests {
             count > 0,
             "auto-indexing should have produced symbols, got {count}"
         );
+    }
+
+    /// Cross-workspace routing: a repo ingested into another registered
+    /// workspace's graph DB is discoverable and readable via the registry.
+    #[test]
+    fn cross_workspace_lookup_finds_repo_registered_elsewhere() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.db");
+
+        // Build a second workspace with an indexed repo.
+        let other_ws = tempfile::tempdir().unwrap();
+        fs::write(other_ws.path().join("hello.py"), "def hello():\n    pass\n").unwrap();
+        let graph_dir = other_ws.path().join(".marrow");
+        fs::create_dir_all(&graph_dir).unwrap();
+        {
+            let conn = crate::db::init_db(graph_dir.join("graph.db").to_str().unwrap()).unwrap();
+            ingestion::ingest_repo(&conn, "remote_repo", other_ws.path()).unwrap();
+        } // connection dropped before the read-only reopen
+
+        registry::Registry::open(&registry_path)
+            .unwrap()
+            .register_workspace(other_ws.path(), None)
+            .unwrap();
+
+        let (conn, owner_root) = open_repo_in_registered_workspace(&registry_path, "remote_repo")
+            .unwrap()
+            .expect("repo should be found in the registered workspace");
+        assert_eq!(owner_root, other_ws.path().canonicalize().unwrap());
+        let nodes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'remote_repo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            nodes > 0,
+            "remote graph should be readable, got {nodes} nodes"
+        );
+    }
+
+    #[test]
+    fn cross_workspace_lookup_returns_none_for_unknown_repo() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.db");
+        let other_ws = tempfile::tempdir().unwrap();
+        fs::create_dir_all(other_ws.path().join(".marrow")).unwrap();
+        registry::Registry::open(&registry_path)
+            .unwrap()
+            .register_workspace(other_ws.path(), None)
+            .unwrap();
+
+        let found = open_repo_in_registered_workspace(&registry_path, "no_such_repo").unwrap();
+        assert!(found.is_none(), "unknown repo should resolve to None");
     }
 
     // ── resolve_context_repo_id cold-start auto-index / degrade ────────────────
