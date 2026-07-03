@@ -292,14 +292,16 @@ fn sprint2_npm_package_metadata_is_release_ready_and_lean() {
     let package_json = read_repo_file("npm/package.json");
     let package_lock = read_repo_file("npm/package-lock.json");
 
-    for text in [&package_json, &package_lock] {
-        assert!(text.contains("\"repository\""));
-        assert!(text.contains("\"homepage\""));
-        assert!(text.contains("\"bugs\""));
-        assert!(text.contains("\"author\""));
-        assert!(text.contains("\"publishConfig\""));
-        assert!(text.contains("\"access\": \"public\""));
-    }
+    // Release metadata lives in package.json. npm 11+ no longer mirrors these
+    // fields into the lockfile root entry, so requiring them there would break
+    // CI every time the lockfile is regenerated with a modern npm.
+    assert!(package_json.contains("\"repository\""));
+    assert!(package_json.contains("\"homepage\""));
+    assert!(package_json.contains("\"bugs\""));
+    assert!(package_json.contains("\"author\""));
+    assert!(package_json.contains("\"publishConfig\""));
+    assert!(package_json.contains("\"access\": \"public\""));
+    assert!(package_lock.contains("\"name\": \"@nickm-swe/marrow\""));
 
     assert!(package_json.contains("\"license\": \"MIT\""));
     assert!(package_json.contains("\"README.md\""));
