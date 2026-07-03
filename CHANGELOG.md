@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Post-ingest index self-check: every ingest (MCP `ingest_repo` and `marrow index`) now resolves a sample of freshly indexed symbols back through the agent query path — with stored file paths in both separator styles — and reports the result in the ingest output, so "ingest succeeded but queries can't see it" regressions fail loudly at ingest time. `marrow index` exits non-zero if the check fails.
+- `marrow doctor [repo_id]` — runs the same index self-check on demand against the workspace database (honors `MARROW_DB_PATH`).
+- `marrow --version` / `-V` / `version` prints the version. Previously the flag fell through to the stdio MCP server and hung the calling shell.
+- Cross-workspace query routing: MCP query tools (capsule, impact, pipeline intents, skeleton) now serve an explicitly requested `repo_id` that was ingested into another registered workspace by opening that workspace's graph DB read-only via the registry, instead of failing.
+
+### Fixed
+
+- Unknown CLI arguments now exit with an error and usage hint instead of silently starting the stdio MCP server.
+- The "Repo not found … Run ingest_repo first" error no longer misleads agents into an ingest/query loop when the repo is indexed in a different workspace; the not-found error now names the current workspace and lists the repos that are indexed in it.
+
 ## [0.1.1] - 2026-06-12
 
 ### Fixed
