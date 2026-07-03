@@ -263,6 +263,38 @@ fn stats_aggregate_prunes_dead_system_tmp_rows_from_registry() {
 }
 
 #[test]
+fn registering_a_git_workspace_adds_marrow_to_local_git_exclude() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Registry::open(temp.path().join("registry.db")).unwrap();
+    let workspace = temp.path().join("repo");
+    std::fs::create_dir_all(workspace.join(".git")).unwrap();
+
+    registry.register_workspace(&workspace, None).unwrap();
+
+    let exclude = workspace.join(".git").join("info").join("exclude");
+    let content = std::fs::read_to_string(&exclude).unwrap();
+    assert!(
+        content.lines().any(|line| line.trim() == ".marrow/"),
+        "exclude should list .marrow/: {content}"
+    );
+
+    // Idempotent: registering again must not duplicate the entry.
+    registry.register_workspace(&workspace, None).unwrap();
+    let content = std::fs::read_to_string(&exclude).unwrap();
+    assert_eq!(
+        content.matches(".marrow/").count(),
+        1,
+        "re-registration must not duplicate the exclude: {content}"
+    );
+
+    // Non-git workspaces are left untouched.
+    let plain = temp.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    registry.register_workspace(&plain, None).unwrap();
+    assert!(!plain.join(".git").exists());
+}
+
+#[test]
 fn registry_reports_empty_and_corrupt_workspace_db_statuses() {
     let temp = tempfile::tempdir().unwrap();
     let registry = Registry::open(temp.path().join("registry.db")).unwrap();

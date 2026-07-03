@@ -206,6 +206,7 @@ impl Registry {
 
         let marrow_dir = root.join(".marrow");
         std::fs::create_dir_all(&marrow_dir)?;
+        ensure_git_excludes_marrow(&root);
         let graph_db_path = marrow_dir.join("graph.db");
         let workspace_id = workspace_id_for_root(&root);
         let now = now_secs();
@@ -585,9 +586,10 @@ impl Registry {
             (pipeline_requests as f64 / compliance_total as f64) * 100.0
         };
 
-        let (workspaces, stale_temp): (Vec<_>, Vec<_>) = workspaces
-            .into_iter()
-            .partition(|entry| is_dashboard_visible_workspace(&entry.status, &entry.workspace_root));
+        let (workspaces, stale_temp): (Vec<_>, Vec<_>) =
+            workspaces.into_iter().partition(|entry| {
+                is_dashboard_visible_workspace(&entry.status, &entry.workspace_root)
+            });
         // Stale `.tmp*` rows under the system temp dir whose root no longer
         // exists are dead test residue that can never become valid again —
         // drop them so the registry self-heals instead of accumulating clutter.
@@ -946,6 +948,36 @@ impl Registry {
         }
         Ok(entry)
     }
+}
+
+/// Best-effort: keep `.marrow/` out of `git status` in registered workspaces
+/// by appending it to `.git/info/exclude` (local-only, never committed —
+/// unlike editing the repo's .gitignore, this leaves the working tree
+/// untouched). Skipped for worktrees/submodules where `.git` is a file.
+fn ensure_git_excludes_marrow(workspace_root: &Path) {
+    let git_dir = workspace_root.join(".git");
+    if !git_dir.is_dir() {
+        return;
+    }
+    let info_dir = git_dir.join("info");
+    let exclude = info_dir.join("exclude");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing
+        .lines()
+        .any(|line| matches!(line.trim(), ".marrow/" | ".marrow"))
+    {
+        return;
+    }
+    if std::fs::create_dir_all(&info_dir).is_err() {
+        return;
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content
+        .push_str("# Marrow workspace database (local-only exclude added by marrow)\n.marrow/\n");
+    let _ = std::fs::write(&exclude, content);
 }
 
 pub fn default_registry_path() -> PathBuf {

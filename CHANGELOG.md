@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Query-failure telemetry: every hard MCP tool-call failure is recorded in a capped per-workspace ring buffer with its exact inputs, plus per-category counters and a `tool_calls_total` denominator. Surfaced by `marrow doctor` (counters + last 10 failures) and the new `GET /api/query-failures?workspace_id=…` daemon endpoint.
+
 ### Changed
 
 - Upgraded the MCP SDK (`rmcp`) from 0.16 to 2.1, aligning marrow with the MCP 2025-11-25 specification. Protocol version negotiation with older clients is handled by the SDK's service layer. Resolves RUSTSEC-2026-0189 for good; the cargo-audit exception added in 0.1.2 is removed.
+- Agent-facing errors now carry guidance that works when followed literally: the "Symbol not found" and `save_observation` misses point at `find_symbol` (which needs no filepath), and the empty-graph note no longer tells agents to re-run a tool that cannot succeed. Windows verbatim `\\?\` prefixes are stripped from agent-facing paths.
+- Registering a workspace appends `.marrow/` to the repo's `.git/info/exclude` (local-only, never committed), so marrow no longer dirties `git status` in ingested repos.
+- Removed the `time <0.3.48` constraint dependency: `time` 0.3.49+ resolved the E0119 conflict with `cookie` 0.18, so fresh `cargo install` builds get the latest `time` again.
 
 ## [0.1.2] - 2026-07-03
 
