@@ -10128,6 +10128,11 @@ fn main() -> Result<()> {
     match args.get(1).map(|s| s.as_str()) {
         // Human interactive mode: no arguments → launch the TUI menu.
         None => return cmd_interactive(),
+        // Version — no runtime needed.
+        Some("--version") | Some("-V") | Some("version") => {
+            println!("marrow {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         // Help — no runtime needed.
         Some("--help") | Some("-h") | Some("help") => {
             println!("Usage: marrow [COMMAND]\n");
@@ -10152,6 +10157,7 @@ fn main() -> Result<()> {
             println!("  service install Install daemon autostart (compatibility alias)");
             println!("\nOptions:");
             println!("  --help, -h      Show this help");
+            println!("  --version, -V   Show version");
             return Ok(());
         }
         Some("ui-app") => {
@@ -10318,9 +10324,16 @@ async fn async_main(args: Vec<String>) -> Result<()> {
             }
             // Fall through to the stdio MCP server below.
         }
-        // Machine bypass: any unrecognised arg falls straight through to the
-        // stdio server without showing the menu.
-        Some(_) => {}
+        // Any other argument is an error. This used to fall through to the
+        // stdio MCP server, which silently hijacked typos and probes like
+        // `marrow --version` into a process that blocks on stdin forever.
+        // Every shipped integration launches the server via `marrow mcp`.
+        Some(other) => {
+            anyhow::bail!(
+                "Unknown command '{other}'. Run 'marrow --help' for usage \
+                 (the MCP stdio server is started with 'marrow mcp')."
+            );
+        }
     }
 
     // ── Default: start MCP stdio server ──────────────────────────────
