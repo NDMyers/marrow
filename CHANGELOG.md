@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-03
+
 ### Added
 
 - Post-ingest index self-check: every ingest (MCP `ingest_repo` and `marrow index`) now resolves a sample of freshly indexed symbols back through the agent query path — with stored file paths in both separator styles — and reports the result in the ingest output, so "ingest succeeded but queries can't see it" regressions fail loudly at ingest time. `marrow index` exits non-zero if the check fails.
@@ -18,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Unknown CLI arguments now exit with an error and usage hint instead of silently starting the stdio MCP server.
 - The "Repo not found … Run ingest_repo first" error no longer misleads agents into an ingest/query loop when the repo is indexed in a different workspace; the not-found error now names the current workspace and lists the repos that are indexed in it.
+
+### Changed
+
+- npm publishes to the `latest` dist-tag (was `alpha`), matching the install docs after #58; no manual dist-tag move is needed after publishing.
+
+### Security
+
+- Bumped `form-data` and `tar` in the npm lockfile past GHSA-hmw2-7cc7-3qxx (high) and GHSA-vmf3-w455-68vh (moderate).
+- Added a documented cargo-audit exception for RUSTSEC-2026-0189: the advisory covers rmcp's Streamable HTTP server transport, which Marrow does not compile (stdio transport only). The rmcp >=1.4 upgrade that removes the exception is tracked separately.
 
 ## [0.1.1] - 2026-06-12
 
