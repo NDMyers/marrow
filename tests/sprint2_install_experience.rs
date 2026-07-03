@@ -274,7 +274,11 @@ fn sprint2_packaging_metadata_and_release_workflow_cover_native_artifacts() {
     assert!(release.contains("id-token: write"));
     assert!(release.contains("npm audit --omit=dev --audit-level=moderate"));
     assert!(release.contains("npm pack --dry-run --json"));
-    assert!(release.contains("npm publish --access public --tag alpha --provenance"));
+    // Dist-tag comes from publishConfig.tag in package.json (latest since
+    // v0.1.2); the workflow must not override it with a --tag flag.
+    assert!(release.contains("npm publish --dry-run --access public\n"));
+    assert!(release.contains("npm publish --access public --provenance"));
+    assert!(!release.contains("--tag alpha"));
     assert!(release.contains("marrow-x86_64-unknown-linux-gnu.tar.gz"));
     assert!(release.contains("marrow-x86_64-apple-darwin.tar.gz"));
     assert!(release.contains("marrow-aarch64-apple-darwin.tar.gz"));
