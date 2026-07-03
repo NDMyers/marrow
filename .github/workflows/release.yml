@@ -267,5 +267,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm audit --omit=dev --audit-level=moderate
       - run: npm pack --dry-run --json
-      - run: npm publish --dry-run --access public --tag alpha
-      - run: npm publish --access public --tag alpha --provenance
+      # Dist-tag comes from publishConfig.tag in package.json (latest since
+      # v0.1.2, matching the install docs after #58) — don't override it here.
+      - run: npm publish --dry-run --access public
+      - run: npm publish --access public --provenance
