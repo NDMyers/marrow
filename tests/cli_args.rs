@@ -74,6 +74,28 @@ fn unknown_command_errors_instead_of_starting_mcp_server() {
 }
 
 #[test]
+fn doctor_reports_empty_workspace_cleanly() {
+    let workspace = tempfile::tempdir().unwrap();
+    let output = Command::new(marrow_bin())
+        .args(["doctor"])
+        .current_dir(workspace.path())
+        .env("MARROW_REGISTRY_PATH", scratch_registry_path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "doctor on an empty workspace should exit 0: {}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("no repos indexed"),
+        "doctor should say there is nothing to check: {}",
+        stdout(&output)
+    );
+}
+
+#[test]
 fn help_mentions_version_flag() {
     let output = run_marrow(&["--help"]);
     assert!(output.status.success());

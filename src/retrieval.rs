@@ -2271,7 +2271,7 @@ pub(crate) enum SymbolResolution {
 /// Callers that receive `Ambiguous` should surface the payload string
 /// directly as a successful tool result — **not** as an error — so agents
 /// can parse the list and retry with the specific filepaths.
-fn resolve_symbol_or_disambiguate(
+pub(crate) fn resolve_symbol_or_disambiguate(
     conn: &Connection,
     symbol_name: &str,
     repo_id: &str,

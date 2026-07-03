@@ -3,6 +3,7 @@ mod context;
 mod daemon;
 mod dashboard;
 mod db;
+mod doctor;
 mod ingestion;
 mod ipc;
 mod packaging;
@@ -3402,6 +3403,7 @@ impl ServerHandler for ContextEngine {
                         .ok()
                         .flatten();
 
+                    let db_for_selfcheck = Arc::clone(&db_for_ingestion);
                     let ingest_result = tokio::task::spawn_blocking(move || {
                         ingestion::run_ingestion_with_arc_and_activity(
                             &db_for_ingestion,
@@ -3439,6 +3441,22 @@ impl ServerHandler for ContextEngine {
                     }
                     let (symbols, edges) = ingest_result?;
 
+                    // Post-ingest self-check: prove the fresh index is
+                    // reachable through the agent query path, so indexing
+                    // regressions fail loudly here instead of silently
+                    // degrading every later query.
+                    let self_check_repo = repo_id_for_event.clone();
+                    let self_check_line = tokio::task::spawn_blocking(move || {
+                        let conn = db_for_selfcheck
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("DB mutex poisoned"))?;
+                        doctor::run_index_self_check(&conn, &self_check_repo, 8)
+                    })
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                    .map(|report| report.summary_line())
+                    .unwrap_or_else(|err| format!("Self-check skipped: {err}"));
+
                     let event = DashboardEvent::RepoIndexed {
                         repo_id: repo_id_for_event,
                         symbols,
@@ -3464,7 +3482,8 @@ impl ServerHandler for ContextEngine {
                     });
 
                     Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Ingested {symbols} symbols; resolved {edges} cross-repo edges."
+                        "Ingested {symbols} symbols; resolved {edges} cross-repo edges.\n\
+                         {self_check_line}"
                     ))]))
                 }
 
@@ -9853,6 +9872,7 @@ fn cmd_index(cli_args: &[String]) -> Result<()> {
     let db_path = ".marrow/graph.db";
     let conn = db::init_db_or_memory(db_path)?;
     let (symbol_count, edge_count) = ingestion::run_ingestion(&conn, &repo_id, &root)?;
+    let self_check = doctor::run_index_self_check(&conn, &repo_id, 8)?;
 
     let elapsed = t0.elapsed();
     eprintln!("\n── Index complete ──────────────────────────────────────────");
@@ -9860,6 +9880,10 @@ fn cmd_index(cli_args: &[String]) -> Result<()> {
     eprintln!("  Edges:   {}", fmt_num(edge_count));
     eprintln!("  Time:    {:.2?}", elapsed);
     eprintln!("  DB:      {db_path}");
+    eprintln!("  Check:   {}", self_check.summary_line());
+    if !self_check.passed() {
+        anyhow::bail!("index self-check failed — the index is not fully queryable (see above)");
+    }
 
     Ok(())
 }
@@ -10291,6 +10315,7 @@ fn main() -> Result<()> {
             println!("  benchmark       Run token benchmark");
             println!("  context         Compile provider-neutral context packet");
             println!("  query           Query a symbol");
+            println!("  doctor          Verify indexed repos answer agent queries [repo_id]");
             println!("  maintenance     Checkpoint & vacuum database");
             println!("  daemon          Start background daemon or manage autostart");
             println!("  status          Show daemon status");
@@ -10394,6 +10419,32 @@ async fn async_main(args: Vec<String>) -> Result<()> {
 
             let conn = db::init_db_or_memory(&db_path)?;
             run_benchmark(&conn, symbol, repo_id, None, precise)?;
+            return Ok(());
+        }
+        Some("doctor") => {
+            let db_path =
+                std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
+            let conn = db::init_db_or_memory(&db_path)?;
+            let repos: Vec<String> = match args.get(2) {
+                Some(repo) => vec![repo.clone()],
+                None => known_repo_ids(&conn),
+            };
+            if repos.is_empty() {
+                println!("[marrow] doctor: no repos indexed in {db_path}.");
+                return Ok(());
+            }
+            let mut all_passed = true;
+            for repo in &repos {
+                let report = doctor::run_index_self_check(&conn, repo, 8)?;
+                println!("[marrow] {}", report.summary_line());
+                all_passed &= report.passed();
+            }
+            if !all_passed {
+                anyhow::bail!(
+                    "doctor found unresolvable symbols — the index is not fully queryable"
+                );
+            }
+            println!("[marrow] doctor: all checks passed ({db_path}).");
             return Ok(());
         }
         Some("query") => {
