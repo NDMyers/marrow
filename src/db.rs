@@ -464,6 +464,111 @@ pub fn increment_stat(conn: &Connection, key: &str, delta: i64) -> Result<()> {
     Ok(())
 }
 
+/// One recorded MCP tool-call failure (agents route around these silently, so
+/// the ring buffer is the only durable evidence they happened).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct QueryFailure {
+    pub ts: String,
+    pub tool: String,
+    pub repo_id: Option<String>,
+    pub target: Option<String>,
+    pub filepath: Option<String>,
+    pub category: String,
+    pub message: String,
+}
+
+/// Newest-first cap on the query_failures ring buffer.
+const QUERY_FAILURE_RING_CAPACITY: i64 = 50;
+
+/// Bucket a failure message for counting. Categories are stable strings —
+/// they become stats keys (`query_failures_<category>`).
+pub fn categorize_query_failure(message: &str) -> &'static str {
+    if message.contains("not found in repo") {
+        "symbol_not_found"
+    } else if message.contains("Marrow database") || message.contains("registered workspace") {
+        "repo_not_found"
+    } else if message.contains("missing required argument") || message.contains("invalid") {
+        "invalid_params"
+    } else if message.contains("mutex") || message.contains("poisoned") {
+        "internal"
+    } else {
+        "other"
+    }
+}
+
+/// Record a hard MCP tool-call failure: append to the capped ring buffer
+/// (with the exact inputs — they are the debugging gold) and bump the
+/// per-category counters.
+pub fn record_query_failure(
+    conn: &Connection,
+    tool: &str,
+    repo_id: Option<&str>,
+    target: Option<&str>,
+    filepath: Option<&str>,
+    message: &str,
+) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS query_failures (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+             tool TEXT NOT NULL,
+             repo_id TEXT,
+             target TEXT,
+             filepath TEXT,
+             category TEXT NOT NULL,
+             message TEXT NOT NULL
+         );",
+    )?;
+    let category = categorize_query_failure(message);
+    conn.execute(
+        "INSERT INTO query_failures (tool, repo_id, target, filepath, category, message)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![tool, repo_id, target, filepath, category, message],
+    )?;
+    conn.execute(
+        "DELETE FROM query_failures WHERE id NOT IN (
+             SELECT id FROM query_failures ORDER BY id DESC LIMIT ?1
+         )",
+        rusqlite::params![QUERY_FAILURE_RING_CAPACITY],
+    )?;
+    increment_stat(conn, "query_failures_total", 1)?;
+    increment_stat(conn, &format!("query_failures_{category}"), 1)?;
+    Ok(())
+}
+
+/// Newest-first recent failures. Returns empty for DBs that have never
+/// recorded one (the table is created lazily on first failure).
+pub fn recent_query_failures(conn: &Connection, limit: usize) -> Result<Vec<QueryFailure>> {
+    let table_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'query_failures'",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut out = Vec::new();
+    if table_exists == 0 {
+        return Ok(out);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT ts, tool, repo_id, target, filepath, category, message
+         FROM query_failures ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+        Ok(QueryFailure {
+            ts: row.get(0)?,
+            tool: row.get(1)?,
+            repo_id: row.get(2)?,
+            target: row.get(3)?,
+            filepath: row.get(4)?,
+            category: row.get(5)?,
+            message: row.get(6)?,
+        })
+    })?;
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 fn canonicalize_best_effort(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -680,11 +785,13 @@ pub fn save_observation(
         Some(ref text) => hash_raw_text(text),
         None => {
             return Err(anyhow::anyhow!(
-                "No indexed node found for symbol '{}' in '{}'. \
-                 Run ingest_repo first, then supply the relative file path \
-                 as stored in the graph (e.g. 'src/main.rs').",
+                "No indexed node found for symbol '{}' at '{}'. Use \
+                 run_pipeline(intent: \"find_symbol\", target: \"{}\") to \
+                 discover the stored relative path and retry; if the repo was \
+                 never indexed, run ingest_repo first.",
                 symbol_name,
-                filepath
+                filepath,
+                symbol_name
             ))
         }
     };
@@ -1162,6 +1269,68 @@ mod tests {
     fn vacuum_and_checkpoint_runs_without_error() {
         let conn = init_db(":memory:").unwrap();
         vacuum_and_checkpoint(&conn).expect("vacuum_and_checkpoint should not error");
+    }
+
+    #[test]
+    fn query_failure_recording_counts_categorizes_and_caps() {
+        let conn = init_db(":memory:").unwrap();
+        record_query_failure(
+            &conn,
+            "run_pipeline",
+            Some("r"),
+            Some("foo"),
+            Some("a/b.rs"),
+            "Symbol 'foo' not found in repo 'r'. Use run_pipeline…",
+        )
+        .unwrap();
+        for i in 0..60 {
+            record_query_failure(
+                &conn,
+                "run_pipeline",
+                Some("r"),
+                None,
+                None,
+                &format!("weird breakage {i}"),
+            )
+            .unwrap();
+        }
+
+        let recent = recent_query_failures(&conn, 100).unwrap();
+        assert_eq!(recent.len(), 50, "ring buffer must cap at 50 rows");
+        assert!(
+            recent[0].message.contains("weird breakage 59"),
+            "newest first: {}",
+            recent[0].message
+        );
+        assert_eq!(read_stat(&conn, "query_failures_total"), 61);
+        assert_eq!(read_stat(&conn, "query_failures_symbol_not_found"), 1);
+        assert_eq!(read_stat(&conn, "query_failures_other"), 60);
+    }
+
+    #[test]
+    fn recent_query_failures_is_empty_when_never_recorded() {
+        let conn = init_db(":memory:").unwrap();
+        assert!(recent_query_failures(&conn, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn query_failure_categories_bucket_known_messages() {
+        assert_eq!(
+            categorize_query_failure("Symbol 'x' not found in repo 'r'."),
+            "symbol_not_found"
+        );
+        assert_eq!(
+            categorize_query_failure(
+                "Repo 'x' not found in this workspace's Marrow database (D:/w) or in any registered workspace."
+            ),
+            "repo_not_found"
+        );
+        assert_eq!(
+            categorize_query_failure("missing required argument: 'target'"),
+            "invalid_params"
+        );
+        assert_eq!(categorize_query_failure("DB mutex poisoned"), "internal");
+        assert_eq!(categorize_query_failure("something else"), "other");
     }
 
     #[test]

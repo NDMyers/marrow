@@ -1386,7 +1386,7 @@ fn ensure_repo_ready(
         eprintln!(
             "[MARROW] JIT auto-indexing repo '{}' at {} …",
             repo_id,
-            workspace_root.display()
+            display_path(workspace_root)
         );
         let t = Instant::now();
         ingestion::ingest_repo(conn, &repo_id, workspace_root)?;
@@ -1397,6 +1397,17 @@ fn ensure_repo_ready(
     }
 
     Ok(repo_id)
+}
+
+/// Render a path for human/agent-facing text, stripping the Windows verbatim
+/// `\\?\` prefix that `canonicalize` adds (left intact for UNC paths, where
+/// stripping would corrupt the path).
+fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => rest.to_string(),
+        _ => text,
+    }
 }
 
 /// A repo-scoped database connection: either the current workspace's shared
@@ -1449,7 +1460,7 @@ fn ensure_repo_conn<'a>(
         Ok(Some((remote, owner_root))) => {
             eprintln!(
                 "[marrow] serving repo '{repo_id}' read-only from workspace {}",
-                owner_root.display()
+                display_path(&owner_root)
             );
             Ok((RepoConn::Remote(remote), repo_id.to_string()))
         }
@@ -1466,7 +1477,7 @@ fn ensure_repo_conn<'a>(
                 "Repo '{repo_id}' not found in this workspace's Marrow database ({}) \
                  or in any registered workspace. If it was never indexed, run \
                  ingest_repo with its root_path. {known}",
-                workspace_root.display()
+                display_path(workspace_root)
             ))
         }
         // Registry unavailable — report the local miss rather than invent a cause.
@@ -3084,6 +3095,22 @@ impl ServerHandler for ContextEngine {
             let compliance_action = compliance.action;
             let args = compliance.args;
 
+            // Captured up front for failure telemetry — the exact inputs of a
+            // failed call are the debugging gold, and some arms move `args`.
+            let telemetry_repo = args
+                .get("repo_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let telemetry_target = args
+                .get("target")
+                .or_else(|| args.get("symbol_name"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let telemetry_filepath = args
+                .get("filepath")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
             let mut jit_auto_indexed = false;
 
             let mut result = match compliance.tool_name.as_str() {
@@ -3349,7 +3376,7 @@ impl ServerHandler for ContextEngine {
                              2. Ask the user for explicit permission. Say exactly: \"You requested context that requires indexing an external directory: {target_path}. Do you want me to index this directory into the Marrow graph?\"\n\
                              3. Wait for the user to reply.\n\
                              4. If the user replies \"yes\", re-run the `ingest_repo` tool with the exact same path, but add the parameter `\"user_confirmed\": true`.",
-                            target_path = root_path.display()
+                            target_path = display_path(&root_path)
                         );
                         return Ok(CallToolResult::success(vec![ContentBlock::text(msg)]));
                     }
@@ -3388,7 +3415,7 @@ impl ServerHandler for ContextEngine {
                         .start_activity(
                             activity::ActivityKind::IndexingJob,
                             registered_workspace_id.clone(),
-                            format!("indexing {}", root_path.display()),
+                            format!("indexing {}", display_path(&root_path)),
                         )
                         .await
                         .ok()
@@ -3649,7 +3676,9 @@ impl ServerHandler for ContextEngine {
                             } else {
                                 return Ok(CallToolResult::success(vec![ContentBlock::text(
                                     "[SYSTEM NOTE: The Marrow graph is empty and the workspace \
-                                     directory is not accessible. Run ingest_repo first.]",
+                                     directory is not accessible. Re-running this tool will not \
+                                     help; run ingest_repo with an absolute root_path to an \
+                                     accessible repository.]",
                                 )]));
                             }
                         }
@@ -4575,6 +4604,21 @@ impl ServerHandler for ContextEngine {
                 }
                 if matches!(compliance_action, ComplianceAction::AutoRouted) {
                     let _ = db::increment_stat(&conn, "direct_low_level_autorouted", 1);
+                }
+                let _ = db::increment_stat(&conn, "tool_calls_total", 1);
+                // Agents route around hard failures silently and fall back to
+                // native tools; recording each failure (inputs included) is
+                // the only durable evidence it happened. Surfaced by
+                // `marrow doctor` and /api/query-failures.
+                if let Err(err) = &result {
+                    let _ = db::record_query_failure(
+                        &conn,
+                        &original_tool_name,
+                        telemetry_repo.as_deref(),
+                        telemetry_target.as_deref(),
+                        telemetry_filepath.as_deref(),
+                        err.message.as_ref(),
+                    );
                 }
             }
 
@@ -10429,6 +10473,29 @@ async fn async_main(args: Vec<String>) -> Result<()> {
                 let report = doctor::run_index_self_check(&conn, repo, 8)?;
                 println!("[marrow] {}", report.summary_line());
                 all_passed &= report.passed();
+            }
+            let calls_total = db::read_stat(&conn, "tool_calls_total");
+            let failures_total = db::read_stat(&conn, "query_failures_total");
+            if calls_total > 0 || failures_total > 0 {
+                println!(
+                    "[marrow] lifetime MCP tool calls: {calls_total}; hard failures recorded: {failures_total}"
+                );
+            }
+            let recent = db::recent_query_failures(&conn, 10)?;
+            if !recent.is_empty() {
+                println!("[marrow] most recent failures (newest first):");
+                for failure in &recent {
+                    println!(
+                        "  [{}] {} via {} (repo={}, target={}, filepath={}): {}",
+                        failure.ts,
+                        failure.category,
+                        failure.tool,
+                        failure.repo_id.as_deref().unwrap_or("-"),
+                        failure.target.as_deref().unwrap_or("-"),
+                        failure.filepath.as_deref().unwrap_or("-"),
+                        failure.message
+                    );
+                }
             }
             if !all_passed {
                 anyhow::bail!(

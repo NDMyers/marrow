@@ -2326,7 +2326,9 @@ pub(crate) fn resolve_symbol_or_disambiguate(
 
     match candidates.len() {
         0 => Err(anyhow!(
-            "Symbol '{}' not found in repo '{}'",
+            "Symbol '{}' not found in repo '{}'. Use run_pipeline(intent: \
+             \"find_symbol\", target: \"<name fragment>\") to locate the \
+             stored symbol name and file path, then retry with those.",
             symbol_name,
             repo_id
         )),
@@ -2889,6 +2891,49 @@ mod tests {
             rusqlite::params![repo_id, root_path],
         )
         .unwrap();
+    }
+
+    /// The not-found error tells agents to use find_symbol — following that
+    /// advice must actually work: locate the stored path, retry, resolve.
+    #[test]
+    fn not_found_error_advice_is_followable() {
+        let conn = make_db();
+        insert_repo(&conn, "r", "/tmp/r");
+        insert_node(
+            &conn,
+            "r:src/deep/util.py:hidden_fn",
+            "r",
+            "src/deep/util.py",
+            "py",
+            "hidden_fn",
+            "function",
+            "def hidden_fn():\n    return 1\n",
+        );
+
+        // Wrong filepath → not found, with find_symbol guidance.
+        let err =
+            match resolve_symbol_or_disambiguate(&conn, "hidden_fn", "r", Some("wrong/path.py")) {
+                Err(err) => err.to_string(),
+                Ok(_) => panic!("expected a not-found error for the wrong filepath"),
+            };
+        assert!(err.contains("not found"), "not-found core missing: {err}");
+        assert!(
+            err.contains("find_symbol"),
+            "error must point at find_symbol: {err}"
+        );
+
+        // Follow the advice: find_symbol discovers the stored path…
+        let listing = find_symbols(&conn, "r", "hidden", None, 10).unwrap();
+        assert!(
+            listing.contains("src/deep/util.py"),
+            "find_symbol should reveal the stored path: {listing}"
+        );
+
+        // …and retrying with it resolves uniquely.
+        let resolved =
+            resolve_symbol_or_disambiguate(&conn, "hidden_fn", "r", Some("src/deep/util.py"))
+                .unwrap();
+        assert!(matches!(resolved, SymbolResolution::Unique(_)));
     }
 
     fn insert_edge(conn: &Connection, src: &str, tgt: &str, rel: &str) {
