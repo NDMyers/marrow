@@ -154,6 +154,18 @@ The same investigation drove output-budgeting fixes (`file:line` on all structur
 
 Caveats: the Claude Code A/B runs are small-n (one repository, one question per arm) measured during local development — treat them as indicative, not universal. For token-reduction claims about your own graph, run `marrow benchmark --precise-file-tokens <symbol> <repo_id>` for exact, reproducible cl100k_base counts.
 
+**What Marrow is measurably good at — and what it is not.** Two independent free-choice A/B campaigns (July 2026: 24 cold-start agent runs plus two per-arm cost controls, across this repo and llama.cpp; ground truth and scoring pre-registered before any run, costs measured as marginal tokens over the controls) produced a consistent routing map:
+
+| Question shape | Measured outcome | Use |
+|---|---|---|
+| "Which **functions** call X — and are they tests or production?" | **Marrow ~1.6× cheaper at identical quality, on both repos** — grep pays an attribution tax (many extra reads to map hits to enclosing functions/test modules) that the graph eliminates | **Marrow** |
+| "Explain function X and its direct callees" | Quality tie; Marrow answers in **one call** with a complete callee table vs 2–3 targeted reads at similar or modestly lower native token cost | Either (Marrow for fewer round trips) |
+| "Where does this exact string/name appear (file:line)?" | Native ~1.5–2× cheaper at identical quality | **grep** (Marrow's agent guidance already routes this away) |
+| "Find the function that does <behavior>" | Comparable; no measured Marrow advantage | Either |
+| Small blast-radius impact (≤10 direct callers) | Wash; graph advantage grows with caller count and transitive depth | Either |
+
+Honest context for the token-reduction table above: those reductions compare capsules against reading the pivot's *entire graph neighborhood* (~20 files). An agent making one surgical read of a short, already-located function achieves similar marginal cost — capsule savings scale with how much code the alternative would have to read into context. Full protocols, per-cell data, and verbatim pre-registered ground truth: [benchmark-6-free-choice-ab.md](docs/benchmarks/benchmark-6-free-choice-ab.md) and [benchmark-7-capability-map.md](docs/benchmarks/benchmark-7-capability-map.md).
+
 ## Agent integrations
 
 `marrow integrate` uses an internal registry of MCP setup targets, in three tiers:
