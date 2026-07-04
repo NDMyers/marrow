@@ -87,7 +87,7 @@ dirs = "5.0"
 
 # Live web dashboard
 axum            = { version = "0.8", features = ["macros"] }
-tower-http      = { version = "0.6", features = ["cors"] }
+tower-http      = { version = "0.7", features = ["cors"] }
 open            = "5"
 reqwest          = { version = "0.12", default-features = false, features = ["json"] }
 tokio-stream    = { version = "0.1", features = ["sync"] }
