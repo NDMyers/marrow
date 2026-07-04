@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # actions/checkout — first-party, pinned to v4.2.2
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # dtolnay/rust-toolchain — first-party Rust ecosystem, uses branch refs by design.
       # Exception: This action uses branch-based refs (stable/nightly) intentionally;
       # SHA pinning would break automatic toolchain updates.
@@ -30,7 +30,7 @@ jobs:
   packaging-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu
@@ -67,7 +67,7 @@ jobs:
       # integration" even when the audit itself is clean.
       checks: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # rustsec/audit-check — official RustSec advisory-db integration, pinned to v2.0.0
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
@@ -79,7 +79,7 @@ jobs:
       run:
         working-directory: npm
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # actions/setup-node — first-party, pinned to v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -91,7 +91,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: rust
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux desktop build dependencies (wry/tao/tray-icon)
         run: |
