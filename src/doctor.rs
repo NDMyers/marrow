@@ -56,10 +56,12 @@ pub fn run_index_self_check(
     repo_id: &str,
     sample_limit: usize,
 ) -> Result<SelfCheckReport> {
+    // No symbol_type filter: every indexed kind (functions, type aliases,
+    // unions, macros, …) must be reachable through the agent query path, and a
+    // kind whitelist here silently exempts files that contain only new kinds.
     let mut stmt = conn.prepare(
         "SELECT MIN(symbol_name), file_path FROM nodes
          WHERE repo_id = ?1
-           AND symbol_type IN ('function', 'method', 'class', 'struct')
          GROUP BY file_path
          ORDER BY file_path
          LIMIT ?2",
@@ -148,6 +150,25 @@ mod tests {
             "expected both-style checks, got {}",
             report.checked
         );
+    }
+
+    /// Files whose only symbols are type-level kinds (aliases, unions, macros)
+    /// must still be sampled — a kind whitelist here would leave them invisible
+    /// to the health check.
+    #[test]
+    fn self_check_samples_files_with_only_type_level_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("aliases.rs"), "type Meters = u64;\n").unwrap();
+        let conn = crate::db::init_db(":memory:").unwrap();
+        crate::ingestion::ingest_repo(&conn, "fixture", dir.path()).unwrap();
+
+        let report = run_index_self_check(&conn, "fixture", 8).unwrap();
+        assert!(
+            report.checked > 0,
+            "types-only file should be sampled: {}",
+            report.summary_line()
+        );
+        assert!(report.passed(), "should pass: {}", report.summary_line());
     }
 
     #[test]
