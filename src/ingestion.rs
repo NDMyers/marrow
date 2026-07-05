@@ -1578,12 +1578,13 @@ where
             crate::db::mark_stale_observations(conn, repo_id, &sym.name, &file_path, &new_hash)?;
 
             // Callees were pre-computed during the parallel parse phase and stored in the
-            // spill file — no tree-sitter re-parse needed here.
+            // spill file — no tree-sitter re-parse needed here. Callees that
+            // share the symbol's own name stay in: self-recursion is dropped
+            // by node id at resolution, so a wrapper calling a same-named
+            // overload keeps its edge.
             for callee_name in &sym.callees {
-                if callee_name != &sym.name {
-                    all_callee_names.insert(callee_name.clone());
-                    pending_calls.push((node_id.clone(), callee_name.clone(), file_path.clone()));
-                }
+                all_callee_names.insert(callee_name.clone());
+                pending_calls.push((node_id.clone(), callee_name.clone(), file_path.clone()));
             }
         }
         conn.execute(
@@ -1620,9 +1621,14 @@ where
                 .collect();
             if !same_file.is_empty() {
                 for id in same_file {
-                    calls_batch.push((source_id.clone(), id.to_string()));
+                    // Recursion is suppressed by identity, not name, so
+                    // same-named siblings (overloads, bare-named members)
+                    // still receive edges.
+                    if id != source_id {
+                        calls_batch.push((source_id.clone(), id.to_string()));
+                    }
                 }
-            } else if targets.len() == 1 {
+            } else if targets.len() == 1 && &targets[0].0 != source_id {
                 calls_batch.push((source_id.clone(), targets[0].0.clone()));
             }
             // else: ambiguous (multiple targets in different files), skip
@@ -1794,9 +1800,7 @@ pub fn apply_single_file_update(
         }
         crate::db::mark_stale_observations(&tx, repo_id, &sym.name, rel_path, &new_hash)?;
         for callee_name in &sym.callees {
-            if callee_name != &sym.name {
-                callee_names.insert(callee_name.clone());
-            }
+            callee_names.insert(callee_name.clone());
         }
     }
 
@@ -1811,12 +1815,10 @@ pub fn apply_single_file_update(
             sym.start_byte,
         );
         for callee_name in &sym.callees {
-            if callee_name == &sym.name {
-                continue;
-            }
             if let Some(targets) = name_to_ids.get(callee_name.as_str()) {
                 // M-5 scoping: prefer same-file targets; else emit only if the
-                // name resolves unambiguously (single target).
+                // name resolves unambiguously (single target). Self-recursion
+                // is dropped by node id so same-named siblings keep edges.
                 let same_file: Vec<&str> = targets
                     .iter()
                     .filter(|(_, fp)| fp == rel_path)
@@ -1824,9 +1826,11 @@ pub fn apply_single_file_update(
                     .collect();
                 if !same_file.is_empty() {
                     for id in same_file {
-                        calls_batch.push((source_id.clone(), id.to_string()));
+                        if id != source_id.as_str() {
+                            calls_batch.push((source_id.clone(), id.to_string()));
+                        }
                     }
-                } else if targets.len() == 1 {
+                } else if targets.len() == 1 && targets[0].0 != source_id {
                     calls_batch.push((source_id.clone(), targets[0].0.clone()));
                 }
                 // else: ambiguous cross-file, skip
@@ -2725,6 +2729,63 @@ function foo() {
             )
             .unwrap();
         assert_eq!(to_struct, 0, "no CALLS edge may target the struct node");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Self-call suppression is by node id, not name: a member indexed under
+    /// its bare name calling a same-named sibling keeps that edge, while
+    /// plain recursion still produces no self-edge.
+    #[test]
+    fn test_same_named_sibling_keeps_call_edge_without_self_edge() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_self_call_by_id");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("refresh.cpp"),
+            "struct widget { void refresh(); };\n\
+             void refresh() {}\n\
+             void widget::refresh() { refresh(); }\n\
+             int spin(int x) { return spin(x - 1); }\n",
+        )
+        .unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let sibling_edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes s ON s.id = e.source_id \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND s.symbol_name = 'refresh' AND t.symbol_name = 'refresh' \
+                   AND s.id != t.id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sibling_edges, 1,
+            "member refresh must keep its edge to the same-named free function"
+        );
+
+        let self_edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges \
+                 WHERE relationship_type = 'CALLS' AND source_id = target_id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(self_edges, 0, "recursion must not produce a self edge");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
