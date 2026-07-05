@@ -92,12 +92,23 @@ fn ingest_parse_queue_capacity() -> usize {
         .unwrap_or(64)
 }
 
+/// Extensions that all share the tree-sitter-cpp grammar path.
+/// The single source of truth for "is this a C/C++ file" — every ingestion
+/// and retrieval decision that treats the c-family specially routes through
+/// here so a new extension can never be added to one list and missed in
+/// another (the `.c` rollout touched five hardcoded lists).
+pub fn is_c_family_ext(ext: &str) -> bool {
+    matches!(ext, "c" | "cpp" | "cc" | "cxx" | "h" | "hpp")
+}
+
 /// Return the tree-sitter `Language` for a file extension.
 /// Extracted from `lang_config_for_ext` so other modules (e.g. watcher) can
 /// check parsability without needing the full query config.
 pub fn language_for_ext(ext: &str) -> Option<Language> {
+    if is_c_family_ext(ext) {
+        return Some(tree_sitter_cpp::LANGUAGE.into());
+    }
     match ext {
-        "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
         "py" => Some(tree_sitter_python::LANGUAGE.into()),
         "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
@@ -1020,10 +1031,32 @@ where
 
 // ── Phase C: brief DB write ───────────────────────────────────────────────────
 
+/// Whether a symbol of this kind can be the *target* of a CALLS edge.
+///
+/// Type-level declarations (interfaces, type aliases, unions, macro
+/// definitions) are never callees; leaving them in the candidate set either
+/// turns a previously-unique name ambiguous (C `struct foo` + `void foo()`
+/// silently drops the edge) or steals the edge outright (TS `type Button` +
+/// `const Button = () => ...` in one file). C/C++ structs and enums are
+/// likewise type-only, but Rust tuple-struct constructors (`Foo(..)`) and
+/// class constructors (Python/C++) are real call targets, so `struct` stays
+/// callable outside the c-family and `class` stays callable everywhere.
+/// `macro` is safe to exclude: Rust macro invocations parse as
+/// `macro_invocation`, which the call query never captures.
+pub(crate) fn is_callable_symbol_kind(symbol_type: &str, language: &str) -> bool {
+    match symbol_type {
+        "interface" | "type" | "union" | "macro" => false,
+        "struct" | "enum" => !is_c_family_ext(language),
+        _ => true,
+    }
+}
+
 /// Map `symbol_name -> node id` for a bounded set of names (MARROW-PERF-009).
 ///
 /// Uses a temp table + join so we avoid scanning every row in `nodes` and stay
 /// within SQLite’s bound-parameter limits for large callee sets.
+/// Only returns nodes that can actually be call targets (see
+/// `is_callable_symbol_kind`) — the sole consumers are CALLS-edge resolvers.
 pub(crate) fn build_name_to_ids_for_symbol_names(
     conn: &Connection,
     repo_id: &str,
@@ -1048,7 +1081,7 @@ pub(crate) fn build_name_to_ids_for_symbol_names(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT n.symbol_name, n.id, n.file_path FROM nodes n
+        "SELECT n.symbol_name, n.id, n.file_path, n.symbol_type, n.language FROM nodes n
          INNER JOIN _marrow_callee_lookup c ON n.symbol_name = c.name
          WHERE n.repo_id = ?1",
     )?;
@@ -1057,10 +1090,15 @@ pub(crate) fn build_name_to_ids_for_symbol_names(
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })?;
     for r in rows {
-        let (name, id, file_path) = r?;
+        let (name, id, file_path, symbol_type, language) = r?;
+        if !is_callable_symbol_kind(&symbol_type, &language) {
+            continue;
+        }
         map.entry(name).or_default().push((id, file_path));
     }
 
@@ -2039,6 +2077,154 @@ function foo() {
             )
             .unwrap();
         assert!(edge_count >= 1, "no CALLS edges in DB");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T1 regression: indexing `struct foo` must not make a cross-file call to
+    /// `void foo()` ambiguous — type-level twins are excluded from the CALLS
+    /// candidate set, so the function keeps its edge.
+    #[test]
+    fn test_c_struct_name_twin_does_not_break_function_call_edge() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_kind_aware_c_twin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foo.h"), "struct foo { int x; };\n").unwrap();
+        std::fs::write(dir.join("foo.c"), "void foo(void) {}\n").unwrap();
+        std::fs::write(dir.join("caller.c"), "void bar(void) { foo(); }\n").unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let to_function: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes s ON s.id = e.source_id \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND s.symbol_name = 'bar' \
+                   AND t.symbol_name = 'foo' AND t.symbol_type = 'function'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            to_function, 1,
+            "same-name struct must not turn the function callee ambiguous"
+        );
+
+        let to_struct: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND t.symbol_name = 'foo' AND t.symbol_type != 'function'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(to_struct, 0, "no CALLS edge may target the struct node");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T1 regression: TS `type Button` + `const Button = () => ...` in one
+    /// file — a `Button()` call must land on the function node only.
+    #[test]
+    fn test_ts_type_value_twin_resolves_call_to_function_not_type() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_kind_aware_ts_twin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("button.ts"),
+            "type Button = { label: string };\n\
+             export const Button = () => ({ label: \"ok\" });\n\
+             export const render = () => Button();\n",
+        )
+        .unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let to_function: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes s ON s.id = e.source_id \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND s.symbol_name = 'render' \
+                   AND t.symbol_name = 'Button' AND t.symbol_type = 'function'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(to_function, 1, "call must resolve to the value binding");
+
+        let to_type: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND t.symbol_name = 'Button' AND t.symbol_type = 'type'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(to_type, 0, "no CALLS edge may target the type alias node");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T1 guard: Rust tuple-struct constructors are real call targets and must
+    /// keep their edges under the kind-aware filter.
+    #[test]
+    fn test_rust_tuple_struct_constructor_call_still_resolves() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_kind_aware_rs_tuple");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("newtype.rs"),
+            "pub struct Newtype(pub u32);\n\npub fn make() -> Newtype {\n    Newtype(1)\n}\n",
+        )
+        .unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let to_struct: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes s ON s.id = e.source_id \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND s.symbol_name = 'make' \
+                   AND t.symbol_name = 'Newtype' AND t.symbol_type = 'struct'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(to_struct, 1, "Rust struct must stay a valid call target");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
