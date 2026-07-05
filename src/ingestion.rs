@@ -294,18 +294,31 @@ fn is_identifier_kind(kind: &str) -> bool {
     )
 }
 
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Locate the parameter-list `()` in a collapsed special-function name: the
+/// `()` followed by a space or end-of-string. A `()` inside a conversion
+/// operator's target type (e.g. `operator std::function<void()>()`) is
+/// always followed by another token character, never a collapsed space.
+fn find_param_list_parens(collapsed: &str) -> Option<usize> {
+    collapsed
+        .match_indices("()")
+        .map(|(idx, _)| idx)
+        .find(|&idx| matches!(collapsed.as_bytes().get(idx + 2), None | Some(b' ')))
+}
+
 fn normalize_cpp_special_function_name(text: &str) -> String {
-    let collapsed = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace(" ()", "()");
+    let collapsed = collapse_whitespace(text).replace(" ()", "()");
     let Some(rest) = collapsed.strip_prefix("operator ") else {
         return collapsed;
     };
 
-    if rest.starts_with("\"\"") {
-        return collapsed;
+    if let Some(suffix) = rest.strip_prefix("\"\"") {
+        // Spaced literal operators (`operator "" _kb`) share an index key
+        // with the compact spelling `operator""_kb`.
+        return format!("operator\"\"{}", suffix.trim_start());
     }
     if let Some(suffix) = rest.strip_prefix("new []") {
         return format!("operator new[]{suffix}");
@@ -320,10 +333,23 @@ fn normalize_cpp_special_function_name(text: &str) -> String {
     {
         return format!("operator{rest}");
     }
-    if let Some(paren) = collapsed.find("()") {
+    // Conversion operator: keep everything through the parameter list,
+    // dropping trailing qualifiers such as `const` or `noexcept`.
+    if let Some(paren) = find_param_list_parens(&collapsed) {
         return collapsed[..paren + 2].to_string();
     }
     collapsed
+}
+
+/// Template names collapse to a compact spelling (`from_float<int>`) so the
+/// index key does not depend on how the author spaced the argument list.
+fn normalize_cpp_template_name(text: &str) -> String {
+    collapse_whitespace(text)
+        .replace(" <", "<")
+        .replace("< ", "<")
+        .replace(" >", ">")
+        .replace(" ,", ",")
+        .replace(", ", ",")
 }
 
 /// Recursively descend through C++ declarator chains to find the terminal identifier.
@@ -345,12 +371,9 @@ fn find_name_in_declarator<'a>(node: tree_sitter::Node<'a>, source: &[u8]) -> Op
         ));
     }
     if matches!(node.kind(), "template_function" | "template_method") {
-        return Some(
-            node.utf8_text(source)
-                .unwrap_or("unknown")
-                .trim()
-                .to_string(),
-        );
+        return Some(normalize_cpp_template_name(
+            node.utf8_text(source).unwrap_or("unknown"),
+        ));
     }
     if node.kind() == "qualified_identifier" {
         // e.g. MyClass::myMethod — take the rightmost `name` field or last identifier child
@@ -359,12 +382,17 @@ fn find_name_in_declarator<'a>(node: tree_sitter::Node<'a>, source: &[u8]) -> Op
                 .or_else(|| Some(name_node.utf8_text(source).unwrap_or("unknown").to_string()));
         }
     }
-    // Recurse into the `declarator` field if present (covers function_declarator,
-    // pointer_declarator, reference_declarator, etc.)
+    // Recurse into the `declarator` field if present (function_declarator,
+    // pointer_declarator, ...). reference_declarator and parenthesized_declarator
+    // wrap their inner declarator as a plain named child WITHOUT a `declarator`
+    // field, so those walk their named children below instead.
     if let Some(inner) = node.child_by_field_name("declarator") {
         return find_name_in_declarator(inner, source);
     }
-    if node.kind() == "reference_declarator" {
+    if matches!(
+        node.kind(),
+        "reference_declarator" | "parenthesized_declarator"
+    ) {
         for i in 0..node.named_child_count() {
             if let Some(child) = node.named_child(i as u32) {
                 if let Some(name) = find_name_in_declarator(child, source) {
@@ -2359,6 +2387,39 @@ template <> void from_float<int>(const float *) {}
         assert_has_symbol(&symbols, "~functor", "function");
         assert_has_symbol(&symbols, "args_target", "function");
         assert_has_symbol(&symbols, "from_float<int>", "function");
+        assert_missing_symbol_name(&symbols, "anonymous");
+    }
+
+    #[test]
+    fn cpp_exotic_declarator_names_are_normalized() {
+        let symbols = symbol_pairs_from_source(
+            "cpp",
+            r#"
+struct widget {
+    operator std::function<void()>() const { return {}; }
+};
+
+unsigned long long operator "" _km(unsigned long long v) { return v; }
+unsigned long long operator""_mi(unsigned long long v) { return v; }
+template <> void from_double< int >(const double *) {}
+struct outer_s { struct inner_s { void method(); }; };
+void outer_s::inner_s::method() {}
+int (*get_handler())(int) { return nullptr; }
+"#,
+        );
+
+        // The `()` inside the conversion target type must not truncate the name.
+        assert_has_symbol(&symbols, "operator std::function<void()>()", "function");
+        // Spaced and compact literal-operator spellings share one name shape.
+        assert_has_symbol(&symbols, "operator\"\"_km", "function");
+        assert_has_symbol(&symbols, "operator\"\"_mi", "function");
+        // Template specializations normalize to the compact spelling.
+        assert_has_symbol(&symbols, "from_double<int>", "function");
+        // Multi-level qualified out-of-line definitions index under the bare
+        // method name, matching single-level `functor::args_target`.
+        assert_has_symbol(&symbols, "method", "function");
+        // Function returning a function pointer: parenthesized_declarator.
+        assert_has_symbol(&symbols, "get_handler", "function");
         assert_missing_symbol_name(&symbols, "anonymous");
     }
 
