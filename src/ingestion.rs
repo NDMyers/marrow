@@ -1456,6 +1456,162 @@ where
     Ok((total, calls_edge_count))
 }
 
+/// Re-index a single file in place — the shared implementation behind both
+/// watch paths (`marrow watch` and the dashboard watcher).
+///
+/// Mirrors the per-file section of `write_changeset_body`: node ids come from
+/// `make_node_id`, unchanged ids survive as UPDATEs so inbound CALLS edges
+/// stay alive (MARROW-PERF-011), removed ids take their edges with them, and
+/// outgoing CALLS edges are rebuilt from the symbols' pre-computed callees
+/// with the same same-file-then-unambiguous scoping as full ingest.
+/// Pass `None` for `parsed_symbols` when the file was deleted.
+/// Returns the number of symbols written.
+pub fn apply_single_file_update(
+    conn: &Connection,
+    repo_id: &str,
+    rel_path: &str,
+    lang_ext: &str,
+    parsed_symbols: Option<Vec<Symbol>>,
+) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    crate::db::mark_graph_degrees_dirty(&tx, repo_id)?;
+
+    let old_ids: HashSet<String> = tx
+        .prepare("SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2")?
+        .query_map(rusqlite::params![repo_id, rel_path], |row| {
+            row.get::<_, String>(0)
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Outgoing CALLS from this file are rebuilt below; inbound edges onto
+    // stable node ids survive (MARROW-PERF-011).
+    tx.execute(
+        "DELETE FROM edges WHERE source_id IN (
+            SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)",
+        rusqlite::params![repo_id, rel_path],
+    )?;
+
+    let Some(symbols) = parsed_symbols else {
+        // File deleted: stale-mark its observations, then drop its nodes and
+        // any edges still touching them.
+        let existing_symbols: Vec<String> = tx
+            .prepare("SELECT symbol_name FROM nodes WHERE repo_id = ?1 AND file_path = ?2")?
+            .query_map(rusqlite::params![repo_id, rel_path], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for symbol_name in &existing_symbols {
+            crate::db::mark_deleted_observation_stale(&tx, repo_id, symbol_name, rel_path)?;
+        }
+        let removed: Vec<String> = old_ids.into_iter().collect();
+        delete_edges_touching_removed_ids(&tx, &removed)?;
+        tx.execute(
+            "DELETE FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
+            rusqlite::params![repo_id, rel_path],
+        )?;
+        tx.commit()?;
+        resolve_cross_repo_after_ingest(conn, repo_id)?;
+        return Ok(0);
+    };
+
+    let new_ids: HashSet<String> = symbols
+        .iter()
+        .map(|s| make_node_id(repo_id, rel_path, &s.symbol_type, &s.name, s.start_byte))
+        .collect();
+    let removed: Vec<String> = old_ids.difference(&new_ids).cloned().collect();
+    delete_edges_touching_removed_ids(&tx, &removed)?;
+    for id in &removed {
+        tx.execute("DELETE FROM nodes WHERE id = ?1", rusqlite::params![id])?;
+    }
+
+    let mut callee_names: HashSet<String> = HashSet::new();
+    for sym in &symbols {
+        let node_id = make_node_id(repo_id, rel_path, &sym.symbol_type, &sym.name, sym.start_byte);
+        let new_hash = crate::db::hash_raw_text(&sym.raw_text);
+        if old_ids.contains(&node_id) {
+            tx.execute(
+                "UPDATE nodes SET language = ?1, symbol_name = ?2, symbol_type = ?3, raw_text = ?4, \
+                 source_start_byte = ?5, source_end_byte = ?6, start_line = ?7, start_column = ?8, \
+                 end_line = ?9, end_column = ?10 WHERE id = ?11",
+                rusqlite::params![
+                    lang_ext,
+                    sym.name,
+                    sym.symbol_type,
+                    sym.raw_text,
+                    sym.start_byte as i64,
+                    sym.end_byte as i64,
+                    sym.start_line as i64,
+                    sym.start_column as i64,
+                    sym.end_line as i64,
+                    sym.end_column as i64,
+                    node_id
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT OR REPLACE INTO nodes \
+                 (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text, \
+                  source_start_byte, source_end_byte, start_line, start_column, end_line, end_column)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    node_id,
+                    repo_id,
+                    rel_path,
+                    lang_ext,
+                    sym.name,
+                    sym.symbol_type,
+                    sym.raw_text,
+                    sym.start_byte as i64,
+                    sym.end_byte as i64,
+                    sym.start_line as i64,
+                    sym.start_column as i64,
+                    sym.end_line as i64,
+                    sym.end_column as i64
+                ],
+            )?;
+        }
+        crate::db::mark_stale_observations(&tx, repo_id, &sym.name, rel_path, &new_hash)?;
+        for callee_name in &sym.callees {
+            if callee_name != &sym.name {
+                callee_names.insert(callee_name.clone());
+            }
+        }
+    }
+
+    let name_to_ids = build_name_to_ids_for_symbol_names(&tx, repo_id, &callee_names)?;
+    let mut calls_batch: Vec<(String, String)> = Vec::new();
+    for sym in &symbols {
+        let source_id = make_node_id(repo_id, rel_path, &sym.symbol_type, &sym.name, sym.start_byte);
+        for callee_name in &sym.callees {
+            if callee_name == &sym.name {
+                continue;
+            }
+            if let Some(targets) = name_to_ids.get(callee_name.as_str()) {
+                // M-5 scoping: prefer same-file targets; else emit only if the
+                // name resolves unambiguously (single target).
+                let same_file: Vec<&str> = targets
+                    .iter()
+                    .filter(|(_, fp)| fp == rel_path)
+                    .map(|(id, _)| id.as_str())
+                    .collect();
+                if !same_file.is_empty() {
+                    for id in same_file {
+                        calls_batch.push((source_id.clone(), id.to_string()));
+                    }
+                } else if targets.len() == 1 {
+                    calls_batch.push((source_id.clone(), targets[0].0.clone()));
+                }
+                // else: ambiguous cross-file, skip
+            }
+        }
+    }
+    flush_calls_edge_batch(&tx, &calls_batch)?;
+
+    tx.commit()?;
+    resolve_cross_repo_after_ingest(conn, repo_id)?;
+    Ok(symbols.len())
+}
+
 // ── Composed entry points ─────────────────────────────────────────────────────
 
 fn ingest_repo_with_progress<F>(
@@ -2225,6 +2381,109 @@ function foo() {
             )
             .unwrap();
         assert_eq!(to_struct, 1, "Rust struct must stay a valid call target");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T4: a watch-path update must produce byte-identical node ids to full
+    /// ingest — same-name twins (TS `type Button` + `const Button`) collapse
+    /// onto one row or dangle inbound edges otherwise.
+    #[test]
+    fn test_watch_update_node_ids_match_full_ingest() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_watch_id_parity");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("button.ts");
+        std::fs::write(
+            &file,
+            "type Button = { label: string };\n\
+             export const Button = () => ({ label: \"ok\" });\n",
+        )
+        .unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let ids_after_ingest = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT id FROM nodes WHERE repo_id = 'test' ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        let full_ingest_ids = ids_after_ingest(&conn);
+        assert_eq!(
+            full_ingest_ids.len(),
+            2,
+            "type + const twins must be two nodes: {full_ingest_ids:?}"
+        );
+
+        // Re-index the same file through the watch path.
+        let (ext, symbols) = parse_file(&file).unwrap();
+        apply_single_file_update(&conn, repo_id, "button.ts", &ext, Some(symbols)).unwrap();
+
+        let watch_ids = ids_after_ingest(&conn);
+        assert_eq!(
+            full_ingest_ids, watch_ids,
+            "watch updates must write make_node_id-keyed rows"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-saving a file with unchanged content must keep every node and edge.
+    /// (Regression: the old watcher path deleted all rows for the file and
+    /// then UPDATEd the surviving ids — updating deleted rows no-ops, so
+    /// unchanged symbols silently vanished on every re-save.)
+    #[test]
+    fn test_watch_resave_unchanged_file_keeps_nodes_and_edges() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_watch_resave");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("calls.py");
+        std::fs::write(&file, "def helper():\n    pass\n\ndef main():\n    helper()\n").unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        for _ in 0..2 {
+            let (ext, symbols) = parse_file(&file).unwrap();
+            apply_single_file_update(&conn, repo_id, "calls.py", &ext, Some(symbols)).unwrap();
+        }
+
+        let nodes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nodes, 2, "unchanged symbols must survive re-saves");
+
+        let edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE relationship_type = 'CALLS'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edges, 1, "the CALLS edge must survive re-saves");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

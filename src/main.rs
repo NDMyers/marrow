@@ -10130,9 +10130,6 @@ pub fn run_watch_command(workspace_root: &Path) -> Result<()> {
             .bold()
     );
 
-    let supported_exts = [
-        "cpp", "cc", "cxx", "h", "hpp", "py", "ts", "tsx", "rs", "rb",
-    ];
     let repo_id = workspace_root
         .file_name()
         .and_then(|n| n.to_str())
@@ -10147,47 +10144,54 @@ pub fn run_watch_command(workspace_root: &Path) -> Result<()> {
                         continue;
                     }
                     let path = &event.path;
-                    let ext_ok = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|e| supported_exts.contains(&e));
-                    if !ext_ok {
+                    // Gate on the same predicates as ingest so watch can never
+                    // drift behind the supported-language list again.
+                    let ext = match path.extension().and_then(|e| e.to_str()) {
+                        Some(e) => e.to_string(),
+                        None => continue,
+                    };
+                    if ingestion::language_for_ext(&ext).is_none()
+                        || !ingestion::is_safe_to_parse(path)
+                    {
                         continue;
                     }
-                    let rel = path
-                        .strip_prefix(workspace_root)
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .to_string();
-                    match ingestion::parse_file(path) {
-                        Ok((lang, symbols)) => {
-                            if let Ok(conn) = conn.lock() {
-                                let node_id_prefix = format!("{repo_id}:{rel}:");
-                                // Remove stale nodes for this file then re-insert.
-                                let _ = conn.execute(
-                                    "DELETE FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
-                                    rusqlite::params![repo_id, rel],
+                    let rel = db::normalize_path_separators(
+                        path.strip_prefix(workspace_root)
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .as_ref(),
+                    );
+                    // Deleted files re-index as `None`; edits parse first.
+                    let parsed = if path.exists() {
+                        match ingestion::parse_file(path) {
+                            Ok((_lang, symbols)) => Some(symbols),
+                            Err(e) => {
+                                eprintln!(
+                                    "{}",
+                                    style(format!("[Marrow] Parse error for {rel}: {e}")).yellow()
                                 );
-                                for sym in &symbols {
-                                    let node_id = format!("{node_id_prefix}{}", sym.name);
-                                    let _ = conn.execute(
-                                        "INSERT OR REPLACE INTO nodes \
-                                         (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text) \
-                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                                        rusqlite::params![
-                                            node_id, repo_id, rel, lang,
-                                            sym.name, sym.symbol_type, sym.raw_text
-                                        ],
-                                    );
-                                }
+                                continue;
                             }
-                            eprintln!("{}", style(format!("[Marrow] Updated AST for {rel}")).dim());
                         }
-                        Err(e) => {
-                            eprintln!(
+                    } else {
+                        None
+                    };
+                    let removed = parsed.is_none();
+                    if let Ok(conn) = conn.lock() {
+                        match ingestion::apply_single_file_update(&conn, &repo_id, &rel, &ext, parsed)
+                        {
+                            Ok(_) => {
+                                let verb = if removed { "Removed" } else { "Updated" };
+                                eprintln!(
+                                    "{}",
+                                    style(format!("[Marrow] {verb} AST for {rel}")).dim()
+                                );
+                            }
+                            Err(e) => eprintln!(
                                 "{}",
-                                style(format!("[Marrow] Parse error for {rel}: {e}")).yellow()
-                            );
+                                style(format!("[Marrow] Index update failed for {rel}: {e}"))
+                                    .yellow()
+                            ),
                         }
                     }
                 }
