@@ -294,6 +294,38 @@ fn is_identifier_kind(kind: &str) -> bool {
     )
 }
 
+fn normalize_cpp_special_function_name(text: &str) -> String {
+    let collapsed = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" ()", "()");
+    let Some(rest) = collapsed.strip_prefix("operator ") else {
+        return collapsed;
+    };
+
+    if rest.starts_with("\"\"") {
+        return collapsed;
+    }
+    if let Some(suffix) = rest.strip_prefix("new []") {
+        return format!("operator new[]{suffix}");
+    }
+    if let Some(suffix) = rest.strip_prefix("delete []") {
+        return format!("operator delete[]{suffix}");
+    }
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_punctuation())
+    {
+        return format!("operator{rest}");
+    }
+    if let Some(paren) = collapsed.find("()") {
+        return collapsed[..paren + 2].to_string();
+    }
+    collapsed
+}
+
 /// Recursively descend through C++ declarator chains to find the terminal identifier.
 /// Handles chains like: function_declarator → pointer_declarator → identifier,
 /// or qualified_identifier containing an identifier.
@@ -304,16 +336,42 @@ fn find_name_in_declarator<'a>(node: tree_sitter::Node<'a>, source: &[u8]) -> Op
     if is_identifier_kind(node.kind()) {
         return Some(node.utf8_text(source).unwrap_or("unknown").to_string());
     }
+    if matches!(
+        node.kind(),
+        "operator_name" | "operator_cast" | "destructor_name"
+    ) {
+        return Some(normalize_cpp_special_function_name(
+            node.utf8_text(source).unwrap_or("unknown"),
+        ));
+    }
+    if matches!(node.kind(), "template_function" | "template_method") {
+        return Some(
+            node.utf8_text(source)
+                .unwrap_or("unknown")
+                .trim()
+                .to_string(),
+        );
+    }
     if node.kind() == "qualified_identifier" {
         // e.g. MyClass::myMethod — take the rightmost `name` field or last identifier child
         if let Some(name_node) = node.child_by_field_name("name") {
-            return Some(name_node.utf8_text(source).unwrap_or("unknown").to_string());
+            return find_name_in_declarator(name_node, source)
+                .or_else(|| Some(name_node.utf8_text(source).unwrap_or("unknown").to_string()));
         }
     }
     // Recurse into the `declarator` field if present (covers function_declarator,
     // pointer_declarator, reference_declarator, etc.)
     if let Some(inner) = node.child_by_field_name("declarator") {
         return find_name_in_declarator(inner, source);
+    }
+    if node.kind() == "reference_declarator" {
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i as u32) {
+                if let Some(name) = find_name_in_declarator(child, source) {
+                    return Some(name);
+                }
+            }
+        }
     }
     None
 }
@@ -2266,6 +2324,41 @@ void local_tmp(void) {
 
         assert_has_symbol(&symbols, "outer", "struct");
         assert_has_symbol(&symbols, "local_tmp", "function");
+        assert_missing_symbol_name(&symbols, "anonymous");
+    }
+
+    #[test]
+    fn cpp_operator_and_destructor_functions_are_named() {
+        let symbols = symbol_pairs_from_source(
+            "cpp",
+            r#"
+struct functor {
+    int operator ()(int x) const { return x; }
+    bool operator<(const functor &) const { return false; }
+    explicit operator bool() const { return true; }
+    ~functor() = default;
+};
+
+bool functor::operator==(const functor &) const { return true; }
+functor::operator int() const { return 1; }
+functor::~functor() {}
+int operator+(functor, functor) { return 0; }
+std::ostream & operator <<(std::ostream & os, const functor &) { return os; }
+std::string & functor::args_target() { static std::string s; return s; }
+template <> void from_float<int>(const float *) {}
+"#,
+        );
+
+        assert_has_symbol(&symbols, "operator()", "function");
+        assert_has_symbol(&symbols, "operator<", "function");
+        assert_has_symbol(&symbols, "operator==", "function");
+        assert_has_symbol(&symbols, "operator+", "function");
+        assert_has_symbol(&symbols, "operator<<", "function");
+        assert_has_symbol(&symbols, "operator bool()", "function");
+        assert_has_symbol(&symbols, "operator int()", "function");
+        assert_has_symbol(&symbols, "~functor", "function");
+        assert_has_symbol(&symbols, "args_target", "function");
+        assert_has_symbol(&symbols, "from_float<int>", "function");
         assert_missing_symbol_name(&symbols, "anonymous");
     }
 

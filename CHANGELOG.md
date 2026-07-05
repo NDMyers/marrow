@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- C++ operator overloads, conversion operators, and destructor definitions are now indexed with their real names (e.g. `operator()`, `operator bool()`, `operator<`, `~Widget`) instead of falling back to `anonymous`.
 - C/C++ typedef aliases are now stored as `symbol_type: "type"` (previously the alias was indexed as a `struct`/`union`/`enum` and the named tag was skipped). Anonymous specifiers no longer produce symbols named `anonymous`, and forward declarations are not indexed. **Existing graph databases should be re-ingested** so stored `symbol_type` values match; nothing gates on an index version, so stale kinds simply persist until re-ingest. Known trade-offs: body-less forward declarations (e.g. Pimpl-style `class Impl;`) lose their only index presence, and K&R-style C function definitions are not captured.
 - CALLS-edge resolution is kind-aware: type-level symbols (interfaces, type aliases, unions, macros, and c-family structs/enums) are never call-edge targets, so a same-named type no longer steals or ambiguates a function's callers.
 - `marrow watch` shares the dashboard watcher's re-index implementation: `.c` saves are picked up, node ids match full ingest, and CALLS edges/observations are maintained on watched saves.
