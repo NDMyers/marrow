@@ -120,17 +120,28 @@ pub fn language_for_ext(ext: &str) -> Option<Language> {
 
 fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
     match ext {
-        "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(LangConfig {
+        // Specifier patterns require both a name and a body: anonymous
+        // specifiers (`union { ... } u;` nested in structs, top-level
+        // `enum { ... };` constant blocks) would otherwise index as symbols
+        // literally named "anonymous", and body-less forward declarations
+        // carry no definition worth indexing (known trade-off: Pimpl-style
+        // `class Impl;` headers lose their only index presence).
+        // Typedef aliases are separate `@type` symbols — the tag (if named)
+        // is still indexed by the specifier patterns, and `name:` is a field
+        // wildcard `(_)` so template specializations (`struct hash<Foo>`)
+        // stay indexed.
+        _ if is_c_family_ext(ext) => Some(LangConfig {
             language: tree_sitter_cpp::LANGUAGE.into(),
             query_src: concat!(
                 "(function_definition) @function\n",
-                "(class_specifier body: (field_declaration_list)) @class\n",
-                "(struct_specifier body: (field_declaration_list)) @struct\n",
-                "(union_specifier body: (field_declaration_list)) @union\n",
-                "(enum_specifier body: (enumerator_list)) @enum\n",
-                "(type_definition type: (struct_specifier body: (field_declaration_list))) @struct\n",
-                "(type_definition type: (union_specifier body: (field_declaration_list))) @union\n",
-                "(type_definition type: (enum_specifier body: (enumerator_list))) @enum"
+                "(class_specifier name: (_) body: (field_declaration_list)) @class\n",
+                "(struct_specifier name: (_) body: (field_declaration_list)) @struct\n",
+                "(union_specifier name: (_) body: (field_declaration_list)) @union\n",
+                "(enum_specifier name: (_) body: (enumerator_list)) @enum\n",
+                "(type_definition type: (struct_specifier body: (field_declaration_list))) @type\n",
+                "(type_definition type: (union_specifier body: (field_declaration_list))) @type\n",
+                "(type_definition type: (enum_specifier body: (enumerator_list))) @type\n",
+                "(type_definition type: (class_specifier body: (field_declaration_list))) @type"
             ),
         }),
         "py" => Some(LangConfig {
@@ -272,17 +283,24 @@ fn extract_symbol_name(node: &tree_sitter::Node, source: &[u8]) -> String {
     "anonymous".to_string()
 }
 
-fn should_skip_symbol_capture(node: &tree_sitter::Node) -> bool {
-    if !matches!(
-        node.kind(),
-        "struct_specifier" | "union_specifier" | "enum_specifier"
-    ) {
-        return false;
+/// All names bound by a captured node.
+/// `type_definition` can bind several aliases at once — `typedef struct
+/// { ... } A, B;` carries one `declarator` field per alias, and
+/// `child_by_field_name` would silently drop everything after the first —
+/// so it yields one name per declarator. Every other capture kind yields
+/// exactly one name.
+fn capture_symbol_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    if node.kind() == "type_definition" {
+        let mut cursor = node.walk();
+        let names: Vec<String> = node
+            .children_by_field_name("declarator", &mut cursor)
+            .filter_map(|decl| find_name_in_declarator(decl, source))
+            .collect();
+        if !names.is_empty() {
+            return names;
+        }
     }
-
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "type_definition" && parent.child_by_field_name("declarator").is_some()
-    })
+    vec![extract_symbol_name(node, source)]
 }
 
 /// Return a tree-sitter query string that captures call expressions for a
@@ -454,29 +472,28 @@ fn parse_file_inner(
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 let node = capture.node;
-                if should_skip_symbol_capture(&node) {
-                    continue;
-                }
                 let capture_name = query.capture_names()[capture.index as usize];
-                let name = extract_symbol_name(&node, source_bytes);
+                let names = capture_symbol_names(&node, source_bytes);
                 let raw_text = cap_raw_text(node.utf8_text(source_bytes).unwrap_or("").to_string());
                 let callees = extract_calls_from_symbol(&raw_text, ext);
                 let start_byte = node.start_byte();
                 let end_byte = node.end_byte();
                 let start_position = node.start_position();
                 let end_position = node.end_position();
-                syms.push(Symbol {
-                    name,
-                    symbol_type: capture_name.to_string(),
-                    raw_text,
-                    callees,
-                    start_byte,
-                    end_byte,
-                    start_line: start_position.row + 1,
-                    start_column: start_position.column + 1,
-                    end_line: end_position.row + 1,
-                    end_column: end_position.column + 1,
-                });
+                for name in names {
+                    syms.push(Symbol {
+                        name,
+                        symbol_type: capture_name.to_string(),
+                        raw_text: raw_text.clone(),
+                        callees: callees.clone(),
+                        start_byte,
+                        end_byte,
+                        start_line: start_position.row + 1,
+                        start_column: start_position.column + 1,
+                        end_line: end_position.row + 1,
+                        end_column: end_position.column + 1,
+                    });
+                }
             }
         }
         Ok(syms)
@@ -2062,18 +2079,83 @@ enum ggml_status { GGML_OK };
 "#,
         );
 
+        // Named tags are struct/union/enum symbols — including inside typedefs
+        // (ggml's `*_s` tag idiom must be findable).
         assert_has_symbol(&symbols, "ggml_tensor", "struct");
-        assert_has_symbol(&symbols, "ggml_cplan", "struct");
-        assert_has_symbol(&symbols, "named_alias", "struct");
+        assert_has_symbol(&symbols, "named_s", "struct");
         assert_has_symbol(&symbols, "ggml_value", "union");
         assert_has_symbol(&symbols, "ggml_status", "enum");
+        // Typedef aliases are `type` symbols, distinguishable from the tag.
+        assert_has_symbol(&symbols, "ggml_cplan", "type");
+        assert_has_symbol(&symbols, "named_alias", "type");
+        // Forward declarations and anonymous specifiers are not indexed.
         assert_missing_symbol_name(&symbols, "Forward");
         assert_missing_symbol_name(&symbols, "Widget");
         assert_missing_symbol_name(&symbols, "anonymous");
-        assert_missing_symbol_name(&symbols, "named_s");
 
         let c_symbols = symbol_pairs_from_source("c", "struct c_file_type { int id; };\n");
         assert_has_symbol(&c_symbols, "c_file_type", "struct");
+    }
+
+    #[test]
+    fn cpp_typedef_multi_declarator_pointer_and_class_variants() {
+        let symbols = symbol_pairs_from_source(
+            "h",
+            r#"
+typedef struct { int x; } A, B;
+typedef struct { int y; } *ptr_t;
+typedef class { public: void run(); } Runner;
+typedef class Named { public: int v; } NamedAlias;
+typedef enum { RED, GREEN } color_t;
+"#,
+        );
+
+        assert_has_symbol(&symbols, "A", "type");
+        assert_has_symbol(&symbols, "B", "type");
+        assert_has_symbol(&symbols, "ptr_t", "type");
+        assert_has_symbol(&symbols, "Runner", "type");
+        assert_has_symbol(&symbols, "NamedAlias", "type");
+        assert_has_symbol(&symbols, "Named", "class");
+        assert_has_symbol(&symbols, "color_t", "type");
+        assert_missing_symbol_name(&symbols, "anonymous");
+    }
+
+    /// Anonymous specifiers — nested unions (ubiquitous in ggml), top-level
+    /// enum constant blocks, function-local structs — must not produce
+    /// symbols named "anonymous".
+    #[test]
+    fn cpp_anonymous_specifiers_are_not_indexed() {
+        let symbols = symbol_pairs_from_source(
+            "h",
+            r#"
+struct outer {
+    union { int i; float f; } u;
+};
+enum { GGML_MAX_DIMS = 4 };
+void local_tmp(void) {
+    struct { int a; } tmp;
+    (void) tmp;
+}
+"#,
+        );
+
+        assert_has_symbol(&symbols, "outer", "struct");
+        assert_has_symbol(&symbols, "local_tmp", "function");
+        assert_missing_symbol_name(&symbols, "anonymous");
+    }
+
+    /// `name:` is a wildcard field match so template specializations keep
+    /// their index presence under the written name.
+    #[test]
+    fn cpp_template_specialization_struct_still_indexed() {
+        let symbols = symbol_pairs_from_source(
+            "hpp",
+            "template <typename T> struct Widget { T v; };\n\
+             template <> struct Widget<int> { int v; };\n",
+        );
+
+        assert_has_symbol(&symbols, "Widget", "struct");
+        assert_has_symbol(&symbols, "Widget<int>", "struct");
     }
 
     #[test]
