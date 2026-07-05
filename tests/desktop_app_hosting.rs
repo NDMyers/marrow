@@ -761,9 +761,7 @@ fn enable_creates_valid_icns() {
     );
 
     // Cleanup.
-    let _ = marrow_cmd()
-        .args(["ui-app", "disable"])
-        .output();
+    let _ = marrow_cmd().args(["ui-app", "disable"]).output();
 }
 
 #[cfg(target_os = "linux")]
@@ -799,9 +797,7 @@ fn enable_desktop_entry_has_icon_and_version() {
     );
 
     // Cleanup.
-    let _ = marrow_cmd()
-        .args(["ui-app", "disable"])
-        .output();
+    let _ = marrow_cmd().args(["ui-app", "disable"]).output();
 }
 
 #[cfg(target_os = "windows")]
@@ -835,9 +831,7 @@ fn enable_creates_valid_lnk() {
     );
 
     // Cleanup.
-    let _ = marrow_cmd()
-        .args(["ui-app", "disable"])
-        .output();
+    let _ = marrow_cmd().args(["ui-app", "disable"]).output();
 }
 
 #[test]

@@ -686,10 +686,7 @@ async fn stats_handler(State(state): State<AppState>) -> axum::response::Respons
             context_packets_use_marrow: crate::db::read_stat(&conn, "context_packets_use_marrow"),
             context_packets_use_native: crate::db::read_stat(&conn, "context_packets_use_native"),
             context_packets_hybrid: crate::db::read_stat(&conn, "context_packets_hybrid"),
-            context_packets_needs_index: crate::db::read_stat(
-                &conn,
-                "context_packets_needs_index",
-            ),
+            context_packets_needs_index: crate::db::read_stat(&conn, "context_packets_needs_index"),
         }
     };
 

@@ -10178,8 +10178,9 @@ pub fn run_watch_command(workspace_root: &Path) -> Result<()> {
                     };
                     let removed = parsed.is_none();
                     if let Ok(conn) = conn.lock() {
-                        match ingestion::apply_single_file_update(&conn, &repo_id, &rel, &ext, parsed)
-                        {
+                        match ingestion::apply_single_file_update(
+                            &conn, &repo_id, &rel, &ext, parsed,
+                        ) {
                             Ok(_) => {
                                 let verb = if removed { "Removed" } else { "Updated" };
                                 eprintln!(

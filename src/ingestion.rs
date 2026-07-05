@@ -117,15 +117,16 @@ fn ts_capture_filter(node: &tree_sitter::Node, source: &[u8]) -> bool {
     }
     // Wrapper call: accept only the known component wrappers. The `property`
     // field covers `React.memo` / `React.forwardRef`.
-    let callee_name = value
-        .child_by_field_name("function")
-        .and_then(|callee| match callee.kind() {
-            "identifier" => callee.utf8_text(source).ok(),
-            "member_expression" => callee
-                .child_by_field_name("property")
-                .and_then(|prop| prop.utf8_text(source).ok()),
-            _ => None,
-        });
+    let callee_name =
+        value
+            .child_by_field_name("function")
+            .and_then(|callee| match callee.kind() {
+                "identifier" => callee.utf8_text(source).ok(),
+                "member_expression" => callee
+                    .child_by_field_name("property")
+                    .and_then(|prop| prop.utf8_text(source).ok()),
+                _ => None,
+            });
     callee_name.is_some_and(|name| TS_FUNCTION_WRAPPERS.contains(&name))
 }
 
@@ -1062,7 +1063,11 @@ where
             // graph, freshness notes, and emitted context packets are portable
             // and stable across platforms (Windows `strip_prefix` yields `\`).
             let rel = crate::db::normalize_path_separators(
-                canonical.strip_prefix(root_path).ok()?.to_string_lossy().as_ref(),
+                canonical
+                    .strip_prefix(root_path)
+                    .ok()?
+                    .to_string_lossy()
+                    .as_ref(),
             );
             let mtime = std::fs::metadata(path)
                 .ok()?
@@ -1651,7 +1656,13 @@ pub fn apply_single_file_update(
 
     let mut callee_names: HashSet<String> = HashSet::new();
     for sym in &symbols {
-        let node_id = make_node_id(repo_id, rel_path, &sym.symbol_type, &sym.name, sym.start_byte);
+        let node_id = make_node_id(
+            repo_id,
+            rel_path,
+            &sym.symbol_type,
+            &sym.name,
+            sym.start_byte,
+        );
         let new_hash = crate::db::hash_raw_text(&sym.raw_text);
         if old_ids.contains(&node_id) {
             tx.execute(
@@ -1706,7 +1717,13 @@ pub fn apply_single_file_update(
     let name_to_ids = build_name_to_ids_for_symbol_names(&tx, repo_id, &callee_names)?;
     let mut calls_batch: Vec<(String, String)> = Vec::new();
     for sym in &symbols {
-        let source_id = make_node_id(repo_id, rel_path, &sym.symbol_type, &sym.name, sym.start_byte);
+        let source_id = make_node_id(
+            repo_id,
+            rel_path,
+            &sym.symbol_type,
+            &sym.name,
+            sym.start_byte,
+        );
         for callee_name in &sym.callees {
             if callee_name == &sym.name {
                 continue;
@@ -2725,7 +2742,11 @@ function foo() {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("calls.py");
-        std::fs::write(&file, "def helper():\n    pass\n\ndef main():\n    helper()\n").unwrap();
+        std::fs::write(
+            &file,
+            "def helper():\n    pass\n\ndef main():\n    helper()\n",
+        )
+        .unwrap();
 
         ingest_repo(&conn, repo_id, &dir).unwrap();
 
