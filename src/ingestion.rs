@@ -97,7 +97,7 @@ fn ingest_parse_queue_capacity() -> usize {
 /// check parsability without needing the full query config.
 pub fn language_for_ext(ext: &str) -> Option<Language> {
     match ext {
-        "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
+        "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
         "py" => Some(tree_sitter_python::LANGUAGE.into()),
         "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
@@ -109,20 +109,37 @@ pub fn language_for_ext(ext: &str) -> Option<Language> {
 
 fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
     match ext {
-        "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(LangConfig {
+        "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(LangConfig {
             language: tree_sitter_cpp::LANGUAGE.into(),
-            query_src: "(function_definition) @function\n(class_specifier) @class",
+            query_src: concat!(
+                "(function_definition) @function\n",
+                "(class_specifier body: (field_declaration_list)) @class\n",
+                "(struct_specifier body: (field_declaration_list)) @struct\n",
+                "(union_specifier body: (field_declaration_list)) @union\n",
+                "(enum_specifier body: (enumerator_list)) @enum\n",
+                "(type_definition type: (struct_specifier body: (field_declaration_list))) @struct\n",
+                "(type_definition type: (union_specifier body: (field_declaration_list))) @union\n",
+                "(type_definition type: (enum_specifier body: (enumerator_list))) @enum"
+            ),
         }),
         "py" => Some(LangConfig {
             language: tree_sitter_python::LANGUAGE.into(),
-            query_src: "(function_definition) @function\n(class_definition) @class",
+            query_src: concat!(
+                "(function_definition) @function\n",
+                "(class_definition) @class\n",
+                "(type_alias_statement) @type"
+            ),
         }),
         "ts" => Some(LangConfig {
             language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             query_src: concat!(
                 "(function_declaration) @function\n",
                 "(method_definition) @method\n",
-                "(class_declaration) @class"
+                "(class_declaration) @class\n",
+                "(interface_declaration) @interface\n",
+                "(type_alias_declaration) @type\n",
+                "(enum_declaration) @enum\n",
+                "(lexical_declaration (variable_declarator name: (identifier) value: (arrow_function)) @function)"
             ),
         }),
         "tsx" => Some(LangConfig {
@@ -130,7 +147,11 @@ fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
             query_src: concat!(
                 "(function_declaration) @function\n",
                 "(method_definition) @method\n",
-                "(class_declaration) @class"
+                "(class_declaration) @class\n",
+                "(interface_declaration) @interface\n",
+                "(type_alias_declaration) @type\n",
+                "(enum_declaration) @enum\n",
+                "(lexical_declaration (variable_declarator name: (identifier) value: (arrow_function)) @function)"
             ),
         }),
         "rs" => Some(LangConfig {
@@ -140,7 +161,10 @@ fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
                 "(struct_item) @struct\n",
                 "(trait_item) @trait\n",
                 "(impl_item) @impl\n",
-                "(enum_item) @enum"
+                "(enum_item) @enum\n",
+                "(type_item) @type\n",
+                "(union_item) @union\n",
+                "(macro_definition) @macro"
             ),
         }),
         "rb" => Some(LangConfig {
@@ -180,6 +204,25 @@ fn find_name_in_declarator<'a>(node: tree_sitter::Node<'a>, source: &[u8]) -> Op
     None
 }
 
+fn find_first_identifier<'a>(node: tree_sitter::Node<'a>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" | "field_identifier" | "property_identifier" => {
+            return Some(node.utf8_text(source).unwrap_or("unknown").to_string());
+        }
+        _ => {}
+    }
+
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i as u32) {
+            if let Some(name) = find_first_identifier(child, source) {
+                return Some(name);
+            }
+        }
+    }
+
+    None
+}
+
 /// Extract the symbol name from a captured AST node.
 /// Tries the `name` field first, then descends into C++ declarator chains,
 /// then falls back to scanning direct named children.
@@ -193,6 +236,15 @@ fn extract_symbol_name(node: &tree_sitter::Node, source: &[u8]) -> String {
     if let Some(decl) = node.child_by_field_name("declarator") {
         if let Some(name) = find_name_in_declarator(decl, source) {
             return name;
+        }
+    }
+    // Python PEP 695 aliases are `type_alias_statement` nodes whose public
+    // symbol lives under the `left` field, e.g. `type Vector[T] = list[T]`.
+    if node.kind() == "type_alias_statement" {
+        if let Some(left) = node.child_by_field_name("left") {
+            if let Some(name) = find_first_identifier(left, source) {
+                return name;
+            }
         }
     }
     // Final fallback: scan direct named children for identifier-like nodes
@@ -209,6 +261,19 @@ fn extract_symbol_name(node: &tree_sitter::Node, source: &[u8]) -> String {
     "anonymous".to_string()
 }
 
+fn should_skip_symbol_capture(node: &tree_sitter::Node) -> bool {
+    if !matches!(
+        node.kind(),
+        "struct_specifier" | "union_specifier" | "enum_specifier"
+    ) {
+        return false;
+    }
+
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "type_definition" && parent.child_by_field_name("declarator").is_some()
+    })
+}
+
 /// Return a tree-sitter query string that captures call expressions for a
 /// given file extension.  Each query exposes a `@callee` capture on the
 /// identifier being invoked.
@@ -222,7 +287,7 @@ fn call_query_for_ext(ext: &str) -> Option<&'static str> {
             "(call_expression function: (identifier) @callee)\n",
             "(call_expression function: (member_expression property: (property_identifier) @callee))\n",
         )),
-        "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(concat!(
+        "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(concat!(
             "(call_expression function: (identifier) @callee)\n",
             "(call_expression function: (qualified_identifier name: (identifier) @callee))\n",
             "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
@@ -378,6 +443,9 @@ fn parse_file_inner(
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 let node = capture.node;
+                if should_skip_symbol_capture(&node) {
+                    continue;
+                }
                 let capture_name = query.capture_names()[capture.index as usize];
                 let name = extract_symbol_name(&node, source_bytes);
                 let raw_text = cap_raw_text(node.utf8_text(source_bytes).unwrap_or("").to_string());
@@ -1718,7 +1786,7 @@ fn extract_imports(raw_text: &str, lang: &str) -> Vec<String> {
                     }
                 }
             }
-            "cpp" | "cc" | "cxx" | "h" | "hpp" => {
+            "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => {
                 // #include "X.h" -> "X"
                 if let Some(rest) = trimmed.strip_prefix("#include") {
                     let rest = rest.trim();
@@ -1744,12 +1812,141 @@ mod tests {
 
     #[test]
     fn test_call_query_parses_all_languages() {
-        let exts = ["py", "ts", "tsx", "cpp", "rs", "rb"];
+        let exts = ["py", "ts", "tsx", "c", "cpp", "rs", "rb"];
         for ext in exts {
             let lang = language_for_ext(ext).unwrap_or_else(|| panic!("no language for {ext}"));
             let qsrc = call_query_for_ext(ext).unwrap_or_else(|| panic!("no call query for {ext}"));
             Query::new(&lang, qsrc).unwrap_or_else(|_| panic!("query parse failed for {ext}"));
         }
+    }
+
+    #[test]
+    fn test_symbol_query_parses_all_languages() {
+        let exts = ["py", "ts", "tsx", "c", "cpp", "rs", "rb"];
+        for ext in exts {
+            let config = lang_config_for_ext(ext).unwrap_or_else(|| panic!("no config for {ext}"));
+            Query::new(&config.language, config.query_src)
+                .unwrap_or_else(|_| panic!("symbol query parse failed for {ext}"));
+        }
+    }
+
+    fn symbol_pairs_from_source(ext: &str, source: &str) -> Vec<(String, String)> {
+        let config = lang_config_for_ext(ext).unwrap_or_else(|| panic!("no config for {ext}"));
+        parse_file_inner(source, ext, &config, "<test>")
+            .unwrap()
+            .into_iter()
+            .map(|symbol| (symbol.name, symbol.symbol_type))
+            .collect()
+    }
+
+    fn assert_has_symbol(symbols: &[(String, String)], name: &str, kind: &str) {
+        assert!(
+            symbols.iter().any(|(n, k)| n == name && k == kind),
+            "missing {kind} {name}: {symbols:?}"
+        );
+    }
+
+    fn assert_missing_symbol_name(symbols: &[(String, String)], name: &str) {
+        assert!(
+            !symbols.iter().any(|(n, _)| n == name),
+            "unexpected symbol {name}: {symbols:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_symbols_cover_type_specifiers_typedefs_and_c_extension() {
+        let symbols = symbol_pairs_from_source(
+            "h",
+            r#"
+struct Forward;
+class Widget;
+struct ggml_tensor { int n_dims; };
+typedef struct { int x; } ggml_cplan;
+typedef struct named_s { int y; } named_alias;
+union ggml_value { int i; float f; };
+enum ggml_status { GGML_OK };
+"#,
+        );
+
+        assert_has_symbol(&symbols, "ggml_tensor", "struct");
+        assert_has_symbol(&symbols, "ggml_cplan", "struct");
+        assert_has_symbol(&symbols, "named_alias", "struct");
+        assert_has_symbol(&symbols, "ggml_value", "union");
+        assert_has_symbol(&symbols, "ggml_status", "enum");
+        assert_missing_symbol_name(&symbols, "Forward");
+        assert_missing_symbol_name(&symbols, "Widget");
+        assert_missing_symbol_name(&symbols, "anonymous");
+        assert_missing_symbol_name(&symbols, "named_s");
+
+        let c_symbols = symbol_pairs_from_source("c", "struct c_file_type { int id; };\n");
+        assert_has_symbol(&c_symbols, "c_file_type", "struct");
+    }
+
+    #[test]
+    fn typescript_symbols_cover_structural_types_and_arrow_functions() {
+        let symbols = symbol_pairs_from_source(
+            "ts",
+            r#"
+interface Props { title: string }
+type Handler = () => void;
+enum Status { Ready }
+const staticValue = 5;
+export const loadData = async () => fetchData();
+let transform = (value: number) => value.toString();
+"#,
+        );
+
+        assert_has_symbol(&symbols, "Props", "interface");
+        assert_has_symbol(&symbols, "Handler", "type");
+        assert_has_symbol(&symbols, "Status", "enum");
+        assert_has_symbol(&symbols, "loadData", "function");
+        assert_has_symbol(&symbols, "transform", "function");
+        assert_missing_symbol_name(&symbols, "staticValue");
+    }
+
+    #[test]
+    fn tsx_symbols_cover_arrow_components() {
+        let symbols = symbol_pairs_from_source(
+            "tsx",
+            r#"
+interface Props { title: string }
+export const Panel = (props: Props) => <section>{props.title}</section>;
+"#,
+        );
+
+        assert_has_symbol(&symbols, "Props", "interface");
+        assert_has_symbol(&symbols, "Panel", "function");
+    }
+
+    #[test]
+    fn rust_symbols_cover_macros_type_aliases_and_unions() {
+        let symbols = symbol_pairs_from_source(
+            "rs",
+            r#"
+macro_rules! say { () => {}; }
+type Alias<T> = Option<T>;
+union Bits { i: u32, f: f32 }
+"#,
+        );
+
+        assert_has_symbol(&symbols, "say", "macro");
+        assert_has_symbol(&symbols, "Alias", "type");
+        assert_has_symbol(&symbols, "Bits", "union");
+    }
+
+    #[test]
+    fn python_symbols_cover_pep_695_type_aliases() {
+        let symbols = symbol_pairs_from_source(
+            "py",
+            r#"
+type Vector[T] = list[T]
+async def af():
+    pass
+"#,
+        );
+
+        assert_has_symbol(&symbols, "Vector", "type");
+        assert_has_symbol(&symbols, "af", "function");
     }
 
     #[test]
