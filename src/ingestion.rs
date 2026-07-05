@@ -54,6 +54,96 @@ type ParsedFileBatchRow = (String, String, Vec<Symbol>, String, i64);
 struct LangConfig {
     language: Language,
     query_src: &'static str,
+    /// Language-specific accept/reject hook for query captures, for rules
+    /// core tree-sitter queries cannot express (ancestor checks, callee
+    /// allowlists — there are no ancestor/negation predicates upstream).
+    /// `None` keeps every capture.
+    capture_filter: Option<fn(&tree_sitter::Node, &[u8]) -> bool>,
+}
+
+/// Symbol query shared by the `.ts` and `.tsx` arms — one constant so the two
+/// grammars can never drift apart silently.
+///
+/// The `variable_declarator` patterns index value bindings that define
+/// functions: `const f = () => ...`, `const f = function () {...}`, their
+/// `var` twins, and known component wrappers (`memo(() => ...)`). Locality
+/// and the wrapper allowlist are enforced by `ts_capture_filter`.
+const TS_SYMBOL_QUERY: &str = concat!(
+    "(function_declaration) @function\n",
+    "(method_definition) @method\n",
+    "(class_declaration) @class\n",
+    "(interface_declaration) @interface\n",
+    "(type_alias_declaration) @type\n",
+    "(enum_declaration) @enum\n",
+    "(lexical_declaration (variable_declarator name: (identifier) value: [(arrow_function) (function_expression)]) @function)\n",
+    "(variable_declaration (variable_declarator name: (identifier) value: [(arrow_function) (function_expression)]) @function)\n",
+    "(lexical_declaration (variable_declarator name: (identifier) value: (call_expression function: [(identifier) (member_expression)] arguments: (arguments (arrow_function)))) @function)"
+);
+
+/// Wrapper callees whose arrow-function argument defines the bound symbol
+/// (`const C = memo(() => ...)`, `React.forwardRef(...)`). Anything else —
+/// `useMemo`, `debounce`, `.then` — receives a callback, not a definition.
+const TS_FUNCTION_WRAPPERS: &[&str] = &["memo", "forwardRef"];
+
+/// Accept/reject TS and TSX `variable_declarator` captures.
+fn ts_capture_filter(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() != "variable_declarator" {
+        return true;
+    }
+    // Reject function-local bindings: `const handleClick = () => {}` inside a
+    // component body is implementation detail, not module surface, and every
+    // component repeats the same handler names — poisoning name-based call
+    // resolution. Module/namespace/export scopes have no such ancestor.
+    let mut ancestor = node.parent();
+    while let Some(a) = ancestor {
+        if matches!(
+            a.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "generator_function_declaration"
+                | "method_definition"
+        ) {
+            return false;
+        }
+        ancestor = a.parent();
+    }
+    let Some(value) = node.child_by_field_name("value") else {
+        return true;
+    };
+    if value.kind() != "call_expression" {
+        return true;
+    }
+    // Wrapper call: accept only the known component wrappers. The `property`
+    // field covers `React.memo` / `React.forwardRef`.
+    let callee_name = value
+        .child_by_field_name("function")
+        .and_then(|callee| match callee.kind() {
+            "identifier" => callee.utf8_text(source).ok(),
+            "member_expression" => callee
+                .child_by_field_name("property")
+                .and_then(|prop| prop.utf8_text(source).ok()),
+            _ => None,
+        });
+    callee_name.is_some_and(|name| TS_FUNCTION_WRAPPERS.contains(&name))
+}
+
+/// Reject impl-body associated types: `impl Iterator for X { type Item = u32; }`
+/// is a `type_item` too, and 50 impls would index 50 colliding `Item` symbols.
+/// (Trait-body associated types parse as `associated_type` — never captured.)
+fn rust_capture_filter(node: &tree_sitter::Node, _source: &[u8]) -> bool {
+    if node.kind() != "type_item" {
+        return true;
+    }
+    let mut ancestor = node.parent();
+    while let Some(a) = ancestor {
+        if a.kind() == "impl_item" {
+            return false;
+        }
+        ancestor = a.parent();
+    }
+    true
 }
 
 thread_local! {
@@ -143,6 +233,7 @@ fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
                 "(type_definition type: (enum_specifier body: (enumerator_list))) @type\n",
                 "(type_definition type: (class_specifier body: (field_declaration_list))) @type"
             ),
+            capture_filter: None,
         }),
         "py" => Some(LangConfig {
             language: tree_sitter_python::LANGUAGE.into(),
@@ -151,30 +242,17 @@ fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
                 "(class_definition) @class\n",
                 "(type_alias_statement) @type"
             ),
+            capture_filter: None,
         }),
         "ts" => Some(LangConfig {
             language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            query_src: concat!(
-                "(function_declaration) @function\n",
-                "(method_definition) @method\n",
-                "(class_declaration) @class\n",
-                "(interface_declaration) @interface\n",
-                "(type_alias_declaration) @type\n",
-                "(enum_declaration) @enum\n",
-                "(lexical_declaration (variable_declarator name: (identifier) value: (arrow_function)) @function)"
-            ),
+            query_src: TS_SYMBOL_QUERY,
+            capture_filter: Some(ts_capture_filter),
         }),
         "tsx" => Some(LangConfig {
             language: tree_sitter_typescript::LANGUAGE_TSX.into(),
-            query_src: concat!(
-                "(function_declaration) @function\n",
-                "(method_definition) @method\n",
-                "(class_declaration) @class\n",
-                "(interface_declaration) @interface\n",
-                "(type_alias_declaration) @type\n",
-                "(enum_declaration) @enum\n",
-                "(lexical_declaration (variable_declarator name: (identifier) value: (arrow_function)) @function)"
-            ),
+            query_src: TS_SYMBOL_QUERY,
+            capture_filter: Some(ts_capture_filter),
         }),
         "rs" => Some(LangConfig {
             language: tree_sitter_rust::LANGUAGE.into(),
@@ -188,6 +266,7 @@ fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
                 "(union_item) @union\n",
                 "(macro_definition) @macro"
             ),
+            capture_filter: Some(rust_capture_filter),
         }),
         "rb" => Some(LangConfig {
             language: tree_sitter_ruby::LANGUAGE.into(),
@@ -197,6 +276,7 @@ fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
                 "(class) @class\n",
                 "(module) @module"
             ),
+            capture_filter: None,
         }),
         _ => None,
     }
@@ -472,6 +552,11 @@ fn parse_file_inner(
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 let node = capture.node;
+                if let Some(filter) = config.capture_filter {
+                    if !filter(&node, source_bytes) {
+                        continue;
+                    }
+                }
                 let capture_name = query.capture_names()[capture.index as usize];
                 let names = capture_symbol_names(&node, source_bytes);
                 let raw_text = cap_raw_text(node.utf8_text(source_bytes).unwrap_or("").to_string());
@@ -2178,6 +2263,83 @@ let transform = (value: number) => value.toString();
         assert_has_symbol(&symbols, "loadData", "function");
         assert_has_symbol(&symbols, "transform", "function");
         assert_missing_symbol_name(&symbols, "staticValue");
+    }
+
+    /// T9: arrow/function-expression bindings anchor to module scope, and
+    /// wrapper calls index only through the memo/forwardRef allowlist.
+    #[test]
+    fn typescript_arrow_anchoring_and_wrapper_allowlist() {
+        let symbols = symbol_pairs_from_source(
+            "ts",
+            r#"
+export const TopLevel = () => 1;
+export const Wrapped = memo(() => 2);
+export const RefComp = React.forwardRef(() => 3);
+export const Memoed = React.memo(() => 4);
+const expr = function () { return 5; };
+var legacy = () => 6;
+export const NotAComponent = useMemo(() => 7);
+const debounced = debounce(() => 8);
+function outer() {
+    const local = () => 9;
+    return local;
+}
+const promise = Promise.resolve().then(() => 10);
+"#,
+        );
+
+        assert_has_symbol(&symbols, "TopLevel", "function");
+        assert_has_symbol(&symbols, "Wrapped", "function");
+        assert_has_symbol(&symbols, "RefComp", "function");
+        assert_has_symbol(&symbols, "Memoed", "function");
+        assert_has_symbol(&symbols, "expr", "function");
+        assert_has_symbol(&symbols, "legacy", "function");
+        assert_has_symbol(&symbols, "outer", "function");
+        assert_missing_symbol_name(&symbols, "NotAComponent");
+        assert_missing_symbol_name(&symbols, "debounced");
+        assert_missing_symbol_name(&symbols, "local");
+        assert_missing_symbol_name(&symbols, "promise");
+    }
+
+    #[test]
+    fn tsx_wrapped_components_indexed_and_local_handlers_suppressed() {
+        let symbols = symbol_pairs_from_source(
+            "tsx",
+            r#"
+export const Memo = memo(() => <div />);
+export const Card = () => {
+    const handleClick = () => {};
+    return <button onClick={handleClick} />;
+};
+"#,
+        );
+
+        assert_has_symbol(&symbols, "Memo", "function");
+        assert_has_symbol(&symbols, "Card", "function");
+        assert_missing_symbol_name(&symbols, "handleClick");
+    }
+
+    /// Impl-body `type Item = ...` must not become a top-level type symbol
+    /// (50 impls of Iterator would index 50 colliding `Item`s), while
+    /// module-level aliases stay indexed.
+    #[test]
+    fn rust_impl_associated_types_are_not_indexed() {
+        let symbols = symbol_pairs_from_source(
+            "rs",
+            r#"
+type TopLevel<T> = Option<T>;
+struct Counter;
+impl Iterator for Counter {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        None
+    }
+}
+"#,
+        );
+
+        assert_has_symbol(&symbols, "TopLevel", "type");
+        assert_missing_symbol_name(&symbols, "Item");
     }
 
     #[test]
