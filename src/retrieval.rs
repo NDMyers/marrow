@@ -2556,7 +2556,7 @@ fn resolve_repo_file_path(root_path: &Path, rel_path: &str) -> Result<PathBuf> {
 /// (e.g., forward declarations, macro-defined structs, incomplete fragments).
 pub fn condense(raw_text: &str, lang: &str) -> String {
     match lang {
-        "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => condense_braces(
+        _ if crate::ingestion::is_c_family_ext(lang) => condense_braces(
             raw_text,
             tree_sitter_cpp::LANGUAGE.into(),
             // compound_statement = function body  |  field_declaration_list = class body

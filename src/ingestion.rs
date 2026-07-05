@@ -282,21 +282,32 @@ fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
     }
 }
 
+/// Node kinds that directly carry a symbol name across the supported
+/// grammars. One predicate shared by the name-extraction helpers so their
+/// identifier lists cannot drift apart (extract_symbol_name's fallback was
+/// missing `field_identifier`).
+fn is_identifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier" | "type_identifier" | "field_identifier" | "property_identifier"
+    )
+}
+
 /// Recursively descend through C++ declarator chains to find the terminal identifier.
 /// Handles chains like: function_declarator → pointer_declarator → identifier,
 /// or qualified_identifier containing an identifier.
+/// (Deliberately NOT a generic first-identifier DFS: `qualified_identifier`
+/// needs the rightmost name, and a blind descent would grab `T` from
+/// `impl<T> Foo<T>`-style generic declarators.)
 fn find_name_in_declarator<'a>(node: tree_sitter::Node<'a>, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "identifier" | "type_identifier" | "field_identifier" => {
-            return Some(node.utf8_text(source).unwrap_or("unknown").to_string());
+    if is_identifier_kind(node.kind()) {
+        return Some(node.utf8_text(source).unwrap_or("unknown").to_string());
+    }
+    if node.kind() == "qualified_identifier" {
+        // e.g. MyClass::myMethod — take the rightmost `name` field or last identifier child
+        if let Some(name_node) = node.child_by_field_name("name") {
+            return Some(name_node.utf8_text(source).unwrap_or("unknown").to_string());
         }
-        "qualified_identifier" => {
-            // e.g. MyClass::myMethod — take the rightmost `name` field or last identifier child
-            if let Some(name_node) = node.child_by_field_name("name") {
-                return Some(name_node.utf8_text(source).unwrap_or("unknown").to_string());
-            }
-        }
-        _ => {}
     }
     // Recurse into the `declarator` field if present (covers function_declarator,
     // pointer_declarator, reference_declarator, etc.)
@@ -307,11 +318,8 @@ fn find_name_in_declarator<'a>(node: tree_sitter::Node<'a>, source: &[u8]) -> Op
 }
 
 fn find_first_identifier<'a>(node: tree_sitter::Node<'a>, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "identifier" | "type_identifier" | "field_identifier" | "property_identifier" => {
-            return Some(node.utf8_text(source).unwrap_or("unknown").to_string());
-        }
-        _ => {}
+    if is_identifier_kind(node.kind()) {
+        return Some(node.utf8_text(source).unwrap_or("unknown").to_string());
     }
 
     for i in 0..node.named_child_count() {
@@ -352,11 +360,8 @@ fn extract_symbol_name(node: &tree_sitter::Node, source: &[u8]) -> String {
     // Final fallback: scan direct named children for identifier-like nodes
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i as u32) {
-            match child.kind() {
-                "identifier" | "type_identifier" | "property_identifier" => {
-                    return child.utf8_text(source).unwrap_or("unknown").to_string();
-                }
-                _ => {}
+            if is_identifier_kind(child.kind()) {
+                return child.utf8_text(source).unwrap_or("unknown").to_string();
             }
         }
     }
@@ -388,6 +393,11 @@ fn capture_symbol_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> 
 /// identifier being invoked.
 fn call_query_for_ext(ext: &str) -> Option<&'static str> {
     match ext {
+        _ if is_c_family_ext(ext) => Some(concat!(
+            "(call_expression function: (identifier) @callee)\n",
+            "(call_expression function: (qualified_identifier name: (identifier) @callee))\n",
+            "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
+        )),
         "py" => Some(concat!(
             "(call function: (identifier) @callee)\n",
             "(call function: (attribute attribute: (identifier) @callee))\n",
@@ -395,11 +405,6 @@ fn call_query_for_ext(ext: &str) -> Option<&'static str> {
         "ts" | "tsx" => Some(concat!(
             "(call_expression function: (identifier) @callee)\n",
             "(call_expression function: (member_expression property: (property_identifier) @callee))\n",
-        )),
-        "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(concat!(
-            "(call_expression function: (identifier) @callee)\n",
-            "(call_expression function: (qualified_identifier name: (identifier) @callee))\n",
-            "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
         )),
         "rs" => Some(concat!(
             "(call_expression function: (identifier) @callee)\n",
@@ -464,14 +469,28 @@ pub fn extract_calls_from_symbol(raw_text: &str, lang_ext: &str) -> Vec<String> 
     })
 }
 
+/// Capture kinds whose bodies cannot contain resolvable call expressions —
+/// skip the per-capture call-extraction re-parse for them (thousands of
+/// captures × KBs of re-parsed text at llama.cpp scale, all for empty
+/// results). Exactly the kinds that did not exist before the AST-gaps work;
+/// `class` and the pre-existing Rust kinds keep their extraction so pre-gap
+/// edge behavior is untouched.
+fn capture_kind_can_contain_calls(capture_name: &str, ext: &str) -> bool {
+    match capture_name {
+        "interface" | "type" | "macro" => false,
+        "struct" | "union" | "enum" => !is_c_family_ext(ext),
+        _ => true,
+    }
+}
+
 const RAW_TEXT_MAX_BYTES: usize = 50_000; // ~50 KB (leaves room for sentinel)
 
 /// Truncates `text` to `RAW_TEXT_MAX_BYTES` if it exceeds that threshold,
 /// appending a sentinel comment so callers know the body is incomplete.
 /// Full source is always available on disk via the node's `file_path`.
-fn cap_raw_text(text: String) -> String {
+fn cap_raw_text(text: &str) -> String {
     if text.len() <= RAW_TEXT_MAX_BYTES {
-        return text;
+        return text.to_string();
     }
     // Truncate at a char boundary to avoid splitting UTF-8 sequences
     let end = text
@@ -559,8 +578,12 @@ fn parse_file_inner(
                 }
                 let capture_name = query.capture_names()[capture.index as usize];
                 let names = capture_symbol_names(&node, source_bytes);
-                let raw_text = cap_raw_text(node.utf8_text(source_bytes).unwrap_or("").to_string());
-                let callees = extract_calls_from_symbol(&raw_text, ext);
+                let raw_text = cap_raw_text(node.utf8_text(source_bytes).unwrap_or(""));
+                let callees = if capture_kind_can_contain_calls(capture_name, ext) {
+                    extract_calls_from_symbol(&raw_text, ext)
+                } else {
+                    Vec::new()
+                };
                 let start_byte = node.start_byte();
                 let end_byte = node.end_byte();
                 let start_position = node.start_position();
@@ -2082,7 +2105,7 @@ fn extract_imports(raw_text: &str, lang: &str) -> Vec<String> {
                     }
                 }
             }
-            "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => {
+            _ if is_c_family_ext(lang) => {
                 // #include "X.h" -> "X"
                 if let Some(rest) = trimmed.strip_prefix("#include") {
                     let rest = rest.trim();
@@ -2969,7 +2992,7 @@ function foo() {
     fn raw_text_cap_applied_to_oversized_symbols() {
         // Build a string just over 50KB
         let big_body = "x".repeat(51_200);
-        let capped = cap_raw_text(big_body.clone());
+        let capped = cap_raw_text(&big_body);
         assert!(
             capped.len() < big_body.len(),
             "oversized raw_text should be truncated"
@@ -2983,7 +3006,7 @@ function foo() {
     #[test]
     fn raw_text_cap_passes_small_symbols_unchanged() {
         let small = "def foo\n  42\nend\n".to_string();
-        let result = cap_raw_text(small.clone());
+        let result = cap_raw_text(&small);
         assert_eq!(result, small, "small raw_text should be unchanged");
     }
 
