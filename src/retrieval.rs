@@ -2556,7 +2556,7 @@ fn resolve_repo_file_path(root_path: &Path, rel_path: &str) -> Result<PathBuf> {
 /// (e.g., forward declarations, macro-defined structs, incomplete fragments).
 pub fn condense(raw_text: &str, lang: &str) -> String {
     match lang {
-        "cpp" | "cc" | "cxx" | "h" | "hpp" => condense_braces(
+        _ if crate::ingestion::is_c_family_ext(lang) => condense_braces(
             raw_text,
             tree_sitter_cpp::LANGUAGE.into(),
             // compound_statement = function body  |  field_declaration_list = class body
@@ -2667,8 +2667,9 @@ const SKELETON_ROW_LIMIT: usize = 2000;
 
 /// Return a token-efficient Markdown map of the repo's high-level symbols.
 ///
-/// Only `function`, `class`, `struct`, `trait`, and `interface` nodes are
-/// included — no variable declarations, imports, or raw text bodies.
+/// Only declaration-level nodes (functions, classes, structs, traits,
+/// interfaces, enums, type aliases, unions, macros, …) are included — no
+/// variable declarations, imports, or raw text bodies.
 /// If `target_dir` is provided, only nodes whose `file_path` starts with
 /// that prefix are included.
 pub fn get_project_skeleton(
@@ -2701,7 +2702,10 @@ pub fn get_project_skeleton(
                         OR symbol_type LIKE '%method%' \
                         OR symbol_type LIKE '%enum%' \
                         OR symbol_type LIKE '%impl%' \
-                        OR symbol_type LIKE '%module%') \
+                        OR symbol_type LIKE '%module%' \
+                        OR symbol_type LIKE '%type%' \
+                        OR symbol_type LIKE '%union%' \
+                        OR symbol_type LIKE '%macro%') \
                     ORDER BY file_path ASC, rowid ASC \
                     LIMIT ?2";
 
@@ -2716,7 +2720,10 @@ pub fn get_project_skeleton(
                        OR symbol_type LIKE '%method%' \
                        OR symbol_type LIKE '%enum%' \
                        OR symbol_type LIKE '%impl%' \
-                       OR symbol_type LIKE '%module%') \
+                       OR symbol_type LIKE '%module%' \
+                       OR symbol_type LIKE '%type%' \
+                       OR symbol_type LIKE '%union%' \
+                       OR symbol_type LIKE '%macro%') \
                      AND (REPLACE(file_path, '\\', '/') = ?3 \
                        OR REPLACE(file_path, '\\', '/') LIKE ?4) \
                    ORDER BY file_path ASC, rowid ASC \
@@ -4572,6 +4579,50 @@ mod tests {
         );
     }
 
+    /// A module containing only type-level symbols (aliases, unions, macros)
+    /// must render instead of "no matching symbols" — the count gate at the
+    /// top of get_project_skeleton sees every node, so the kind whitelist has
+    /// to admit every indexed kind.
+    #[test]
+    fn skeleton_lists_type_union_and_macro_kinds() {
+        let conn = make_db();
+        insert_node(
+            &conn,
+            "r:types.rs:Alias",
+            "r",
+            "src/types.rs",
+            "rs",
+            "Alias",
+            "type",
+            "type Alias<T> = Option<T>;",
+        );
+        insert_node(
+            &conn,
+            "r:types.rs:Bits",
+            "r",
+            "src/types.rs",
+            "rs",
+            "Bits",
+            "union",
+            "union Bits { i: u32, f: f32 }",
+        );
+        insert_node(
+            &conn,
+            "r:types.rs:say",
+            "r",
+            "src/types.rs",
+            "rs",
+            "say",
+            "macro",
+            "macro_rules! say { () => {}; }",
+        );
+
+        let out = get_project_skeleton(&conn, "r", None).unwrap();
+        assert!(out.contains("[type] Alias"), "type alias missing: {out}");
+        assert!(out.contains("[union] Bits"), "union missing: {out}");
+        assert!(out.contains("[macro] say"), "macro missing: {out}");
+    }
+
     #[test]
     fn skeleton_target_dir_filters_to_prefix() {
         let conn = make_db();
@@ -4994,6 +5045,21 @@ mod tests {
     fn condense_cpp_forward_decl_unchanged() {
         let raw = "class Foo;";
         assert_eq!(condense(raw, "cpp"), raw);
+    }
+
+    #[test]
+    fn condense_c_function_replaces_body() {
+        let raw = "static void ggml_compute(struct ggml_tensor * t) {\n    t->n_dims = 4;\n    do_work(t);\n}";
+        let result = condense(raw, "c");
+        assert!(
+            result.contains("ggml_compute(struct ggml_tensor * t)"),
+            "signature lost: {result}"
+        );
+        assert!(
+            result.contains("{ /* ... */ }"),
+            "placeholder missing: {result}"
+        );
+        assert!(!result.contains("do_work"), "body leaked: {result}");
     }
 
     #[test]

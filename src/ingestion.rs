@@ -54,6 +54,97 @@ type ParsedFileBatchRow = (String, String, Vec<Symbol>, String, i64);
 struct LangConfig {
     language: Language,
     query_src: &'static str,
+    /// Language-specific accept/reject hook for query captures, for rules
+    /// core tree-sitter queries cannot express (ancestor checks, callee
+    /// allowlists — there are no ancestor/negation predicates upstream).
+    /// `None` keeps every capture.
+    capture_filter: Option<fn(&tree_sitter::Node, &[u8]) -> bool>,
+}
+
+/// Symbol query shared by the `.ts` and `.tsx` arms — one constant so the two
+/// grammars can never drift apart silently.
+///
+/// The `variable_declarator` patterns index value bindings that define
+/// functions: `const f = () => ...`, `const f = function () {...}`, their
+/// `var` twins, and known component wrappers (`memo(() => ...)`). Locality
+/// and the wrapper allowlist are enforced by `ts_capture_filter`.
+const TS_SYMBOL_QUERY: &str = concat!(
+    "(function_declaration) @function\n",
+    "(method_definition) @method\n",
+    "(class_declaration) @class\n",
+    "(interface_declaration) @interface\n",
+    "(type_alias_declaration) @type\n",
+    "(enum_declaration) @enum\n",
+    "(lexical_declaration (variable_declarator name: (identifier) value: [(arrow_function) (function_expression)]) @function)\n",
+    "(variable_declaration (variable_declarator name: (identifier) value: [(arrow_function) (function_expression)]) @function)\n",
+    "(lexical_declaration (variable_declarator name: (identifier) value: (call_expression function: [(identifier) (member_expression)] arguments: (arguments (arrow_function)))) @function)"
+);
+
+/// Wrapper callees whose arrow-function argument defines the bound symbol
+/// (`const C = memo(() => ...)`, `React.forwardRef(...)`). Anything else —
+/// `useMemo`, `debounce`, `.then` — receives a callback, not a definition.
+const TS_FUNCTION_WRAPPERS: &[&str] = &["memo", "forwardRef"];
+
+/// Accept/reject TS and TSX `variable_declarator` captures.
+fn ts_capture_filter(node: &tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() != "variable_declarator" {
+        return true;
+    }
+    // Reject function-local bindings: `const handleClick = () => {}` inside a
+    // component body is implementation detail, not module surface, and every
+    // component repeats the same handler names — poisoning name-based call
+    // resolution. Module/namespace/export scopes have no such ancestor.
+    let mut ancestor = node.parent();
+    while let Some(a) = ancestor {
+        if matches!(
+            a.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "generator_function_declaration"
+                | "method_definition"
+        ) {
+            return false;
+        }
+        ancestor = a.parent();
+    }
+    let Some(value) = node.child_by_field_name("value") else {
+        return true;
+    };
+    if value.kind() != "call_expression" {
+        return true;
+    }
+    // Wrapper call: accept only the known component wrappers. The `property`
+    // field covers `React.memo` / `React.forwardRef`.
+    let callee_name =
+        value
+            .child_by_field_name("function")
+            .and_then(|callee| match callee.kind() {
+                "identifier" => callee.utf8_text(source).ok(),
+                "member_expression" => callee
+                    .child_by_field_name("property")
+                    .and_then(|prop| prop.utf8_text(source).ok()),
+                _ => None,
+            });
+    callee_name.is_some_and(|name| TS_FUNCTION_WRAPPERS.contains(&name))
+}
+
+/// Reject impl-body associated types: `impl Iterator for X { type Item = u32; }`
+/// is a `type_item` too, and 50 impls would index 50 colliding `Item` symbols.
+/// (Trait-body associated types parse as `associated_type` — never captured.)
+fn rust_capture_filter(node: &tree_sitter::Node, _source: &[u8]) -> bool {
+    if node.kind() != "type_item" {
+        return true;
+    }
+    let mut ancestor = node.parent();
+    while let Some(a) = ancestor {
+        if a.kind() == "impl_item" {
+            return false;
+        }
+        ancestor = a.parent();
+    }
+    true
 }
 
 thread_local! {
@@ -92,12 +183,23 @@ fn ingest_parse_queue_capacity() -> usize {
         .unwrap_or(64)
 }
 
+/// Extensions that all share the tree-sitter-cpp grammar path.
+/// The single source of truth for "is this a C/C++ file" — every ingestion
+/// and retrieval decision that treats the c-family specially routes through
+/// here so a new extension can never be added to one list and missed in
+/// another (the `.c` rollout touched five hardcoded lists).
+pub fn is_c_family_ext(ext: &str) -> bool {
+    matches!(ext, "c" | "cpp" | "cc" | "cxx" | "h" | "hpp")
+}
+
 /// Return the tree-sitter `Language` for a file extension.
 /// Extracted from `lang_config_for_ext` so other modules (e.g. watcher) can
 /// check parsability without needing the full query config.
 pub fn language_for_ext(ext: &str) -> Option<Language> {
+    if is_c_family_ext(ext) {
+        return Some(tree_sitter_cpp::LANGUAGE.into());
+    }
     match ext {
-        "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
         "py" => Some(tree_sitter_python::LANGUAGE.into()),
         "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
@@ -109,29 +211,49 @@ pub fn language_for_ext(ext: &str) -> Option<Language> {
 
 fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
     match ext {
-        "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(LangConfig {
+        // Specifier patterns require both a name and a body: anonymous
+        // specifiers (`union { ... } u;` nested in structs, top-level
+        // `enum { ... };` constant blocks) would otherwise index as symbols
+        // literally named "anonymous", and body-less forward declarations
+        // carry no definition worth indexing (known trade-off: Pimpl-style
+        // `class Impl;` headers lose their only index presence).
+        // Typedef aliases are separate `@type` symbols — the tag (if named)
+        // is still indexed by the specifier patterns, and `name:` is a field
+        // wildcard `(_)` so template specializations (`struct hash<Foo>`)
+        // stay indexed.
+        _ if is_c_family_ext(ext) => Some(LangConfig {
             language: tree_sitter_cpp::LANGUAGE.into(),
-            query_src: "(function_definition) @function\n(class_specifier) @class",
+            query_src: concat!(
+                "(function_definition) @function\n",
+                "(class_specifier name: (_) body: (field_declaration_list)) @class\n",
+                "(struct_specifier name: (_) body: (field_declaration_list)) @struct\n",
+                "(union_specifier name: (_) body: (field_declaration_list)) @union\n",
+                "(enum_specifier name: (_) body: (enumerator_list)) @enum\n",
+                "(type_definition type: (struct_specifier body: (field_declaration_list))) @type\n",
+                "(type_definition type: (union_specifier body: (field_declaration_list))) @type\n",
+                "(type_definition type: (enum_specifier body: (enumerator_list))) @type\n",
+                "(type_definition type: (class_specifier body: (field_declaration_list))) @type"
+            ),
+            capture_filter: None,
         }),
         "py" => Some(LangConfig {
             language: tree_sitter_python::LANGUAGE.into(),
-            query_src: "(function_definition) @function\n(class_definition) @class",
+            query_src: concat!(
+                "(function_definition) @function\n",
+                "(class_definition) @class\n",
+                "(type_alias_statement) @type"
+            ),
+            capture_filter: None,
         }),
         "ts" => Some(LangConfig {
             language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            query_src: concat!(
-                "(function_declaration) @function\n",
-                "(method_definition) @method\n",
-                "(class_declaration) @class"
-            ),
+            query_src: TS_SYMBOL_QUERY,
+            capture_filter: Some(ts_capture_filter),
         }),
         "tsx" => Some(LangConfig {
             language: tree_sitter_typescript::LANGUAGE_TSX.into(),
-            query_src: concat!(
-                "(function_declaration) @function\n",
-                "(method_definition) @method\n",
-                "(class_declaration) @class"
-            ),
+            query_src: TS_SYMBOL_QUERY,
+            capture_filter: Some(ts_capture_filter),
         }),
         "rs" => Some(LangConfig {
             language: tree_sitter_rust::LANGUAGE.into(),
@@ -140,8 +262,12 @@ fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
                 "(struct_item) @struct\n",
                 "(trait_item) @trait\n",
                 "(impl_item) @impl\n",
-                "(enum_item) @enum"
+                "(enum_item) @enum\n",
+                "(type_item) @type\n",
+                "(union_item) @union\n",
+                "(macro_definition) @macro"
             ),
+            capture_filter: Some(rust_capture_filter),
         }),
         "rb" => Some(LangConfig {
             language: tree_sitter_ruby::LANGUAGE.into(),
@@ -151,32 +277,60 @@ fn lang_config_for_ext(ext: &str) -> Option<LangConfig> {
                 "(class) @class\n",
                 "(module) @module"
             ),
+            capture_filter: None,
         }),
         _ => None,
     }
 }
 
+/// Node kinds that directly carry a symbol name across the supported
+/// grammars. One predicate shared by the name-extraction helpers so their
+/// identifier lists cannot drift apart (extract_symbol_name's fallback was
+/// missing `field_identifier`).
+fn is_identifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier" | "type_identifier" | "field_identifier" | "property_identifier"
+    )
+}
+
 /// Recursively descend through C++ declarator chains to find the terminal identifier.
 /// Handles chains like: function_declarator → pointer_declarator → identifier,
 /// or qualified_identifier containing an identifier.
+/// (Deliberately NOT a generic first-identifier DFS: `qualified_identifier`
+/// needs the rightmost name, and a blind descent would grab `T` from
+/// `impl<T> Foo<T>`-style generic declarators.)
 fn find_name_in_declarator<'a>(node: tree_sitter::Node<'a>, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "identifier" | "type_identifier" | "field_identifier" => {
-            return Some(node.utf8_text(source).unwrap_or("unknown").to_string());
+    if is_identifier_kind(node.kind()) {
+        return Some(node.utf8_text(source).unwrap_or("unknown").to_string());
+    }
+    if node.kind() == "qualified_identifier" {
+        // e.g. MyClass::myMethod — take the rightmost `name` field or last identifier child
+        if let Some(name_node) = node.child_by_field_name("name") {
+            return Some(name_node.utf8_text(source).unwrap_or("unknown").to_string());
         }
-        "qualified_identifier" => {
-            // e.g. MyClass::myMethod — take the rightmost `name` field or last identifier child
-            if let Some(name_node) = node.child_by_field_name("name") {
-                return Some(name_node.utf8_text(source).unwrap_or("unknown").to_string());
-            }
-        }
-        _ => {}
     }
     // Recurse into the `declarator` field if present (covers function_declarator,
     // pointer_declarator, reference_declarator, etc.)
     if let Some(inner) = node.child_by_field_name("declarator") {
         return find_name_in_declarator(inner, source);
     }
+    None
+}
+
+fn find_first_identifier<'a>(node: tree_sitter::Node<'a>, source: &[u8]) -> Option<String> {
+    if is_identifier_kind(node.kind()) {
+        return Some(node.utf8_text(source).unwrap_or("unknown").to_string());
+    }
+
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i as u32) {
+            if let Some(name) = find_first_identifier(child, source) {
+                return Some(name);
+            }
+        }
+    }
+
     None
 }
 
@@ -195,18 +349,44 @@ fn extract_symbol_name(node: &tree_sitter::Node, source: &[u8]) -> String {
             return name;
         }
     }
+    // Python PEP 695 aliases are `type_alias_statement` nodes whose public
+    // symbol lives under the `left` field, e.g. `type Vector[T] = list[T]`.
+    if node.kind() == "type_alias_statement" {
+        if let Some(left) = node.child_by_field_name("left") {
+            if let Some(name) = find_first_identifier(left, source) {
+                return name;
+            }
+        }
+    }
     // Final fallback: scan direct named children for identifier-like nodes
     for i in 0..node.named_child_count() {
         if let Some(child) = node.named_child(i as u32) {
-            match child.kind() {
-                "identifier" | "type_identifier" | "property_identifier" => {
-                    return child.utf8_text(source).unwrap_or("unknown").to_string();
-                }
-                _ => {}
+            if is_identifier_kind(child.kind()) {
+                return child.utf8_text(source).unwrap_or("unknown").to_string();
             }
         }
     }
     "anonymous".to_string()
+}
+
+/// All names bound by a captured node.
+/// `type_definition` can bind several aliases at once — `typedef struct
+/// { ... } A, B;` carries one `declarator` field per alias, and
+/// `child_by_field_name` would silently drop everything after the first —
+/// so it yields one name per declarator. Every other capture kind yields
+/// exactly one name.
+fn capture_symbol_names(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    if node.kind() == "type_definition" {
+        let mut cursor = node.walk();
+        let names: Vec<String> = node
+            .children_by_field_name("declarator", &mut cursor)
+            .filter_map(|decl| find_name_in_declarator(decl, source))
+            .collect();
+        if !names.is_empty() {
+            return names;
+        }
+    }
+    vec![extract_symbol_name(node, source)]
 }
 
 /// Return a tree-sitter query string that captures call expressions for a
@@ -214,6 +394,11 @@ fn extract_symbol_name(node: &tree_sitter::Node, source: &[u8]) -> String {
 /// identifier being invoked.
 fn call_query_for_ext(ext: &str) -> Option<&'static str> {
     match ext {
+        _ if is_c_family_ext(ext) => Some(concat!(
+            "(call_expression function: (identifier) @callee)\n",
+            "(call_expression function: (qualified_identifier name: (identifier) @callee))\n",
+            "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
+        )),
         "py" => Some(concat!(
             "(call function: (identifier) @callee)\n",
             "(call function: (attribute attribute: (identifier) @callee))\n",
@@ -221,11 +406,6 @@ fn call_query_for_ext(ext: &str) -> Option<&'static str> {
         "ts" | "tsx" => Some(concat!(
             "(call_expression function: (identifier) @callee)\n",
             "(call_expression function: (member_expression property: (property_identifier) @callee))\n",
-        )),
-        "cpp" | "cc" | "cxx" | "h" | "hpp" => Some(concat!(
-            "(call_expression function: (identifier) @callee)\n",
-            "(call_expression function: (qualified_identifier name: (identifier) @callee))\n",
-            "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
         )),
         "rs" => Some(concat!(
             "(call_expression function: (identifier) @callee)\n",
@@ -290,14 +470,28 @@ pub fn extract_calls_from_symbol(raw_text: &str, lang_ext: &str) -> Vec<String> 
     })
 }
 
+/// Capture kinds whose bodies cannot contain resolvable call expressions —
+/// skip the per-capture call-extraction re-parse for them (thousands of
+/// captures × KBs of re-parsed text at llama.cpp scale, all for empty
+/// results). Exactly the kinds that did not exist before the AST-gaps work;
+/// `class` and the pre-existing Rust kinds keep their extraction so pre-gap
+/// edge behavior is untouched.
+fn capture_kind_can_contain_calls(capture_name: &str, ext: &str) -> bool {
+    match capture_name {
+        "interface" | "type" | "macro" => false,
+        "struct" | "union" | "enum" => !is_c_family_ext(ext),
+        _ => true,
+    }
+}
+
 const RAW_TEXT_MAX_BYTES: usize = 50_000; // ~50 KB (leaves room for sentinel)
 
 /// Truncates `text` to `RAW_TEXT_MAX_BYTES` if it exceeds that threshold,
 /// appending a sentinel comment so callers know the body is incomplete.
 /// Full source is always available on disk via the node's `file_path`.
-fn cap_raw_text(text: String) -> String {
+fn cap_raw_text(text: &str) -> String {
     if text.len() <= RAW_TEXT_MAX_BYTES {
-        return text;
+        return text.to_string();
     }
     // Truncate at a char boundary to avoid splitting UTF-8 sequences
     let end = text
@@ -378,26 +572,37 @@ fn parse_file_inner(
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 let node = capture.node;
+                if let Some(filter) = config.capture_filter {
+                    if !filter(&node, source_bytes) {
+                        continue;
+                    }
+                }
                 let capture_name = query.capture_names()[capture.index as usize];
-                let name = extract_symbol_name(&node, source_bytes);
-                let raw_text = cap_raw_text(node.utf8_text(source_bytes).unwrap_or("").to_string());
-                let callees = extract_calls_from_symbol(&raw_text, ext);
+                let names = capture_symbol_names(&node, source_bytes);
+                let raw_text = cap_raw_text(node.utf8_text(source_bytes).unwrap_or(""));
+                let callees = if capture_kind_can_contain_calls(capture_name, ext) {
+                    extract_calls_from_symbol(&raw_text, ext)
+                } else {
+                    Vec::new()
+                };
                 let start_byte = node.start_byte();
                 let end_byte = node.end_byte();
                 let start_position = node.start_position();
                 let end_position = node.end_position();
-                syms.push(Symbol {
-                    name,
-                    symbol_type: capture_name.to_string(),
-                    raw_text,
-                    callees,
-                    start_byte,
-                    end_byte,
-                    start_line: start_position.row + 1,
-                    start_column: start_position.column + 1,
-                    end_line: end_position.row + 1,
-                    end_column: end_position.column + 1,
-                });
+                for name in names {
+                    syms.push(Symbol {
+                        name,
+                        symbol_type: capture_name.to_string(),
+                        raw_text: raw_text.clone(),
+                        callees: callees.clone(),
+                        start_byte,
+                        end_byte,
+                        start_line: start_position.row + 1,
+                        start_column: start_position.column + 1,
+                        end_line: end_position.row + 1,
+                        end_column: end_position.column + 1,
+                    });
+                }
             }
         }
         Ok(syms)
@@ -858,7 +1063,11 @@ where
             // graph, freshness notes, and emitted context packets are portable
             // and stable across platforms (Windows `strip_prefix` yields `\`).
             let rel = crate::db::normalize_path_separators(
-                canonical.strip_prefix(root_path).ok()?.to_string_lossy().as_ref(),
+                canonical
+                    .strip_prefix(root_path)
+                    .ok()?
+                    .to_string_lossy()
+                    .as_ref(),
             );
             let mtime = std::fs::metadata(path)
                 .ok()?
@@ -952,10 +1161,32 @@ where
 
 // ── Phase C: brief DB write ───────────────────────────────────────────────────
 
+/// Whether a symbol of this kind can be the *target* of a CALLS edge.
+///
+/// Type-level declarations (interfaces, type aliases, unions, macro
+/// definitions) are never callees; leaving them in the candidate set either
+/// turns a previously-unique name ambiguous (C `struct foo` + `void foo()`
+/// silently drops the edge) or steals the edge outright (TS `type Button` +
+/// `const Button = () => ...` in one file). C/C++ structs and enums are
+/// likewise type-only, but Rust tuple-struct constructors (`Foo(..)`) and
+/// class constructors (Python/C++) are real call targets, so `struct` stays
+/// callable outside the c-family and `class` stays callable everywhere.
+/// `macro` is safe to exclude: Rust macro invocations parse as
+/// `macro_invocation`, which the call query never captures.
+pub(crate) fn is_callable_symbol_kind(symbol_type: &str, language: &str) -> bool {
+    match symbol_type {
+        "interface" | "type" | "union" | "macro" => false,
+        "struct" | "enum" => !is_c_family_ext(language),
+        _ => true,
+    }
+}
+
 /// Map `symbol_name -> node id` for a bounded set of names (MARROW-PERF-009).
 ///
 /// Uses a temp table + join so we avoid scanning every row in `nodes` and stay
 /// within SQLite’s bound-parameter limits for large callee sets.
+/// Only returns nodes that can actually be call targets (see
+/// `is_callable_symbol_kind`) — the sole consumers are CALLS-edge resolvers.
 pub(crate) fn build_name_to_ids_for_symbol_names(
     conn: &Connection,
     repo_id: &str,
@@ -980,7 +1211,7 @@ pub(crate) fn build_name_to_ids_for_symbol_names(
     }
 
     let mut stmt = conn.prepare(
-        "SELECT n.symbol_name, n.id, n.file_path FROM nodes n
+        "SELECT n.symbol_name, n.id, n.file_path, n.symbol_type, n.language FROM nodes n
          INNER JOIN _marrow_callee_lookup c ON n.symbol_name = c.name
          WHERE n.repo_id = ?1",
     )?;
@@ -989,10 +1220,15 @@ pub(crate) fn build_name_to_ids_for_symbol_names(
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })?;
     for r in rows {
-        let (name, id, file_path) = r?;
+        let (name, id, file_path, symbol_type, language) = r?;
+        if !is_callable_symbol_kind(&symbol_type, &language) {
+            continue;
+        }
         map.entry(name).or_default().push((id, file_path));
     }
 
@@ -1348,6 +1584,174 @@ where
     )? as usize;
 
     Ok((total, calls_edge_count))
+}
+
+/// Re-index a single file in place — the shared implementation behind both
+/// watch paths (`marrow watch` and the dashboard watcher).
+///
+/// Mirrors the per-file section of `write_changeset_body`: node ids come from
+/// `make_node_id`, unchanged ids survive as UPDATEs so inbound CALLS edges
+/// stay alive (MARROW-PERF-011), removed ids take their edges with them, and
+/// outgoing CALLS edges are rebuilt from the symbols' pre-computed callees
+/// with the same same-file-then-unambiguous scoping as full ingest.
+/// Pass `None` for `parsed_symbols` when the file was deleted.
+/// Returns the number of symbols written.
+pub fn apply_single_file_update(
+    conn: &Connection,
+    repo_id: &str,
+    rel_path: &str,
+    lang_ext: &str,
+    parsed_symbols: Option<Vec<Symbol>>,
+) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    crate::db::mark_graph_degrees_dirty(&tx, repo_id)?;
+
+    let old_ids: HashSet<String> = tx
+        .prepare("SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2")?
+        .query_map(rusqlite::params![repo_id, rel_path], |row| {
+            row.get::<_, String>(0)
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Outgoing CALLS from this file are rebuilt below; inbound edges onto
+    // stable node ids survive (MARROW-PERF-011).
+    tx.execute(
+        "DELETE FROM edges WHERE source_id IN (
+            SELECT id FROM nodes WHERE repo_id = ?1 AND file_path = ?2)",
+        rusqlite::params![repo_id, rel_path],
+    )?;
+
+    let Some(symbols) = parsed_symbols else {
+        // File deleted: stale-mark its observations, then drop its nodes and
+        // any edges still touching them.
+        let existing_symbols: Vec<String> = tx
+            .prepare("SELECT symbol_name FROM nodes WHERE repo_id = ?1 AND file_path = ?2")?
+            .query_map(rusqlite::params![repo_id, rel_path], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for symbol_name in &existing_symbols {
+            crate::db::mark_deleted_observation_stale(&tx, repo_id, symbol_name, rel_path)?;
+        }
+        let removed: Vec<String> = old_ids.into_iter().collect();
+        delete_edges_touching_removed_ids(&tx, &removed)?;
+        tx.execute(
+            "DELETE FROM nodes WHERE repo_id = ?1 AND file_path = ?2",
+            rusqlite::params![repo_id, rel_path],
+        )?;
+        tx.commit()?;
+        resolve_cross_repo_after_ingest(conn, repo_id)?;
+        return Ok(0);
+    };
+
+    let new_ids: HashSet<String> = symbols
+        .iter()
+        .map(|s| make_node_id(repo_id, rel_path, &s.symbol_type, &s.name, s.start_byte))
+        .collect();
+    let removed: Vec<String> = old_ids.difference(&new_ids).cloned().collect();
+    delete_edges_touching_removed_ids(&tx, &removed)?;
+    for id in &removed {
+        tx.execute("DELETE FROM nodes WHERE id = ?1", rusqlite::params![id])?;
+    }
+
+    let mut callee_names: HashSet<String> = HashSet::new();
+    for sym in &symbols {
+        let node_id = make_node_id(
+            repo_id,
+            rel_path,
+            &sym.symbol_type,
+            &sym.name,
+            sym.start_byte,
+        );
+        let new_hash = crate::db::hash_raw_text(&sym.raw_text);
+        if old_ids.contains(&node_id) {
+            tx.execute(
+                "UPDATE nodes SET language = ?1, symbol_name = ?2, symbol_type = ?3, raw_text = ?4, \
+                 source_start_byte = ?5, source_end_byte = ?6, start_line = ?7, start_column = ?8, \
+                 end_line = ?9, end_column = ?10 WHERE id = ?11",
+                rusqlite::params![
+                    lang_ext,
+                    sym.name,
+                    sym.symbol_type,
+                    sym.raw_text,
+                    sym.start_byte as i64,
+                    sym.end_byte as i64,
+                    sym.start_line as i64,
+                    sym.start_column as i64,
+                    sym.end_line as i64,
+                    sym.end_column as i64,
+                    node_id
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT OR REPLACE INTO nodes \
+                 (id, repo_id, file_path, language, symbol_name, symbol_type, raw_text, \
+                  source_start_byte, source_end_byte, start_line, start_column, end_line, end_column)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    node_id,
+                    repo_id,
+                    rel_path,
+                    lang_ext,
+                    sym.name,
+                    sym.symbol_type,
+                    sym.raw_text,
+                    sym.start_byte as i64,
+                    sym.end_byte as i64,
+                    sym.start_line as i64,
+                    sym.start_column as i64,
+                    sym.end_line as i64,
+                    sym.end_column as i64
+                ],
+            )?;
+        }
+        crate::db::mark_stale_observations(&tx, repo_id, &sym.name, rel_path, &new_hash)?;
+        for callee_name in &sym.callees {
+            if callee_name != &sym.name {
+                callee_names.insert(callee_name.clone());
+            }
+        }
+    }
+
+    let name_to_ids = build_name_to_ids_for_symbol_names(&tx, repo_id, &callee_names)?;
+    let mut calls_batch: Vec<(String, String)> = Vec::new();
+    for sym in &symbols {
+        let source_id = make_node_id(
+            repo_id,
+            rel_path,
+            &sym.symbol_type,
+            &sym.name,
+            sym.start_byte,
+        );
+        for callee_name in &sym.callees {
+            if callee_name == &sym.name {
+                continue;
+            }
+            if let Some(targets) = name_to_ids.get(callee_name.as_str()) {
+                // M-5 scoping: prefer same-file targets; else emit only if the
+                // name resolves unambiguously (single target).
+                let same_file: Vec<&str> = targets
+                    .iter()
+                    .filter(|(_, fp)| fp == rel_path)
+                    .map(|(id, _)| id.as_str())
+                    .collect();
+                if !same_file.is_empty() {
+                    for id in same_file {
+                        calls_batch.push((source_id.clone(), id.to_string()));
+                    }
+                } else if targets.len() == 1 {
+                    calls_batch.push((source_id.clone(), targets[0].0.clone()));
+                }
+                // else: ambiguous cross-file, skip
+            }
+        }
+    }
+    flush_calls_edge_batch(&tx, &calls_batch)?;
+
+    tx.commit()?;
+    resolve_cross_repo_after_ingest(conn, repo_id)?;
+    Ok(symbols.len())
 }
 
 // ── Composed entry points ─────────────────────────────────────────────────────
@@ -1718,7 +2122,7 @@ fn extract_imports(raw_text: &str, lang: &str) -> Vec<String> {
                     }
                 }
             }
-            "cpp" | "cc" | "cxx" | "h" | "hpp" => {
+            _ if is_c_family_ext(lang) => {
                 // #include "X.h" -> "X"
                 if let Some(rest) = trimmed.strip_prefix("#include") {
                     let rest = rest.trim();
@@ -1744,12 +2148,283 @@ mod tests {
 
     #[test]
     fn test_call_query_parses_all_languages() {
-        let exts = ["py", "ts", "tsx", "cpp", "rs", "rb"];
+        let exts = ["py", "ts", "tsx", "c", "cpp", "rs", "rb"];
         for ext in exts {
             let lang = language_for_ext(ext).unwrap_or_else(|| panic!("no language for {ext}"));
             let qsrc = call_query_for_ext(ext).unwrap_or_else(|| panic!("no call query for {ext}"));
             Query::new(&lang, qsrc).unwrap_or_else(|_| panic!("query parse failed for {ext}"));
         }
+    }
+
+    #[test]
+    fn test_symbol_query_parses_all_languages() {
+        let exts = ["py", "ts", "tsx", "c", "cpp", "rs", "rb"];
+        for ext in exts {
+            let config = lang_config_for_ext(ext).unwrap_or_else(|| panic!("no config for {ext}"));
+            Query::new(&config.language, config.query_src)
+                .unwrap_or_else(|_| panic!("symbol query parse failed for {ext}"));
+        }
+    }
+
+    fn symbol_pairs_from_source(ext: &str, source: &str) -> Vec<(String, String)> {
+        let config = lang_config_for_ext(ext).unwrap_or_else(|| panic!("no config for {ext}"));
+        parse_file_inner(source, ext, &config, "<test>")
+            .unwrap()
+            .into_iter()
+            .map(|symbol| (symbol.name, symbol.symbol_type))
+            .collect()
+    }
+
+    fn assert_has_symbol(symbols: &[(String, String)], name: &str, kind: &str) {
+        assert!(
+            symbols.iter().any(|(n, k)| n == name && k == kind),
+            "missing {kind} {name}: {symbols:?}"
+        );
+    }
+
+    fn assert_missing_symbol_name(symbols: &[(String, String)], name: &str) {
+        assert!(
+            !symbols.iter().any(|(n, _)| n == name),
+            "unexpected symbol {name}: {symbols:?}"
+        );
+    }
+
+    #[test]
+    fn cpp_symbols_cover_type_specifiers_typedefs_and_c_extension() {
+        let symbols = symbol_pairs_from_source(
+            "h",
+            r#"
+struct Forward;
+class Widget;
+struct ggml_tensor { int n_dims; };
+typedef struct { int x; } ggml_cplan;
+typedef struct named_s { int y; } named_alias;
+union ggml_value { int i; float f; };
+enum ggml_status { GGML_OK };
+"#,
+        );
+
+        // Named tags are struct/union/enum symbols — including inside typedefs
+        // (ggml's `*_s` tag idiom must be findable).
+        assert_has_symbol(&symbols, "ggml_tensor", "struct");
+        assert_has_symbol(&symbols, "named_s", "struct");
+        assert_has_symbol(&symbols, "ggml_value", "union");
+        assert_has_symbol(&symbols, "ggml_status", "enum");
+        // Typedef aliases are `type` symbols, distinguishable from the tag.
+        assert_has_symbol(&symbols, "ggml_cplan", "type");
+        assert_has_symbol(&symbols, "named_alias", "type");
+        // Forward declarations and anonymous specifiers are not indexed.
+        assert_missing_symbol_name(&symbols, "Forward");
+        assert_missing_symbol_name(&symbols, "Widget");
+        assert_missing_symbol_name(&symbols, "anonymous");
+
+        let c_symbols = symbol_pairs_from_source("c", "struct c_file_type { int id; };\n");
+        assert_has_symbol(&c_symbols, "c_file_type", "struct");
+    }
+
+    #[test]
+    fn cpp_typedef_multi_declarator_pointer_and_class_variants() {
+        let symbols = symbol_pairs_from_source(
+            "h",
+            r#"
+typedef struct { int x; } A, B;
+typedef struct { int y; } *ptr_t;
+typedef class { public: void run(); } Runner;
+typedef class Named { public: int v; } NamedAlias;
+typedef enum { RED, GREEN } color_t;
+"#,
+        );
+
+        assert_has_symbol(&symbols, "A", "type");
+        assert_has_symbol(&symbols, "B", "type");
+        assert_has_symbol(&symbols, "ptr_t", "type");
+        assert_has_symbol(&symbols, "Runner", "type");
+        assert_has_symbol(&symbols, "NamedAlias", "type");
+        assert_has_symbol(&symbols, "Named", "class");
+        assert_has_symbol(&symbols, "color_t", "type");
+        assert_missing_symbol_name(&symbols, "anonymous");
+    }
+
+    /// Anonymous specifiers — nested unions (ubiquitous in ggml), top-level
+    /// enum constant blocks, function-local structs — must not produce
+    /// symbols named "anonymous".
+    #[test]
+    fn cpp_anonymous_specifiers_are_not_indexed() {
+        let symbols = symbol_pairs_from_source(
+            "h",
+            r#"
+struct outer {
+    union { int i; float f; } u;
+};
+enum { GGML_MAX_DIMS = 4 };
+void local_tmp(void) {
+    struct { int a; } tmp;
+    (void) tmp;
+}
+"#,
+        );
+
+        assert_has_symbol(&symbols, "outer", "struct");
+        assert_has_symbol(&symbols, "local_tmp", "function");
+        assert_missing_symbol_name(&symbols, "anonymous");
+    }
+
+    /// `name:` is a wildcard field match so template specializations keep
+    /// their index presence under the written name.
+    #[test]
+    fn cpp_template_specialization_struct_still_indexed() {
+        let symbols = symbol_pairs_from_source(
+            "hpp",
+            "template <typename T> struct Widget { T v; };\n\
+             template <> struct Widget<int> { int v; };\n",
+        );
+
+        assert_has_symbol(&symbols, "Widget", "struct");
+        assert_has_symbol(&symbols, "Widget<int>", "struct");
+    }
+
+    #[test]
+    fn typescript_symbols_cover_structural_types_and_arrow_functions() {
+        let symbols = symbol_pairs_from_source(
+            "ts",
+            r#"
+interface Props { title: string }
+type Handler = () => void;
+enum Status { Ready }
+const staticValue = 5;
+export const loadData = async () => fetchData();
+let transform = (value: number) => value.toString();
+"#,
+        );
+
+        assert_has_symbol(&symbols, "Props", "interface");
+        assert_has_symbol(&symbols, "Handler", "type");
+        assert_has_symbol(&symbols, "Status", "enum");
+        assert_has_symbol(&symbols, "loadData", "function");
+        assert_has_symbol(&symbols, "transform", "function");
+        assert_missing_symbol_name(&symbols, "staticValue");
+    }
+
+    /// T9: arrow/function-expression bindings anchor to module scope, and
+    /// wrapper calls index only through the memo/forwardRef allowlist.
+    #[test]
+    fn typescript_arrow_anchoring_and_wrapper_allowlist() {
+        let symbols = symbol_pairs_from_source(
+            "ts",
+            r#"
+export const TopLevel = () => 1;
+export const Wrapped = memo(() => 2);
+export const RefComp = React.forwardRef(() => 3);
+export const Memoed = React.memo(() => 4);
+const expr = function () { return 5; };
+var legacy = () => 6;
+export const NotAComponent = useMemo(() => 7);
+const debounced = debounce(() => 8);
+function outer() {
+    const local = () => 9;
+    return local;
+}
+const promise = Promise.resolve().then(() => 10);
+"#,
+        );
+
+        assert_has_symbol(&symbols, "TopLevel", "function");
+        assert_has_symbol(&symbols, "Wrapped", "function");
+        assert_has_symbol(&symbols, "RefComp", "function");
+        assert_has_symbol(&symbols, "Memoed", "function");
+        assert_has_symbol(&symbols, "expr", "function");
+        assert_has_symbol(&symbols, "legacy", "function");
+        assert_has_symbol(&symbols, "outer", "function");
+        assert_missing_symbol_name(&symbols, "NotAComponent");
+        assert_missing_symbol_name(&symbols, "debounced");
+        assert_missing_symbol_name(&symbols, "local");
+        assert_missing_symbol_name(&symbols, "promise");
+    }
+
+    #[test]
+    fn tsx_wrapped_components_indexed_and_local_handlers_suppressed() {
+        let symbols = symbol_pairs_from_source(
+            "tsx",
+            r#"
+export const Memo = memo(() => <div />);
+export const Card = () => {
+    const handleClick = () => {};
+    return <button onClick={handleClick} />;
+};
+"#,
+        );
+
+        assert_has_symbol(&symbols, "Memo", "function");
+        assert_has_symbol(&symbols, "Card", "function");
+        assert_missing_symbol_name(&symbols, "handleClick");
+    }
+
+    /// Impl-body `type Item = ...` must not become a top-level type symbol
+    /// (50 impls of Iterator would index 50 colliding `Item`s), while
+    /// module-level aliases stay indexed.
+    #[test]
+    fn rust_impl_associated_types_are_not_indexed() {
+        let symbols = symbol_pairs_from_source(
+            "rs",
+            r#"
+type TopLevel<T> = Option<T>;
+struct Counter;
+impl Iterator for Counter {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        None
+    }
+}
+"#,
+        );
+
+        assert_has_symbol(&symbols, "TopLevel", "type");
+        assert_missing_symbol_name(&symbols, "Item");
+    }
+
+    #[test]
+    fn tsx_symbols_cover_arrow_components() {
+        let symbols = symbol_pairs_from_source(
+            "tsx",
+            r#"
+interface Props { title: string }
+export const Panel = (props: Props) => <section>{props.title}</section>;
+"#,
+        );
+
+        assert_has_symbol(&symbols, "Props", "interface");
+        assert_has_symbol(&symbols, "Panel", "function");
+    }
+
+    #[test]
+    fn rust_symbols_cover_macros_type_aliases_and_unions() {
+        let symbols = symbol_pairs_from_source(
+            "rs",
+            r#"
+macro_rules! say { () => {}; }
+type Alias<T> = Option<T>;
+union Bits { i: u32, f: f32 }
+"#,
+        );
+
+        assert_has_symbol(&symbols, "say", "macro");
+        assert_has_symbol(&symbols, "Alias", "type");
+        assert_has_symbol(&symbols, "Bits", "union");
+    }
+
+    #[test]
+    fn python_symbols_cover_pep_695_type_aliases() {
+        let symbols = symbol_pairs_from_source(
+            "py",
+            r#"
+type Vector[T] = list[T]
+async def af():
+    pass
+"#,
+        );
+
+        assert_has_symbol(&symbols, "Vector", "type");
+        assert_has_symbol(&symbols, "af", "function");
     }
 
     #[test]
@@ -1842,6 +2517,261 @@ function foo() {
             )
             .unwrap();
         assert!(edge_count >= 1, "no CALLS edges in DB");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T1 regression: indexing `struct foo` must not make a cross-file call to
+    /// `void foo()` ambiguous — type-level twins are excluded from the CALLS
+    /// candidate set, so the function keeps its edge.
+    #[test]
+    fn test_c_struct_name_twin_does_not_break_function_call_edge() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_kind_aware_c_twin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foo.h"), "struct foo { int x; };\n").unwrap();
+        std::fs::write(dir.join("foo.c"), "void foo(void) {}\n").unwrap();
+        std::fs::write(dir.join("caller.c"), "void bar(void) { foo(); }\n").unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let to_function: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes s ON s.id = e.source_id \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND s.symbol_name = 'bar' \
+                   AND t.symbol_name = 'foo' AND t.symbol_type = 'function'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            to_function, 1,
+            "same-name struct must not turn the function callee ambiguous"
+        );
+
+        let to_struct: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND t.symbol_name = 'foo' AND t.symbol_type != 'function'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(to_struct, 0, "no CALLS edge may target the struct node");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T1 regression: TS `type Button` + `const Button = () => ...` in one
+    /// file — a `Button()` call must land on the function node only.
+    #[test]
+    fn test_ts_type_value_twin_resolves_call_to_function_not_type() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_kind_aware_ts_twin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("button.ts"),
+            "type Button = { label: string };\n\
+             export const Button = () => ({ label: \"ok\" });\n\
+             export const render = () => Button();\n",
+        )
+        .unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let to_function: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes s ON s.id = e.source_id \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND s.symbol_name = 'render' \
+                   AND t.symbol_name = 'Button' AND t.symbol_type = 'function'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(to_function, 1, "call must resolve to the value binding");
+
+        let to_type: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND t.symbol_name = 'Button' AND t.symbol_type = 'type'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(to_type, 0, "no CALLS edge may target the type alias node");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T1 guard: Rust tuple-struct constructors are real call targets and must
+    /// keep their edges under the kind-aware filter.
+    #[test]
+    fn test_rust_tuple_struct_constructor_call_still_resolves() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_kind_aware_rs_tuple");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("newtype.rs"),
+            "pub struct Newtype(pub u32);\n\npub fn make() -> Newtype {\n    Newtype(1)\n}\n",
+        )
+        .unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let to_struct: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes s ON s.id = e.source_id \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND s.symbol_name = 'make' \
+                   AND t.symbol_name = 'Newtype' AND t.symbol_type = 'struct'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(to_struct, 1, "Rust struct must stay a valid call target");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T4: a watch-path update must produce byte-identical node ids to full
+    /// ingest — same-name twins (TS `type Button` + `const Button`) collapse
+    /// onto one row or dangle inbound edges otherwise.
+    #[test]
+    fn test_watch_update_node_ids_match_full_ingest() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_watch_id_parity");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("button.ts");
+        std::fs::write(
+            &file,
+            "type Button = { label: string };\n\
+             export const Button = () => ({ label: \"ok\" });\n",
+        )
+        .unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let ids_after_ingest = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT id FROM nodes WHERE repo_id = 'test' ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        let full_ingest_ids = ids_after_ingest(&conn);
+        assert_eq!(
+            full_ingest_ids.len(),
+            2,
+            "type + const twins must be two nodes: {full_ingest_ids:?}"
+        );
+
+        // Re-index the same file through the watch path.
+        let (ext, symbols) = parse_file(&file).unwrap();
+        apply_single_file_update(&conn, repo_id, "button.ts", &ext, Some(symbols)).unwrap();
+
+        let watch_ids = ids_after_ingest(&conn);
+        assert_eq!(
+            full_ingest_ids, watch_ids,
+            "watch updates must write make_node_id-keyed rows"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-saving a file with unchanged content must keep every node and edge.
+    /// (Regression: the old watcher path deleted all rows for the file and
+    /// then UPDATEd the surviving ids — updating deleted rows no-ops, so
+    /// unchanged symbols silently vanished on every re-save.)
+    #[test]
+    fn test_watch_resave_unchanged_file_keeps_nodes_and_edges() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_watch_resave");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("calls.py");
+        std::fs::write(
+            &file,
+            "def helper():\n    pass\n\ndef main():\n    helper()\n",
+        )
+        .unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        for _ in 0..2 {
+            let (ext, symbols) = parse_file(&file).unwrap();
+            apply_single_file_update(&conn, repo_id, "calls.py", &ext, Some(symbols)).unwrap();
+        }
+
+        let nodes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE repo_id = 'test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nodes, 2, "unchanged symbols must survive re-saves");
+
+        let edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE relationship_type = 'CALLS'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edges, 1, "the CALLS edge must survive re-saves");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2083,7 +3013,7 @@ function foo() {
     fn raw_text_cap_applied_to_oversized_symbols() {
         // Build a string just over 50KB
         let big_body = "x".repeat(51_200);
-        let capped = cap_raw_text(big_body.clone());
+        let capped = cap_raw_text(&big_body);
         assert!(
             capped.len() < big_body.len(),
             "oversized raw_text should be truncated"
@@ -2097,7 +3027,7 @@ function foo() {
     #[test]
     fn raw_text_cap_passes_small_symbols_unchanged() {
         let small = "def foo\n  42\nend\n".to_string();
-        let result = cap_raw_text(small.clone());
+        let result = cap_raw_text(&small);
         assert_eq!(result, small, "small raw_text should be unchanged");
     }
 
