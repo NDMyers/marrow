@@ -294,6 +294,64 @@ fn is_identifier_kind(kind: &str) -> bool {
     )
 }
 
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Locate the parameter-list `()` in a collapsed special-function name: the
+/// `()` followed by a space or end-of-string. A `()` inside a conversion
+/// operator's target type (e.g. `operator std::function<void()>()`) is
+/// always followed by another token character, never a collapsed space.
+fn find_param_list_parens(collapsed: &str) -> Option<usize> {
+    collapsed
+        .match_indices("()")
+        .map(|(idx, _)| idx)
+        .find(|&idx| matches!(collapsed.as_bytes().get(idx + 2), None | Some(b' ')))
+}
+
+fn normalize_cpp_special_function_name(text: &str) -> String {
+    let collapsed = collapse_whitespace(text).replace(" ()", "()");
+    let Some(rest) = collapsed.strip_prefix("operator ") else {
+        return collapsed;
+    };
+
+    if let Some(suffix) = rest.strip_prefix("\"\"") {
+        // Spaced literal operators (`operator "" _kb`) share an index key
+        // with the compact spelling `operator""_kb`.
+        return format!("operator\"\"{}", suffix.trim_start());
+    }
+    if let Some(suffix) = rest.strip_prefix("new []") {
+        return format!("operator new[]{suffix}");
+    }
+    if let Some(suffix) = rest.strip_prefix("delete []") {
+        return format!("operator delete[]{suffix}");
+    }
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_punctuation())
+    {
+        return format!("operator{rest}");
+    }
+    // Conversion operator: keep everything through the parameter list,
+    // dropping trailing qualifiers such as `const` or `noexcept`.
+    if let Some(paren) = find_param_list_parens(&collapsed) {
+        return collapsed[..paren + 2].to_string();
+    }
+    collapsed
+}
+
+/// Template names collapse to a compact spelling (`from_float<int>`) so the
+/// index key does not depend on how the author spaced the argument list.
+fn normalize_cpp_template_name(text: &str) -> String {
+    collapse_whitespace(text)
+        .replace(" <", "<")
+        .replace("< ", "<")
+        .replace(" >", ">")
+        .replace(" ,", ",")
+        .replace(", ", ",")
+}
+
 /// Recursively descend through C++ declarator chains to find the terminal identifier.
 /// Handles chains like: function_declarator → pointer_declarator → identifier,
 /// or qualified_identifier containing an identifier.
@@ -304,16 +362,44 @@ fn find_name_in_declarator<'a>(node: tree_sitter::Node<'a>, source: &[u8]) -> Op
     if is_identifier_kind(node.kind()) {
         return Some(node.utf8_text(source).unwrap_or("unknown").to_string());
     }
+    if matches!(
+        node.kind(),
+        "operator_name" | "operator_cast" | "destructor_name"
+    ) {
+        return Some(normalize_cpp_special_function_name(
+            node.utf8_text(source).unwrap_or("unknown"),
+        ));
+    }
+    if matches!(node.kind(), "template_function" | "template_method") {
+        return Some(normalize_cpp_template_name(
+            node.utf8_text(source).unwrap_or("unknown"),
+        ));
+    }
     if node.kind() == "qualified_identifier" {
         // e.g. MyClass::myMethod — take the rightmost `name` field or last identifier child
         if let Some(name_node) = node.child_by_field_name("name") {
-            return Some(name_node.utf8_text(source).unwrap_or("unknown").to_string());
+            return find_name_in_declarator(name_node, source)
+                .or_else(|| Some(name_node.utf8_text(source).unwrap_or("unknown").to_string()));
         }
     }
-    // Recurse into the `declarator` field if present (covers function_declarator,
-    // pointer_declarator, reference_declarator, etc.)
+    // Recurse into the `declarator` field if present (function_declarator,
+    // pointer_declarator, ...). reference_declarator and parenthesized_declarator
+    // wrap their inner declarator as a plain named child WITHOUT a `declarator`
+    // field, so those walk their named children below instead.
     if let Some(inner) = node.child_by_field_name("declarator") {
         return find_name_in_declarator(inner, source);
+    }
+    if matches!(
+        node.kind(),
+        "reference_declarator" | "parenthesized_declarator"
+    ) {
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i as u32) {
+                if let Some(name) = find_name_in_declarator(child, source) {
+                    return Some(name);
+                }
+            }
+        }
     }
     None
 }
@@ -1492,12 +1578,13 @@ where
             crate::db::mark_stale_observations(conn, repo_id, &sym.name, &file_path, &new_hash)?;
 
             // Callees were pre-computed during the parallel parse phase and stored in the
-            // spill file — no tree-sitter re-parse needed here.
+            // spill file — no tree-sitter re-parse needed here. Callees that
+            // share the symbol's own name stay in: self-recursion is dropped
+            // by node id at resolution, so a wrapper calling a same-named
+            // overload keeps its edge.
             for callee_name in &sym.callees {
-                if callee_name != &sym.name {
-                    all_callee_names.insert(callee_name.clone());
-                    pending_calls.push((node_id.clone(), callee_name.clone(), file_path.clone()));
-                }
+                all_callee_names.insert(callee_name.clone());
+                pending_calls.push((node_id.clone(), callee_name.clone(), file_path.clone()));
             }
         }
         conn.execute(
@@ -1534,9 +1621,14 @@ where
                 .collect();
             if !same_file.is_empty() {
                 for id in same_file {
-                    calls_batch.push((source_id.clone(), id.to_string()));
+                    // Recursion is suppressed by identity, not name, so
+                    // same-named siblings (overloads, bare-named members)
+                    // still receive edges.
+                    if id != source_id {
+                        calls_batch.push((source_id.clone(), id.to_string()));
+                    }
                 }
-            } else if targets.len() == 1 {
+            } else if targets.len() == 1 && &targets[0].0 != source_id {
                 calls_batch.push((source_id.clone(), targets[0].0.clone()));
             }
             // else: ambiguous (multiple targets in different files), skip
@@ -1708,9 +1800,7 @@ pub fn apply_single_file_update(
         }
         crate::db::mark_stale_observations(&tx, repo_id, &sym.name, rel_path, &new_hash)?;
         for callee_name in &sym.callees {
-            if callee_name != &sym.name {
-                callee_names.insert(callee_name.clone());
-            }
+            callee_names.insert(callee_name.clone());
         }
     }
 
@@ -1725,12 +1815,10 @@ pub fn apply_single_file_update(
             sym.start_byte,
         );
         for callee_name in &sym.callees {
-            if callee_name == &sym.name {
-                continue;
-            }
             if let Some(targets) = name_to_ids.get(callee_name.as_str()) {
                 // M-5 scoping: prefer same-file targets; else emit only if the
-                // name resolves unambiguously (single target).
+                // name resolves unambiguously (single target). Self-recursion
+                // is dropped by node id so same-named siblings keep edges.
                 let same_file: Vec<&str> = targets
                     .iter()
                     .filter(|(_, fp)| fp == rel_path)
@@ -1738,9 +1826,11 @@ pub fn apply_single_file_update(
                     .collect();
                 if !same_file.is_empty() {
                     for id in same_file {
-                        calls_batch.push((source_id.clone(), id.to_string()));
+                        if id != source_id.as_str() {
+                            calls_batch.push((source_id.clone(), id.to_string()));
+                        }
                     }
-                } else if targets.len() == 1 {
+                } else if targets.len() == 1 && targets[0].0 != source_id {
                     calls_batch.push((source_id.clone(), targets[0].0.clone()));
                 }
                 // else: ambiguous cross-file, skip
@@ -2269,6 +2359,74 @@ void local_tmp(void) {
         assert_missing_symbol_name(&symbols, "anonymous");
     }
 
+    #[test]
+    fn cpp_operator_and_destructor_functions_are_named() {
+        let symbols = symbol_pairs_from_source(
+            "cpp",
+            r#"
+struct functor {
+    int operator ()(int x) const { return x; }
+    bool operator<(const functor &) const { return false; }
+    explicit operator bool() const { return true; }
+    ~functor() = default;
+};
+
+bool functor::operator==(const functor &) const { return true; }
+functor::operator int() const { return 1; }
+functor::~functor() {}
+int operator+(functor, functor) { return 0; }
+std::ostream & operator <<(std::ostream & os, const functor &) { return os; }
+std::string & functor::args_target() { static std::string s; return s; }
+template <> void from_float<int>(const float *) {}
+"#,
+        );
+
+        assert_has_symbol(&symbols, "operator()", "function");
+        assert_has_symbol(&symbols, "operator<", "function");
+        assert_has_symbol(&symbols, "operator==", "function");
+        assert_has_symbol(&symbols, "operator+", "function");
+        assert_has_symbol(&symbols, "operator<<", "function");
+        assert_has_symbol(&symbols, "operator bool()", "function");
+        assert_has_symbol(&symbols, "operator int()", "function");
+        assert_has_symbol(&symbols, "~functor", "function");
+        assert_has_symbol(&symbols, "args_target", "function");
+        assert_has_symbol(&symbols, "from_float<int>", "function");
+        assert_missing_symbol_name(&symbols, "anonymous");
+    }
+
+    #[test]
+    fn cpp_exotic_declarator_names_are_normalized() {
+        let symbols = symbol_pairs_from_source(
+            "cpp",
+            r#"
+struct widget {
+    operator std::function<void()>() const { return {}; }
+};
+
+unsigned long long operator "" _km(unsigned long long v) { return v; }
+unsigned long long operator""_mi(unsigned long long v) { return v; }
+template <> void from_double< int >(const double *) {}
+struct outer_s { struct inner_s { void method(); }; };
+void outer_s::inner_s::method() {}
+int (*get_handler())(int) { return nullptr; }
+"#,
+        );
+
+        // The `()` inside the conversion target type must not truncate the name.
+        assert_has_symbol(&symbols, "operator std::function<void()>()", "function");
+        // Spaced and compact literal-operator spellings share one name shape.
+        assert_has_symbol(&symbols, "operator\"\"_km", "function");
+        assert_has_symbol(&symbols, "operator\"\"_mi", "function");
+        // Template specializations normalize to the compact spelling.
+        assert_has_symbol(&symbols, "from_double<int>", "function");
+        // Multi-level qualified out-of-line definitions index under the bare
+        // method name, matching single-level `functor::args_target`.
+        assert_has_symbol(&symbols, "method", "function");
+        // Function returning a function pointer: parenthesized_declarator.
+        assert_has_symbol(&symbols, "get_handler", "function");
+        assert_missing_symbol_name(&symbols, "anonymous");
+    }
+
     /// `name:` is a wildcard field match so template specializations keep
     /// their index presence under the written name.
     #[test]
@@ -2571,6 +2729,63 @@ function foo() {
             )
             .unwrap();
         assert_eq!(to_struct, 0, "no CALLS edge may target the struct node");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Self-call suppression is by node id, not name: a member indexed under
+    /// its bare name calling a same-named sibling keeps that edge, while
+    /// plain recursion still produces no self-edge.
+    #[test]
+    fn test_same_named_sibling_keeps_call_edge_without_self_edge() {
+        let conn = crate::db::init_db(":memory:").unwrap();
+        let repo_id = "test";
+        conn.execute(
+            "INSERT INTO repositories (id, root_path) VALUES (?1, ?2)",
+            rusqlite::params![repo_id, "/tmp/test"],
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join("marrow_test_self_call_by_id");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("refresh.cpp"),
+            "struct widget { void refresh(); };\n\
+             void refresh() {}\n\
+             void widget::refresh() { refresh(); }\n\
+             int spin(int x) { return spin(x - 1); }\n",
+        )
+        .unwrap();
+
+        ingest_repo(&conn, repo_id, &dir).unwrap();
+
+        let sibling_edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e \
+                 JOIN nodes s ON s.id = e.source_id \
+                 JOIN nodes t ON t.id = e.target_id \
+                 WHERE e.relationship_type = 'CALLS' \
+                   AND s.symbol_name = 'refresh' AND t.symbol_name = 'refresh' \
+                   AND s.id != t.id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sibling_edges, 1,
+            "member refresh must keep its edge to the same-named free function"
+        );
+
+        let self_edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges \
+                 WHERE relationship_type = 'CALLS' AND source_id = target_id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(self_edges, 0, "recursion must not produce a self edge");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
