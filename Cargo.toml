@@ -1,6 +1,6 @@
 [package]
 name = "marrow"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["NDMyers <99777840+NDMyers@users.noreply.github.com>"]
 license = "MIT"
