@@ -7888,13 +7888,13 @@ fn cmd_ui(workspace_root: &Path) -> Result<()> {
             if auto_open { "ON " } else { "OFF" }
         );
 
-        let items = vec![
-            "Open dashboard      Launch http://127.0.0.1:8765 in your browser",
-            toggle_label.as_str(),
-            "Back",
+        let rows = [
+            MenuRow::Item("Open dashboard      Launch http://127.0.0.1:8765 in your browser"),
+            MenuRow::Item(toggle_label.as_str()),
+            MenuRow::Item("Back"),
         ];
 
-        let selection = hub_select("Dashboard (Esc to go back)", &items, 0);
+        let selection = hub_select("Dashboard", &rows, "↑↓ move · enter select · esc back", 0);
 
         match selection {
             Ok(Some(0)) => {
@@ -10225,6 +10225,10 @@ enum HubIndexState {
         repos: usize,
         symbols: usize,
         edges: usize,
+        /// Top indexed file extensions by count, plus the total file count —
+        /// fuels the language-mix bar in the status panel.
+        langs: Vec<(String, usize)>,
+        lang_total: usize,
     },
 }
 
@@ -10269,11 +10273,32 @@ fn read_hub_index_state(db_path: &Path) -> HubIndexState {
         count("SELECT COUNT(*) FROM nodes"),
         count("SELECT COUNT(*) FROM edges"),
     ) {
-        (Some(repos), Some(symbols), Some(edges)) => HubIndexState::Ready {
-            repos,
-            symbols,
-            edges,
-        },
+        (Some(repos), Some(symbols), Some(edges)) => {
+            // Language mix from the tracked-files table (best-effort: an
+            // empty result simply hides the bar).
+            let mut counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            if let Ok(mut stmt) = conn.prepare("SELECT file_path FROM files") {
+                if let Ok(iter) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                    for path in iter.flatten() {
+                        if let Some(ext) = Path::new(&path).extension().and_then(|e| e.to_str()) {
+                            *counts.entry(ext.to_ascii_lowercase()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            let lang_total: usize = counts.values().sum();
+            let mut langs: Vec<(String, usize)> = counts.into_iter().collect();
+            langs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            langs.truncate(3);
+            HubIndexState::Ready {
+                repos,
+                symbols,
+                edges,
+                langs,
+                lang_total,
+            }
+        }
         _ => HubIndexState::Unreadable,
     }
 }
@@ -10336,20 +10361,44 @@ impl HubStatus {
                 style("not initialized — “Integrate agents” sets this up").yellow()
             );
         }
-        match self.index {
+        match &self.index {
             HubIndexState::Ready {
                 repos,
                 symbols,
                 edges,
+                langs,
+                lang_total,
             } => {
                 println!(
                     "{}{} symbols · {} edges · {} repo{}",
                     label("Index"),
-                    style(fmt_num(symbols)).green(),
-                    fmt_num(edges),
+                    style(fmt_num(*symbols)).green(),
+                    fmt_num(*edges),
                     repos,
-                    if repos == 1 { "" } else { "s" }
+                    if *repos == 1 { "" } else { "s" }
                 );
+                if !langs.is_empty() && *lang_total > 0 {
+                    const BAR_COLORS: [console::Color; 3] = [
+                        console::Color::Cyan,
+                        console::Color::Green,
+                        console::Color::Magenta,
+                    ];
+                    let parts: Vec<String> = langs
+                        .iter()
+                        .zip(BAR_COLORS)
+                        .map(|((ext, count), color)| {
+                            let pct = *count as f64 / *lang_total as f64 * 100.0;
+                            let blocks = ((pct / 100.0 * 8.0).round() as usize).max(1);
+                            format!(
+                                "{} {} {:.0}%",
+                                style(ext).bold(),
+                                style("█".repeat(blocks)).fg(color),
+                                pct
+                            )
+                        })
+                        .collect();
+                    println!("{}{}", label("Languages"), parts.join(" · "));
+                }
             }
             HubIndexState::Missing => {
                 println!(
@@ -10383,26 +10432,47 @@ impl HubStatus {
     }
 }
 
-/// Brand header: wordmark, tagline, and the installed version.
+/// Brand header: gradient wordmark, rotating tagline, installed version.
 fn print_hub_header() {
     use console::style;
 
-    let art = r#"
-  ███╗   ███╗ █████╗ ██████╗ ██████╗  ██████╗ ██╗    ██╗
-  ████╗ ████║██╔══██╗██╔══██╗██╔══██╗██╔═══██╗██║    ██║
-  ██╔████╔██║███████║██████╔╝██████╔╝██║   ██║██║ █╗ ██║
-  ██║╚██╔╝██║██╔══██║██╔══██╗██╔══██╗██║   ██║██║███╗██║
-  ██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██║╚██████╔╝╚███╔███╔╝
-  ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚══╝╚══╝
-"#;
+    const ART: [&str; 6] = [
+        "  ███╗   ███╗ █████╗ ██████╗ ██████╗  ██████╗ ██╗    ██╗",
+        "  ████╗ ████║██╔══██╗██╔══██╗██╔══██╗██╔═══██╗██║    ██║",
+        "  ██╔████╔██║███████║██████╔╝██████╔╝██║   ██║██║ █╗ ██║",
+        "  ██║╚██╔╝██║██╔══██║██╔══██╗██╔══██╗██║   ██║██║███╗██║",
+        "  ██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██║╚██████╔╝╚███╔███╔╝",
+        "  ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚══╝╚══╝",
+    ];
+    // Green→cyan 256-color ramp, one shade per line. Terminals without
+    // 256-color support fall back via the console crate (colors dropped).
+    const RAMP: [u8; 6] = [46, 47, 48, 49, 50, 51];
 
-    println!("{}", style(art).green().bold());
+    // One tagline per launch — the canonical line plus a few with teeth.
+    const TAGLINES: [&str; 5] = [
+        "AST context engine for AI agents",
+        "Straight to the marrow of your codebase",
+        "Callers, capsules, blast radius — in milliseconds",
+        "No embeddings. No cloud. Just structure.",
+        "Deterministic context, cut to the bone",
+    ];
+    let tagline_idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as usize)
+        .unwrap_or(0)
+        % TAGLINES.len();
+
+    println!();
+    for (line, color) in ART.iter().zip(RAMP) {
+        println!("{}", style(*line).color256(color).bold());
+    }
+    println!();
     println!(
         "  {} {}   {}",
         style(format!("v{}", env!("CARGO_PKG_VERSION")))
             .green()
             .bold(),
-        style("· AST context engine for AI agents").cyan(),
+        style(format!("· {}", TAGLINES[tagline_idx])).cyan(),
         style("github.com/NDMyers/marrow").dim()
     );
     println!();
@@ -10481,6 +10551,14 @@ fn hub_menu_entries() -> Vec<(&'static str, HubAction)> {
     ]
 }
 
+/// One visual row of a hub menu.
+enum MenuRow<'a> {
+    /// Dim, non-selectable group label (empty string renders a blank spacer).
+    Header(&'a str),
+    /// Selectable entry. `hub_select` returns the ordinal counting items only.
+    Item(&'a str),
+}
+
 /// Flicker-free select menu for the hub and its submenus.
 ///
 /// `dialoguer::Select` erases and repaints the whole item list on every
@@ -10489,45 +10567,69 @@ fn hub_menu_entries() -> Vec<(&'static str, HubAction)> {
 /// once and then, per keypress, clears and rewrites only the two lines whose
 /// highlight changed — no full-menu blank phase, so nothing flickers.
 ///
-/// Keys match dialoguer: ↑/↓ (or k/j) move with wrap-around, Enter selects,
-/// Esc cancels (`Ok(None)`), Ctrl+C surfaces as a read error → cancel.
-fn hub_select(prompt: &str, items: &[&str], default: usize) -> Result<Option<usize>> {
+/// Rows may include dim `MenuRow::Header` group labels, which navigation
+/// skips. A dim `footer` key-hint line renders below the list. Keys match
+/// dialoguer: ↑/↓ (or k/j) move with wrap-around, Enter selects, Esc cancels
+/// (`Ok(None)`), Ctrl+C surfaces as a read error → cancel.
+fn hub_select(
+    prompt: &str,
+    rows: &[MenuRow],
+    footer: &str,
+    default_item: usize,
+) -> Result<Option<usize>> {
     use console::{style, Key, Term};
 
     let term = Term::stdout();
-    let n = items.len();
-    let mut sel = default.min(n.saturating_sub(1));
+    // Map item ordinal → row index; navigation moves through this list only.
+    let item_rows: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| matches!(row, MenuRow::Item(_)).then_some(i))
+        .collect();
+    let n_items = item_rows.len();
+    if n_items == 0 {
+        return Ok(None);
+    }
+    let total = rows.len();
+    let mut sel = default_item.min(n_items - 1);
 
-    let render_item = |label: &str, active: bool| -> String {
-        if active {
-            format!("{} {}", style("❯").cyan(), style(label).cyan())
-        } else {
-            format!("  {label}")
+    let render_row = |row: &MenuRow, active: bool| -> String {
+        match row {
+            MenuRow::Header("") => String::new(),
+            MenuRow::Header(h) => format!("  {}", style(*h).dim()),
+            MenuRow::Item(label) if active => {
+                format!("{} {}", style("❯").cyan(), style(*label).cyan())
+            }
+            MenuRow::Item(label) => format!("  {label}"),
         }
     };
 
     term.hide_cursor()?;
     let result = (|| -> std::io::Result<Option<usize>> {
-        // Initial full paint; afterwards the cursor rests on the line below
-        // the last item ("anchor"), so item `i` is `n - i` lines above it.
+        // Initial full paint: prompt, rows, footer. Afterwards the cursor
+        // rests on the line below the footer ("anchor"), so row `r` sits
+        // `total - r + 1` lines above it.
         term.write_line(&format!(
             "{} {} {}",
             style("?").yellow().bold(),
             style(prompt).bold(),
             style("›").dim()
         ))?;
-        for (i, label) in items.iter().enumerate() {
-            term.write_line(&render_item(label, i == sel))?;
+        for (i, row) in rows.iter().enumerate() {
+            term.write_line(&render_row(row, item_rows.get(sel) == Some(&i)))?;
         }
+        term.write_line(&format!("  {}", style(footer).dim()))?;
 
-        // Rewrite exactly one item line, addressed relative to the anchor,
-        // and return the cursor to the anchor. `clear_line` leaves the
-        // cursor at column 0, so no horizontal bookkeeping is needed.
-        let repaint = |idx: usize, active: bool| -> std::io::Result<()> {
-            term.move_cursor_up(n - idx)?;
+        // Rewrite exactly one row, addressed relative to the anchor, and
+        // return the cursor to the anchor. `clear_line` leaves the cursor
+        // at column 0, so no horizontal bookkeeping is needed.
+        let repaint = |item: usize, active: bool| -> std::io::Result<()> {
+            let r = item_rows[item];
+            let up = total - r + 1;
+            term.move_cursor_up(up)?;
             term.clear_line()?;
-            term.write_str(&render_item(items[idx], active))?;
-            term.move_cursor_down(n - idx)?;
+            term.write_str(&render_row(&rows[r], active))?;
+            term.move_cursor_down(up)?;
             Ok(())
         };
 
@@ -10538,10 +10640,10 @@ fn hub_select(prompt: &str, items: &[&str], default: usize) -> Result<Option<usi
                 Err(_) => break None,
             };
             let target = match key {
-                Key::ArrowDown | Key::Tab | Key::Char('j') => (sel + 1) % n,
-                Key::ArrowUp | Key::BackTab | Key::Char('k') => (sel + n - 1) % n,
+                Key::ArrowDown | Key::Tab | Key::Char('j') => (sel + 1) % n_items,
+                Key::ArrowUp | Key::BackTab | Key::Char('k') => (sel + n_items - 1) % n_items,
                 Key::Home => 0,
-                Key::End => n - 1,
+                Key::End => n_items - 1,
                 Key::Enter => break Some(sel),
                 Key::Escape | Key::Char('q') => break None,
                 Key::Char('\u{3}') => break None,
@@ -10554,15 +10656,18 @@ fn hub_select(prompt: &str, items: &[&str], default: usize) -> Result<Option<usi
             }
         };
 
-        // Tear the widget down: clear prompt + items, then report the choice
-        // the way dialoguer's ColorfulTheme does (✔ prompt · choice).
-        term.move_cursor_up(n + 1)?;
+        // Tear the widget down: clear prompt + rows + footer, then report
+        // the choice the way dialoguer's ColorfulTheme does (✔ prompt · choice).
+        term.move_cursor_up(total + 2)?;
         term.clear_to_end_of_screen()?;
         if let Some(idx) = outcome {
+            let MenuRow::Item(label) = rows[item_rows[idx]] else {
+                unreachable!("item_rows only indexes MenuRow::Item rows")
+            };
             // The label's name column ends at the first run of 2+ spaces.
-            let name = match items[idx].find("  ") {
-                Some(pos) => &items[idx][..pos],
-                None => items[idx],
+            let name = match label.find("  ") {
+                Some(pos) => &label[..pos],
+                None => label,
             };
             term.write_line(&format!(
                 "{} {} {} {}",
@@ -10617,7 +10722,19 @@ fn cmd_interactive() -> Result<()> {
         let _ = term.clear_screen();
         print_hub_header();
 
-        let status = HubStatus::gather();
+        // Spinner while probing the workspace + daemon (up to ~500 ms).
+        let status = {
+            use indicatif::{ProgressBar, ProgressStyle};
+            let spinner = ProgressBar::new_spinner();
+            if let Ok(spin_style) = ProgressStyle::with_template("  {spinner:.green} {msg}") {
+                spinner.set_style(spin_style);
+            }
+            spinner.set_message("Reading workspace state…");
+            spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+            let status = HubStatus::gather();
+            spinner.finish_and_clear();
+            status
+        };
         status.render();
         println!();
 
@@ -10636,7 +10753,19 @@ fn cmd_interactive() -> Result<()> {
         }
 
         let entries = hub_menu_entries();
-        let labels: Vec<&str> = entries.iter().map(|(label, _)| *label).collect();
+        // Group the menu the same way `marrow help` groups commands; headers
+        // are keyed off actions so cfg-gated entries can't shift them.
+        let mut rows: Vec<MenuRow> = Vec::with_capacity(entries.len() + 4);
+        for (label, action) in &entries {
+            match action {
+                HubAction::Integrate => rows.push(MenuRow::Header("Get started")),
+                HubAction::Context => rows.push(MenuRow::Header("Context & queries")),
+                HubAction::Doctor => rows.push(MenuRow::Header("Diagnostics & dashboard")),
+                HubAction::Help => rows.push(MenuRow::Header("")),
+                _ => {}
+            }
+            rows.push(MenuRow::Item(label));
+        }
         // Land the cursor on the most useful action for the current state.
         let default_idx = if status.is_first_run() {
             0 // Integrate agents
@@ -10647,8 +10776,9 @@ fn cmd_interactive() -> Result<()> {
         };
 
         let selection = hub_select(
-            "What would you like to do? (↑/↓ move · Enter select · Esc quit)",
-            &labels,
+            "What would you like to do?",
+            &rows,
+            "↑↓ move · enter select · esc quit",
             default_idx,
         );
 
@@ -10781,16 +10911,16 @@ fn cmd_query_interactive(db_path: &str) -> Result<()> {
 /// stays on screen until the user chooses Back.
 #[cfg(feature = "desktop")]
 fn cmd_desktop_submenu() -> Result<()> {
-    let items = [
-        "Open                Launch the native dashboard window",
-        "Enable              Register an OS launcher entry",
-        "Disable             Remove the OS launcher entry",
-        "Status              Show registration and process state",
-        "Back",
+    let rows = [
+        MenuRow::Item("Open                Launch the native dashboard window"),
+        MenuRow::Item("Enable              Register an OS launcher entry"),
+        MenuRow::Item("Disable             Remove the OS launcher entry"),
+        MenuRow::Item("Status              Show registration and process state"),
+        MenuRow::Item("Back"),
     ];
 
     loop {
-        let selection = hub_select("Desktop App (Esc to go back)", &items, 0);
+        let selection = hub_select("Desktop App", &rows, "↑↓ move · enter select · esc back", 0);
 
         match selection {
             Ok(Some(0)) => ui_app::open_app()?,
