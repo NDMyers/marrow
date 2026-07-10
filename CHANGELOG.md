@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.5] - 2026-07-09
+
+### Added
+
+- Interactive hub: running bare `marrow` now opens a single front door for the whole CLI — a gradient wordmark header showing the installed version and a rotating tagline, a read-only workspace status panel (config presence, symbol/edge/repo counts, a language-mix bar derived from the tracked-files table, and daemon liveness with the dashboard URL), a first-run onboarding hint, and a grouped looping action menu. Every hub action delegates to the same implementation as its direct subcommand; action failures return to the menu instead of exiting. Browsing the hub never creates `graph.db` or writes anything. Non-TTY invocations (CI, pipes) print the full help instead of hanging on a menu.
+- New hub actions: an interactive "Query symbol" wizard (context capsule + impact analysis) and "Doctor"; the hub's "Watch workspace" registers with the background daemon exactly like `marrow watch`.
+- Flicker-free menu renderer (`hub_select`): paints the list once and rewrites only the two lines whose highlight changed per keypress, with non-selectable group headers and a key-hint footer. Replaces `dialoguer::Select` in the hub and its submenus, which erased and repainted the entire list on every keypress and visibly flickered on Windows consoles.
+
+### Changed
+
+- `marrow help` is restyled: installed version up top, commands grouped by workflow (getting started, context & queries, diagnostics, daemon & dashboard), with ANSI-safe column alignment.
+- Hub and dashboard flows anchor to the workspace root instead of the current directory: the status panel, context wizard, query, and doctor all read the workspace-rooted `.marrow/graph.db` (honoring `MARROW_DB_PATH`), and the dashboard auto-open toggle edits the workspace's `.marrowrc.json` — launching from a subdirectory no longer scatters stray config or database files.
+- `marrow ui` and the hub's Dashboard action ensure the background daemon is running before offering to open the browser, so the dashboard link never lands on a dead port (failure degrades to a non-fatal warning).
+- The Dashboard and Desktop App submenus loop and hold their output on screen; Esc navigates back and Ctrl+C exits quietly instead of surfacing an IO error.
+- README and npm README lead with `marrow` as the one-word entry point.
+- Bumped `crossbeam-epoch` 0.9.18 → 0.9.20 (RUSTSEC-2026-0204: invalid pointer dereference in the `fmt::Pointer` impl; transitive via rayon).
+
 ## [0.1.4] - 2026-07-05
 
 ### Added
