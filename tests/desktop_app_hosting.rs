@@ -487,63 +487,62 @@ fn ac12_no_desktop_feature_omits_menu_item() {
         "AC-12: 'Desktop App' menu item must be behind cfg(feature = \"desktop\") guard"
     );
 
-    // Verify there's a cfg(not(feature = "desktop")) exit item variant.
+    // The hub action enum variant and its dispatch arm are gated the same way,
+    // so no-default-features builds omit the Desktop App entry entirely.
+    let dispatch_idx = main_src
+        .find("HubAction::Desktop => cmd_desktop_submenu()")
+        .expect("AC-12: hub must dispatch Desktop App through cmd_desktop_submenu");
+    let dispatch_preceding = &main_src[dispatch_idx.saturating_sub(120)..dispatch_idx];
     assert!(
-        main_src.contains(r#"#[cfg(not(feature = "desktop"))]"#),
-        "AC-12: Must have a not(feature = \"desktop\") variant for Exit numbering"
+        dispatch_preceding.contains(r#"cfg(feature = "desktop")"#),
+        "AC-12: HubAction::Desktop dispatch must be behind cfg(feature = \"desktop\") guard"
     );
 }
 
 #[test]
-fn interactive_menu_omits_watch_workspace_and_dispatch() {
+fn interactive_hub_menu_dispatch() {
     let main_src = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
     )
     .expect("read src/main.rs");
 
+    // The hub must never run the foreground watch loop (it would block the
+    // menu forever); watching goes through the daemon like `marrow watch`.
     assert!(
-        !main_src.contains("Watch Workspace"),
-        "interactive menu must not contain 'Watch Workspace'"
+        !main_src.contains("HubAction::Watch => run_watch_command"),
+        "hub must not dispatch the foreground run_watch_command loop"
+    );
+    assert!(
+        main_src.contains("HubAction::Watch => hub_watch(&workspace_root)"),
+        "hub must dispatch watch through the daemon-registered hub_watch"
     );
 
-    assert!(
-        !main_src.contains("2 => run_watch_command(&workspace_root)?"),
-        "interactive mode must not dispatch run_watch_command from the menu"
-    );
-
+    // The MCP stdio server blocks on stdin and is launched by agents, never
+    // from the human-facing menu.
     assert!(
         !main_src.contains("Start MCP Server"),
         "interactive menu must not include Start MCP Server"
     );
 
+    // Packet-first: the hub offers the provider-neutral context packet flow.
     assert!(
-        main_src.contains("\"3. Context Packet     (Compile provider-neutral task context)\""),
-        "interactive menu must offer the packet-first Context Packet entry in slot 3"
+        main_src.contains("HubAction::Context => cmd_context_interactive()"),
+        "hub must dispatch the context packet flow"
     );
 
+    // Every hub action delegates to the same implementation as the direct
+    // subcommand — the hub is a front door, not a separate code path.
     assert!(
-        main_src.contains("2 => cmd_context_interactive()?"),
-        "interactive menu must dispatch the context packet flow from selection 2"
+        main_src.contains("HubAction::Index => run_index_command(&workspace_root)"),
+        "hub must dispatch indexing through run_index_command"
     );
-
     assert!(
-        main_src.contains("\"4. Desktop App        (Open native dashboard window)\""),
-        "interactive menu must place Desktop App in slot 4"
+        main_src.contains("HubAction::Doctor => run_doctor("),
+        "hub must dispatch doctor through run_doctor"
     );
-
     assert!(
-        main_src.contains("\"5. Exit\"") && main_src.contains("\"4. Exit\""),
-        "interactive menu must renumber Exit consistently for desktop and non-desktop builds"
-    );
-
-    assert!(
-        main_src.contains("3 => cmd_desktop_submenu()?"),
-        "interactive menu must dispatch the desktop submenu from selection 3"
-    );
-
-    assert!(
-        !main_src.contains("2 => cmd_desktop_submenu()?"),
-        "interactive menu must not retain the old desktop submenu selection"
+        main_src.contains("HubAction::Dashboard => cmd_ui()"),
+        "hub must dispatch the dashboard through cmd_ui"
     );
 }
 
@@ -560,13 +559,13 @@ fn interactive_integrate_menu_uses_registry_backed_command() {
     );
 
     assert!(
-        main_src.contains("0 => cmd_integrate(&[])?"),
-        "interactive Integrate Agents menu item must dispatch through cmd_integrate"
+        main_src.contains("HubAction::Integrate => cmd_integrate(&[])"),
+        "interactive Integrate agents menu item must dispatch through cmd_integrate"
     );
 
     assert!(
-        !main_src.contains("0 => run_integrate_command(&workspace_root)?"),
-        "interactive Integrate Agents menu item must not dispatch the legacy integrate flow"
+        !main_src.contains("HubAction::Integrate => run_integrate_command"),
+        "interactive Integrate agents menu item must not dispatch the legacy integrate flow"
     );
 }
 

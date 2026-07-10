@@ -94,9 +94,8 @@ fn daemon_cli_exposes_autostart_management_without_replacing_runtime_status() {
     .unwrap();
 
     assert!(
-        main_src.contains(
-            "println!(\"  daemon          Start background daemon or manage autostart\");"
-        ),
+        main_src.contains("\"[install|uninstall|status]\"")
+            && main_src.contains("\"Run the daemon / manage autostart\""),
         "daemon help text should advertise runtime + autostart management"
     );
     assert!(
