@@ -7874,8 +7874,6 @@ mod tests {
 /// the cwd, so the auto-open toggle always edits the workspace config that
 /// `current_workspace_root()` will find again later.
 fn cmd_ui(workspace_root: &Path) -> Result<()> {
-    use dialoguer::{theme::ColorfulTheme, Select};
-
     let rc_path = workspace_root.join(".marrowrc.json");
     loop {
         // Re-read config each iteration so the toggle label is always current.
@@ -7896,11 +7894,7 @@ fn cmd_ui(workspace_root: &Path) -> Result<()> {
             "Back",
         ];
 
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Dashboard (Esc to go back)")
-            .items(&items)
-            .default(0)
-            .interact_opt();
+        let selection = hub_select("Dashboard (Esc to go back)", &items, 0);
 
         match selection {
             Ok(Some(0)) => {
@@ -10487,6 +10481,104 @@ fn hub_menu_entries() -> Vec<(&'static str, HubAction)> {
     ]
 }
 
+/// Flicker-free select menu for the hub and its submenus.
+///
+/// `dialoguer::Select` erases and repaints the whole item list on every
+/// keypress (~35 unbuffered console writes for a 10-item menu), which makes
+/// the menu visibly blink on Windows consoles. This renderer paints the list
+/// once and then, per keypress, clears and rewrites only the two lines whose
+/// highlight changed — no full-menu blank phase, so nothing flickers.
+///
+/// Keys match dialoguer: ↑/↓ (or k/j) move with wrap-around, Enter selects,
+/// Esc cancels (`Ok(None)`), Ctrl+C surfaces as a read error → cancel.
+fn hub_select(prompt: &str, items: &[&str], default: usize) -> Result<Option<usize>> {
+    use console::{style, Key, Term};
+
+    let term = Term::stdout();
+    let n = items.len();
+    let mut sel = default.min(n.saturating_sub(1));
+
+    let render_item = |label: &str, active: bool| -> String {
+        if active {
+            format!("{} {}", style("❯").cyan(), style(label).cyan())
+        } else {
+            format!("  {label}")
+        }
+    };
+
+    term.hide_cursor()?;
+    let result = (|| -> std::io::Result<Option<usize>> {
+        // Initial full paint; afterwards the cursor rests on the line below
+        // the last item ("anchor"), so item `i` is `n - i` lines above it.
+        term.write_line(&format!(
+            "{} {} {}",
+            style("?").yellow().bold(),
+            style(prompt).bold(),
+            style("›").dim()
+        ))?;
+        for (i, label) in items.iter().enumerate() {
+            term.write_line(&render_item(label, i == sel))?;
+        }
+
+        // Rewrite exactly one item line, addressed relative to the anchor,
+        // and return the cursor to the anchor. `clear_line` leaves the
+        // cursor at column 0, so no horizontal bookkeeping is needed.
+        let repaint = |idx: usize, active: bool| -> std::io::Result<()> {
+            term.move_cursor_up(n - idx)?;
+            term.clear_line()?;
+            term.write_str(&render_item(items[idx], active))?;
+            term.move_cursor_down(n - idx)?;
+            Ok(())
+        };
+
+        let outcome = loop {
+            let key = match term.read_key() {
+                Ok(key) => key,
+                // Ctrl+C (and any raw-read failure) cancels like Esc.
+                Err(_) => break None,
+            };
+            let target = match key {
+                Key::ArrowDown | Key::Tab | Key::Char('j') => (sel + 1) % n,
+                Key::ArrowUp | Key::BackTab | Key::Char('k') => (sel + n - 1) % n,
+                Key::Home => 0,
+                Key::End => n - 1,
+                Key::Enter => break Some(sel),
+                Key::Escape | Key::Char('q') => break None,
+                Key::Char('\u{3}') => break None,
+                _ => continue,
+            };
+            if target != sel {
+                repaint(sel, false)?;
+                repaint(target, true)?;
+                sel = target;
+            }
+        };
+
+        // Tear the widget down: clear prompt + items, then report the choice
+        // the way dialoguer's ColorfulTheme does (✔ prompt · choice).
+        term.move_cursor_up(n + 1)?;
+        term.clear_to_end_of_screen()?;
+        if let Some(idx) = outcome {
+            // The label's name column ends at the first run of 2+ spaces.
+            let name = match items[idx].find("  ") {
+                Some(pos) => &items[idx][..pos],
+                None => items[idx],
+            };
+            term.write_line(&format!(
+                "{} {} {} {}",
+                style("✔").green(),
+                style(prompt).bold(),
+                style("·").dim(),
+                style(name).cyan()
+            ))?;
+        }
+        Ok(outcome)
+    })();
+    // Restore the cursor on every path, including mid-render IO errors.
+    let _ = term.show_cursor();
+    Ok(result?)
+}
+
 /// Block until the user presses Enter, so action output stays readable
 /// before the hub clears the screen and redraws.
 fn hub_pause() {
@@ -10511,7 +10603,6 @@ fn hub_pause() {
 /// menu of actions that all remain available as direct subcommands.
 fn cmd_interactive() -> Result<()> {
     use console::style;
-    use dialoguer::{theme::ColorfulTheme, Select};
     use std::io::IsTerminal as _;
 
     let term = console::Term::stdout();
@@ -10555,11 +10646,11 @@ fn cmd_interactive() -> Result<()> {
             3 // Context packet
         };
 
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("What would you like to do? (↑/↓ move · Enter select · Esc quit)")
-            .items(&labels)
-            .default(default_idx)
-            .interact_opt();
+        let selection = hub_select(
+            "What would you like to do? (↑/↓ move · Enter select · Esc quit)",
+            &labels,
+            default_idx,
+        );
 
         let action = match selection {
             Ok(Some(idx)) => entries[idx].1,
@@ -10690,8 +10781,6 @@ fn cmd_query_interactive(db_path: &str) -> Result<()> {
 /// stays on screen until the user chooses Back.
 #[cfg(feature = "desktop")]
 fn cmd_desktop_submenu() -> Result<()> {
-    use dialoguer::{theme::ColorfulTheme, Select};
-
     let items = [
         "Open                Launch the native dashboard window",
         "Enable              Register an OS launcher entry",
@@ -10701,11 +10790,7 @@ fn cmd_desktop_submenu() -> Result<()> {
     ];
 
     loop {
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Desktop App (Esc to go back)")
-            .items(&items)
-            .default(0)
-            .interact_opt();
+        let selection = hub_select("Desktop App (Esc to go back)", &items, 0);
 
         match selection {
             Ok(Some(0)) => ui_app::open_app()?,
