@@ -7886,7 +7886,7 @@ fn cmd_ui(workspace_root: &Path) -> Result<()> {
             .unwrap_or(true);
 
         let toggle_label = format!(
-            "Auto-open: {}       Toggle opening the dashboard when the daemon starts",
+            "Auto-open: {}      Toggle opening the dashboard when the daemon starts",
             if auto_open { "ON " } else { "OFF" }
         );
 
