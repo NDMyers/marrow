@@ -524,10 +524,11 @@ fn interactive_hub_menu_dispatch() {
         "interactive menu must not include Start MCP Server"
     );
 
-    // Packet-first: the hub offers the provider-neutral context packet flow.
+    // Packet-first: the hub offers the provider-neutral context packet flow,
+    // anchored to the same workspace-rooted DB the status panel reports.
     assert!(
-        main_src.contains("HubAction::Context => cmd_context_interactive()"),
-        "hub must dispatch the context packet flow"
+        main_src.contains("HubAction::Context => cmd_context_interactive(&db_path)"),
+        "hub must dispatch the context packet flow against the workspace-rooted DB"
     );
 
     // Every hub action delegates to the same implementation as the direct
@@ -537,12 +538,12 @@ fn interactive_hub_menu_dispatch() {
         "hub must dispatch indexing through run_index_command"
     );
     assert!(
-        main_src.contains("HubAction::Doctor => run_doctor("),
-        "hub must dispatch doctor through run_doctor"
+        main_src.contains("run_doctor(&db_path, None)"),
+        "hub must dispatch doctor through run_doctor against the workspace-rooted DB"
     );
     assert!(
-        main_src.contains("HubAction::Dashboard => cmd_ui()"),
-        "hub must dispatch the dashboard through cmd_ui"
+        main_src.contains("cmd_ui(&workspace_root)"),
+        "hub must dispatch the dashboard through cmd_ui anchored to the workspace root"
     );
 }
 

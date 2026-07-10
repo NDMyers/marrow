@@ -44,12 +44,13 @@ Type `marrow` for the interactive hub, or run any command directly. `marrow --he
 | `marrow mcp` | Start the MCP stdio server (used by editor/agent integrations). |
 | `marrow init` | Initialize workspace config (`.marrow/`, `.marrowrc.json`). |
 | `marrow index` | Index the current workspace (same pipeline as MCP `ingest_repo`). |
-| `marrow watch` | Watch the workspace for changes and re-index incrementally. |
+| `marrow watch` | Keep the index fresh via the background daemon. |
 | `marrow context <task>` | Compile a provider-neutral context packet (markdown/JSON). |
 | `marrow query <symbol> <repo_id>` | Print a symbol's context capsule plus impact analysis. |
 | `marrow benchmark [<symbol> <repo_id>]` | Token-reduction benchmark (interactive wizard when run bare). |
 | `marrow perf-harness` | Ingest + query performance benchmark (`--json` for machine output). |
 | `marrow integrate` | Write/print MCP setup for supported agent targets. |
+| `marrow doctor [repo_id]` | Verify indexed repos answer agent queries. |
 | `marrow validate` | Check workspace setup and integration config. |
 | `marrow maintenance` | WAL checkpoint + `incremental_vacuum` on `graph.db`. |
 | `marrow ui` / `marrow ui-app` | Open the dashboard / manage the desktop app entry. |
