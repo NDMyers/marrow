@@ -8,30 +8,42 @@ This npm package is a thin installer: it downloads the matching GitHub release a
 
 ```bash
 npm install -g @nickm-swe/marrow
-marrow mcp
 ```
 
 ## Quick start
 
+Using Marrow is one word:
+
 ```bash
-marrow init                                                      # workspace setup (.marrow/, .marrowrc.json)
+marrow
+```
+
+Just like `claude` opens Claude Code, `marrow` opens the Marrow hub: it shows your installed version, workspace status, and index health, then walks you through everything — connecting coding agents, indexing, compiling context packets, querying symbols, and diagnostics. On a fresh workspace it tells you exactly where to start.
+
+Prefer direct commands? Every hub action is also a subcommand:
+
+```bash
+marrow integrate                                                 # connect Claude Code, Cursor, Copilot & more
 marrow index                                                     # index the current directory
 marrow context "trace request flow" --repo my_repo --format markdown
-marrow integrate                                                 # wire Marrow into your editor/agent
+marrow doctor                                                    # verify the index answers agent queries
 ```
 
 ## Commands
 
-Run `marrow` with no arguments for an interactive TUI menu, or `marrow --help` for the full list.
+Type `marrow` for the interactive hub, or run any command directly. `marrow --help` prints the full grouped reference.
 
 | Command | Purpose |
 |---------|---------|
+| `marrow` | Open the interactive hub (version, workspace status, guided actions). |
 | `marrow mcp` | Start the MCP stdio server (used by editor/agent integrations). |
 | `marrow init` | Initialize workspace config (`.marrow/`, `.marrowrc.json`). |
 | `marrow index` | Index the current workspace. |
+| `marrow watch` | Keep the index fresh via the background daemon. |
 | `marrow context <task>` | Compile a provider-neutral context packet (markdown/JSON). |
 | `marrow query <symbol> <repo_id>` | Print a symbol's context capsule plus impact analysis. |
 | `marrow integrate` | Write/print MCP setup for supported agent targets. |
+| `marrow doctor` | Verify indexed repos answer agent queries. |
 | `marrow ui` / `marrow ui-app` | Open the dashboard / manage the desktop app entry. |
 | `marrow daemon [install\|uninstall\|status]` | Background daemon and autostart management. |
 

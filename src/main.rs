@@ -7870,39 +7870,40 @@ mod tests {
 // ── CLI subcommands ───────────────────────────────────────────────────────────
 
 /// `marrow ui` — interactive dashboard configuration menu.
-fn cmd_ui() -> Result<()> {
-    use dialoguer::{theme::ColorfulTheme, Select};
-
+/// Dashboard submenu. `.marrowrc.json` is anchored to `workspace_root`, not
+/// the cwd, so the auto-open toggle always edits the workspace config that
+/// `current_workspace_root()` will find again later.
+fn cmd_ui(workspace_root: &Path) -> Result<()> {
+    let rc_path = workspace_root.join(".marrowrc.json");
     loop {
         // Re-read config each iteration so the toggle label is always current.
-        let auto_open: bool = fs::read_to_string(".marrowrc.json")
+        let auto_open: bool = fs::read_to_string(&rc_path)
             .ok()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
             .and_then(|v| v.get("auto_open_ui").and_then(|b| b.as_bool()))
             .unwrap_or(true);
 
         let toggle_label = format!(
-            "Toggle Auto-Open (Currently: {})",
-            if auto_open { "ON" } else { "OFF" }
+            "Auto-open: {}      Toggle opening the dashboard when the daemon starts",
+            if auto_open { "ON " } else { "OFF" }
         );
 
-        let items = vec!["Open Dashboard in Browser", toggle_label.as_str(), "Exit"];
+        let rows = [
+            MenuRow::Item("Open dashboard      Launch http://127.0.0.1:8765 in your browser"),
+            MenuRow::Item(toggle_label.as_str()),
+            MenuRow::Item("Back"),
+        ];
 
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Marrow Dashboard")
-            .items(&items)
-            .default(0)
-            .interact()?;
+        let selection = hub_select("Dashboard", &rows, "↑↓ move · enter select · esc back", 0);
 
         match selection {
-            0 => {
+            Ok(Some(0)) => {
                 if let Err(e) = open::that("http://127.0.0.1:8765") {
                     eprintln!("Could not open browser: {e}");
                 }
             }
-            1 => {
-                let rc_path = Path::new(".marrowrc.json");
-                let mut cfg: serde_json::Value = fs::read_to_string(rc_path)
+            Ok(Some(1)) => {
+                let mut cfg: serde_json::Value = fs::read_to_string(&rc_path)
                     .ok()
                     .and_then(|raw| serde_json::from_str(&raw).ok())
                     .unwrap_or_else(|| serde_json::json!({}));
@@ -7915,10 +7916,11 @@ fn cmd_ui() -> Result<()> {
                 // Best-effort write — silently ignore failures on read-only filesystems.
                 if let Ok(pretty) = serde_json::to_string_pretty(&cfg) {
                     let tmp = rc_path.with_extension("json.tmp");
-                    let _ = fs::write(&tmp, &pretty).and_then(|_| fs::rename(&tmp, rc_path));
+                    let _ = fs::write(&tmp, &pretty).and_then(|_| fs::rename(&tmp, &rc_path));
                 }
-                eprintln!("Auto-Open is now {}.", if !current { "ON" } else { "OFF" });
+                eprintln!("Auto-open is now {}.", if !current { "ON" } else { "OFF" });
             }
+            // "Back", Esc, or Ctrl+C: return to the caller.
             _ => break,
         }
     }
@@ -9024,31 +9026,25 @@ fn cmd_integrate(args: &[String]) -> Result<()> {
             eprintln!("  {}", style(rule_install_note()).dim());
         }
 
-        let scope =
-            match inquire::Select::new("Rule file scope", vec!["Global (recommended)", "Project"])
-                .prompt()
-            {
-                Ok(choice) => {
-                    if choice.starts_with("Global") {
-                        skills::Scope::Global
-                    } else {
-                        skills::Scope::Project
-                    }
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-        let method = match inquire::Select::new("Rule file method", vec!["Write File", "Symlink"])
-            .prompt()
-        {
-            Ok(choice) => {
-                if choice == "Symlink" {
-                    skills::Method::Symlink
-                } else {
-                    skills::Method::WriteFile
-                }
+        let scope = {
+            let choice =
+                inquire::Select::new("Rule file scope", vec!["Global (recommended)", "Project"])
+                    .prompt()?;
+            if choice.starts_with("Global") {
+                skills::Scope::Global
+            } else {
+                skills::Scope::Project
             }
-            Err(e) => return Err(e.into()),
+        };
+
+        let method = {
+            let choice =
+                inquire::Select::new("Rule file method", vec!["Write File", "Symlink"]).prompt()?;
+            if choice == "Symlink" {
+                skills::Method::Symlink
+            } else {
+                skills::Method::WriteFile
+            }
         };
 
         eprintln!();
@@ -9545,21 +9541,22 @@ fn cmd_context(program: &str, cli_args: &[String]) -> Result<()> {
     }
     let repo_id = repo_id.ok_or_else(|| anyhow::anyhow!("context: --repo is required"))?;
     let task = task_parts.join(" ");
-    run_context_packet(task, repo_id, budget_tokens, profile, format)
+    let db_path =
+        std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
+    run_context_packet(&db_path, task, repo_id, budget_tokens, profile, format)
 }
 
 /// Shared compile → print → telemetry path for `marrow context` (flag-driven)
-/// and the interactive TUI entry.
+/// and the interactive hub entry.
 fn run_context_packet(
+    db_path: &str,
     task: String,
     repo_id: String,
     budget_tokens: usize,
     profile: context::ModelProfile,
     format: context::ContextFormat,
 ) -> Result<()> {
-    let db_path =
-        std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
-    let conn = db::init_db_or_memory(&db_path)?;
+    let conn = db::init_db_or_memory(db_path)?;
     let repo_id = resolve_context_repo_id(&conn, &repo_id)?;
     let packet = context::compile_context_packet_for_format(
         &conn,
@@ -9582,22 +9579,26 @@ fn run_context_packet(
     Ok(())
 }
 
-/// Interactive context-packet flow for the TUI main menu: pick an indexed
+/// Interactive context-packet flow for the hub menu: pick an indexed
 /// repository (or type one on cold start), describe the task, choose a
 /// profile, then compile through the same path as `marrow context`.
-fn cmd_context_interactive() -> Result<()> {
+///
+/// `db_path` comes from the caller (the hub passes the workspace-rooted
+/// graph) so this flow always reads the same index the status panel reports.
+/// Listing repos never creates the DB — a missing graph is a cold start.
+fn cmd_context_interactive(db_path: &str) -> Result<()> {
     use dialoguer::{theme::ColorfulTheme, Input, Select};
 
-    let db_path =
-        std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
-    let repos: Vec<String> = {
-        let conn = db::init_db_or_memory(&db_path)?;
+    let repos: Vec<String> = if Path::new(db_path).exists() {
+        let conn = db::init_db_or_memory(db_path)?;
         let mut stmt = conn.prepare("SELECT id FROM repositories ORDER BY id")?;
         let repos = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
             .collect();
         repos
+    } else {
+        Vec::new()
     };
 
     let repo_id = match repos.as_slice() {
@@ -9645,6 +9646,7 @@ fn cmd_context_interactive() -> Result<()> {
         .interact()?;
 
     run_context_packet(
+        db_path,
         task,
         repo_id,
         12_000,
@@ -10204,85 +10206,918 @@ pub fn run_watch_command(workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Interactive TUI — shown when `marrow` is run with no arguments.
+// ── Interactive hub ───────────────────────────────────────────────────────────
+
+/// What the hub can currently say about the workspace index.
+enum HubIndexState {
+    /// No `graph.db` on disk yet.
+    Missing,
+    /// `graph.db` exists but could not be opened read-only (e.g. locked).
+    Unreadable,
+    /// Live counts read from the graph.
+    Ready {
+        repos: usize,
+        symbols: usize,
+        edges: usize,
+        /// Top indexed file extensions by count, plus the total file count —
+        /// fuels the language-mix bar in the status panel.
+        langs: Vec<(String, usize)>,
+        lang_total: usize,
+    },
+}
+
+/// Snapshot of everything the hub header reports. Gathering is strictly
+/// read-only: no databases are created and nothing is written to disk.
+struct HubStatus {
+    workspace_root: PathBuf,
+    config_present: bool,
+    index: HubIndexState,
+    daemon_running: bool,
+}
+
+/// Resolve the graph DB the hub should inspect: `MARROW_DB_PATH` when set,
+/// otherwise the workspace-rooted `.marrow/graph.db` (so the hub reports the
+/// same index regardless of which subdirectory it was launched from).
+fn hub_db_path(workspace_root: &Path) -> PathBuf {
+    std::env::var("MARROW_DB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root.join(".marrow").join("graph.db"))
+}
+
+/// Read index counts without creating the DB (unlike `init_db_or_memory`,
+/// which would leave an empty `.marrow/graph.db` behind as a side effect).
+fn read_hub_index_state(db_path: &Path) -> HubIndexState {
+    if !db_path.exists() {
+        return HubIndexState::Missing;
+    }
+    let open = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    );
+    let Ok(conn) = open else {
+        return HubIndexState::Unreadable;
+    };
+    let count = |sql: &str| -> Option<usize> {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+            .ok()
+            .map(|n| n.max(0) as usize)
+    };
+    match (
+        count("SELECT COUNT(*) FROM repositories"),
+        count("SELECT COUNT(*) FROM nodes"),
+        count("SELECT COUNT(*) FROM edges"),
+    ) {
+        (Some(repos), Some(symbols), Some(edges)) => {
+            // Language mix from the tracked-files table (best-effort: an
+            // empty result simply hides the bar).
+            let mut counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            if let Ok(mut stmt) = conn.prepare("SELECT file_path FROM files") {
+                if let Ok(iter) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                    for path in iter.flatten() {
+                        if let Some(ext) = Path::new(&path).extension().and_then(|e| e.to_str()) {
+                            *counts.entry(ext.to_ascii_lowercase()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            let lang_total: usize = counts.values().sum();
+            let mut langs: Vec<(String, usize)> = counts.into_iter().collect();
+            langs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            langs.truncate(3);
+            HubIndexState::Ready {
+                repos,
+                symbols,
+                edges,
+                langs,
+                lang_total,
+            }
+        }
+        _ => HubIndexState::Unreadable,
+    }
+}
+
+/// Best-effort daemon liveness probe with a hard 500 ms budget so the hub
+/// never stalls on startup. Runs on a throwaway current-thread runtime
+/// because the hub executes before the main Tokio runtime is built.
+fn daemon_running_quick() -> bool {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    rt.block_on(async {
+        let client = ipc::default_client();
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), client.health_check())
+                .await,
+            Ok(Ok(true))
+        )
+    })
+}
+
+impl HubStatus {
+    fn gather() -> Self {
+        let workspace_root = current_workspace_root();
+        let config_present = workspace_root.join(".marrowrc.json").exists();
+        let index = read_hub_index_state(&hub_db_path(&workspace_root));
+        let daemon_running = daemon_running_quick();
+        Self {
+            workspace_root,
+            config_present,
+            index,
+            daemon_running,
+        }
+    }
+
+    /// First run = nothing configured and nothing indexed yet.
+    fn is_first_run(&self) -> bool {
+        !self.config_present && matches!(self.index, HubIndexState::Missing)
+    }
+
+    fn render(&self) {
+        use console::style;
+
+        let label = |name: &str| style(format!("  {name:<12}")).dim().to_string();
+
+        println!(
+            "{}{}",
+            label("Workspace"),
+            display_path(&self.workspace_root)
+        );
+        if self.config_present {
+            println!("{}.marrowrc.json {}", label("Config"), style("✓").green());
+        } else {
+            println!(
+                "{}{}",
+                label("Config"),
+                style("not initialized — “Integrate agents” sets this up").yellow()
+            );
+        }
+        match &self.index {
+            HubIndexState::Ready {
+                repos,
+                symbols,
+                edges,
+                langs,
+                lang_total,
+            } => {
+                println!(
+                    "{}{} symbols · {} edges · {} repo{}",
+                    label("Index"),
+                    style(fmt_num(*symbols)).green(),
+                    fmt_num(*edges),
+                    repos,
+                    if *repos == 1 { "" } else { "s" }
+                );
+                if !langs.is_empty() && *lang_total > 0 {
+                    const BAR_COLORS: [console::Color; 3] = [
+                        console::Color::Cyan,
+                        console::Color::Green,
+                        console::Color::Magenta,
+                    ];
+                    let parts: Vec<String> = langs
+                        .iter()
+                        .zip(BAR_COLORS)
+                        .map(|((ext, count), color)| {
+                            let pct = *count as f64 / *lang_total as f64 * 100.0;
+                            let blocks = ((pct / 100.0 * 8.0).round() as usize).max(1);
+                            format!(
+                                "{} {} {:.0}%",
+                                style(ext).bold(),
+                                style("█".repeat(blocks)).fg(color),
+                                pct
+                            )
+                        })
+                        .collect();
+                    println!("{}{}", label("Languages"), parts.join(" · "));
+                }
+            }
+            HubIndexState::Missing => {
+                println!(
+                    "{}{}",
+                    label("Index"),
+                    style("not built — “Index workspace” parses this repo").yellow()
+                );
+            }
+            HubIndexState::Unreadable => {
+                println!(
+                    "{}{}",
+                    label("Index"),
+                    style("present, but unreadable right now (locked or corrupt)").dim()
+                );
+            }
+        }
+        if self.daemon_running {
+            println!(
+                "{}{} running · dashboard at {}",
+                label("Daemon"),
+                style("●").green(),
+                style("http://127.0.0.1:8765").cyan().underlined()
+            );
+        } else {
+            println!(
+                "{}{} stopped · starts automatically with `marrow mcp`",
+                label("Daemon"),
+                style("○").dim()
+            );
+        }
+    }
+}
+
+/// Brand header: gradient wordmark, rotating tagline, installed version.
+fn print_hub_header() {
+    use console::style;
+
+    const ART: [&str; 6] = [
+        "  ███╗   ███╗ █████╗ ██████╗ ██████╗  ██████╗ ██╗    ██╗",
+        "  ████╗ ████║██╔══██╗██╔══██╗██╔══██╗██╔═══██╗██║    ██║",
+        "  ██╔████╔██║███████║██████╔╝██████╔╝██║   ██║██║ █╗ ██║",
+        "  ██║╚██╔╝██║██╔══██║██╔══██╗██╔══██╗██║   ██║██║███╗██║",
+        "  ██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██║╚██████╔╝╚███╔███╔╝",
+        "  ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚══╝╚══╝",
+    ];
+    // Green→cyan 256-color ramp, one shade per line. Terminals without
+    // 256-color support fall back via the console crate (colors dropped).
+    const RAMP: [u8; 6] = [46, 47, 48, 49, 50, 51];
+
+    // One tagline per launch — the canonical line plus a few with teeth.
+    const TAGLINES: [&str; 5] = [
+        "AST context engine for AI agents",
+        "Straight to the marrow of your codebase",
+        "Callers, capsules, blast radius — in milliseconds",
+        "No embeddings. No cloud. Just structure.",
+        "Deterministic context, cut to the bone",
+    ];
+    let tagline_idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as usize)
+        .unwrap_or(0)
+        % TAGLINES.len();
+
+    println!();
+    for (line, color) in ART.iter().zip(RAMP) {
+        println!("{}", style(*line).color256(color).bold());
+    }
+    println!();
+    println!(
+        "  {} {}   {}",
+        style(format!("v{}", env!("CARGO_PKG_VERSION")))
+            .green()
+            .bold(),
+        style(format!("· {}", TAGLINES[tagline_idx])).cyan(),
+        style("github.com/NDMyers/marrow").dim()
+    );
+    println!();
+}
+
+/// Actions offered by the hub menu. Every action maps 1:1 onto a direct
+/// subcommand, so the hub is a front door — not a separate code path.
+#[derive(Clone, Copy)]
+enum HubAction {
+    Integrate,
+    Index,
+    Watch,
+    Context,
+    Query,
+    Doctor,
+    Dashboard,
+    #[cfg(feature = "desktop")]
+    Desktop,
+    Help,
+    Exit,
+}
+
+impl HubAction {
+    /// Submenu actions run their own looping UI and leave no page output
+    /// behind, so the hub skips the "Press Enter" pause for them.
+    fn is_submenu(self) -> bool {
+        match self {
+            HubAction::Dashboard => true,
+            #[cfg(feature = "desktop")]
+            HubAction::Desktop => true,
+            _ => false,
+        }
+    }
+}
+
+fn hub_menu_entries() -> Vec<(&'static str, HubAction)> {
+    vec![
+        (
+            "Integrate agents    Connect Claude Code, Cursor, Copilot & more",
+            HubAction::Integrate,
+        ),
+        (
+            "Index workspace     Parse this codebase into the AST graph",
+            HubAction::Index,
+        ),
+        (
+            "Watch workspace     Keep the index fresh via the background daemon",
+            HubAction::Watch,
+        ),
+        (
+            "Context packet      Compile provider-neutral task context",
+            HubAction::Context,
+        ),
+        (
+            "Query symbol        Context capsule + blast radius for a symbol",
+            HubAction::Query,
+        ),
+        (
+            "Doctor              Verify the index answers agent queries",
+            HubAction::Doctor,
+        ),
+        (
+            "Dashboard           Web dashboard & auto-open settings",
+            HubAction::Dashboard,
+        ),
+        #[cfg(feature = "desktop")]
+        (
+            "Desktop App         Native dashboard window",
+            HubAction::Desktop,
+        ),
+        (
+            "Help                Every command on one page",
+            HubAction::Help,
+        ),
+        ("Exit", HubAction::Exit),
+    ]
+}
+
+/// One visual row of a hub menu.
+enum MenuRow<'a> {
+    /// Dim, non-selectable group label (empty string renders a blank spacer).
+    Header(&'a str),
+    /// Selectable entry. `hub_select` returns the ordinal counting items only.
+    Item(&'a str),
+}
+
+/// Flicker-free select menu for the hub and its submenus.
+///
+/// `dialoguer::Select` erases and repaints the whole item list on every
+/// keypress (~35 unbuffered console writes for a 10-item menu), which makes
+/// the menu visibly blink on Windows consoles. This renderer paints the list
+/// once and then, per keypress, clears and rewrites only the two lines whose
+/// highlight changed — no full-menu blank phase, so nothing flickers.
+///
+/// Rows may include dim `MenuRow::Header` group labels, which navigation
+/// skips. A dim `footer` key-hint line renders below the list. Keys match
+/// dialoguer: ↑/↓ (or k/j) move with wrap-around, Enter selects, Esc cancels
+/// (`Ok(None)`), Ctrl+C surfaces as a read error → cancel.
+fn hub_select(
+    prompt: &str,
+    rows: &[MenuRow],
+    footer: &str,
+    default_item: usize,
+) -> Result<Option<usize>> {
+    use console::{style, Key, Term};
+
+    let term = Term::stdout();
+    // Map item ordinal → row index; navigation moves through this list only.
+    let item_rows: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| matches!(row, MenuRow::Item(_)).then_some(i))
+        .collect();
+    let n_items = item_rows.len();
+    if n_items == 0 {
+        return Ok(None);
+    }
+    let total = rows.len();
+    let mut sel = default_item.min(n_items - 1);
+
+    let render_row = |row: &MenuRow, active: bool| -> String {
+        match row {
+            MenuRow::Header("") => String::new(),
+            MenuRow::Header(h) => format!("  {}", style(*h).dim()),
+            MenuRow::Item(label) if active => {
+                format!("{} {}", style("❯").cyan(), style(*label).cyan())
+            }
+            MenuRow::Item(label) => format!("  {label}"),
+        }
+    };
+
+    term.hide_cursor()?;
+    let result = (|| -> std::io::Result<Option<usize>> {
+        // Initial full paint: prompt, rows, footer. Afterwards the cursor
+        // rests on the line below the footer ("anchor"), so row `r` sits
+        // `total - r + 1` lines above it.
+        term.write_line(&format!(
+            "{} {} {}",
+            style("?").yellow().bold(),
+            style(prompt).bold(),
+            style("›").dim()
+        ))?;
+        for (i, row) in rows.iter().enumerate() {
+            term.write_line(&render_row(row, item_rows.get(sel) == Some(&i)))?;
+        }
+        term.write_line(&format!("  {}", style(footer).dim()))?;
+
+        // Rewrite exactly one row, addressed relative to the anchor, and
+        // return the cursor to the anchor. `clear_line` leaves the cursor
+        // at column 0, so no horizontal bookkeeping is needed.
+        let repaint = |item: usize, active: bool| -> std::io::Result<()> {
+            let r = item_rows[item];
+            let up = total - r + 1;
+            term.move_cursor_up(up)?;
+            term.clear_line()?;
+            term.write_str(&render_row(&rows[r], active))?;
+            term.move_cursor_down(up)?;
+            Ok(())
+        };
+
+        let outcome = loop {
+            let key = match term.read_key() {
+                Ok(key) => key,
+                // Ctrl+C (and any raw-read failure) cancels like Esc.
+                Err(_) => break None,
+            };
+            let target = match key {
+                Key::ArrowDown | Key::Tab | Key::Char('j') => (sel + 1) % n_items,
+                Key::ArrowUp | Key::BackTab | Key::Char('k') => (sel + n_items - 1) % n_items,
+                Key::Home => 0,
+                Key::End => n_items - 1,
+                Key::Enter => break Some(sel),
+                Key::Escape | Key::Char('q') => break None,
+                Key::Char('\u{3}') => break None,
+                _ => continue,
+            };
+            if target != sel {
+                repaint(sel, false)?;
+                repaint(target, true)?;
+                sel = target;
+            }
+        };
+
+        // Tear the widget down: clear prompt + rows + footer, then report
+        // the choice the way dialoguer's ColorfulTheme does (✔ prompt · choice).
+        term.move_cursor_up(total + 2)?;
+        term.clear_to_end_of_screen()?;
+        if let Some(idx) = outcome {
+            let MenuRow::Item(label) = rows[item_rows[idx]] else {
+                unreachable!("item_rows only indexes MenuRow::Item rows")
+            };
+            // The label's name column ends at the first run of 2+ spaces.
+            let name = match label.find("  ") {
+                Some(pos) => &label[..pos],
+                None => label,
+            };
+            term.write_line(&format!(
+                "{} {} {} {}",
+                style("✔").green(),
+                style(prompt).bold(),
+                style("·").dim(),
+                style(name).cyan()
+            ))?;
+        }
+        Ok(outcome)
+    })();
+    // Restore the cursor on every path, including mid-render IO errors.
+    let _ = term.show_cursor();
+    Ok(result?)
+}
+
+/// Block until the user presses Enter, so action output stays readable
+/// before the hub clears the screen and redraws.
+fn hub_pause() {
+    use console::style;
+    use std::io::Write as _;
+
+    let mut stdout = std::io::stdout();
+    let _ = write!(
+        stdout,
+        "\n  {}",
+        style("Press Enter to return to the hub…").dim()
+    );
+    let _ = stdout.flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+}
+
+/// Interactive hub — shown when `marrow` is run with no arguments.
+///
+/// Single entry point in the spirit of modern agent CLIs (`claude`,
+/// `copilot`): brand + version header, live workspace status, and a looping
+/// menu of actions that all remain available as direct subcommands.
 fn cmd_interactive() -> Result<()> {
     use console::style;
-    use dialoguer::{theme::ColorfulTheme, Select};
+    use std::io::IsTerminal as _;
 
-    // Clear terminal
-    print!("\x1B[2J\x1B[1;1H");
+    let term = console::Term::stdout();
+    // Non-interactive invocation (CI, pipes, redirected output): the menu
+    // cannot render, so print the full help instead of erroring out.
+    if !term.is_term() || !std::io::stdin().is_terminal() {
+        print_help();
+        return Ok(());
+    }
 
-    let art = r#"
-  ███╗   ███╗ █████╗ ██████╗ ██████╗  ██████╗ ██╗    ██╗
-  ████╗ ████║██╔══██╗██╔══██╗██╔══██╗██╔═══██╗██║    ██║
-  ██╔████╔██║███████║██████╔╝██████╔╝██║   ██║██║ █╗ ██║
-  ██║╚██╔╝██║██╔══██║██╔══██╗██╔══██╗██║   ██║██║███╗██║
-  ██║ ╚═╝ ██║██║  ██║██║  ██║██║  ██║╚██████╔╝╚███╔███╔╝
-  ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚══╝╚══╝
-"#;
+    loop {
+        let _ = term.clear_screen();
+        print_hub_header();
 
-    println!("{}", style(art).green().bold());
-    println!("{}", style("  AST Context Engine for AI Agents\n").cyan());
+        // Spinner while probing the workspace + daemon (up to ~500 ms).
+        let status = {
+            use indicatif::{ProgressBar, ProgressStyle};
+            let spinner = ProgressBar::new_spinner();
+            if let Ok(spin_style) = ProgressStyle::with_template("  {spinner:.green} {msg}") {
+                spinner.set_style(spin_style);
+            }
+            spinner.set_message("Reading workspace state…");
+            spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+            let status = HubStatus::gather();
+            spinner.finish_and_clear();
+            status
+        };
+        status.render();
+        println!();
 
-    let items = [
-        "1. Integrate Agents   (Configure MCP + rules)",
-        "2. Index Workspace    (Build the AST graph once)",
-        "3. Context Packet     (Compile provider-neutral task context)",
-        #[cfg(feature = "desktop")]
-        "4. Desktop App        (Open native dashboard window)",
-        #[cfg(feature = "desktop")]
-        "5. Exit",
-        #[cfg(not(feature = "desktop"))]
-        "4. Exit",
+        if status.is_first_run() {
+            println!(
+                "  {} {}",
+                // U+2726 is missing from legacy conhost fonts; fall back to `*`.
+                style(console::Emoji("✦", "*")).magenta(),
+                style(
+                    "New here? Start with “Integrate agents”, then “Index workspace” — \
+                     after that, agents pull context automatically."
+                )
+                .italic()
+            );
+            println!();
+        }
+
+        let entries = hub_menu_entries();
+        // Group the menu the same way `marrow help` groups commands; headers
+        // are keyed off actions so cfg-gated entries can't shift them.
+        let mut rows: Vec<MenuRow> = Vec::with_capacity(entries.len() + 4);
+        for (label, action) in &entries {
+            match action {
+                HubAction::Integrate => rows.push(MenuRow::Header("Get started")),
+                HubAction::Context => rows.push(MenuRow::Header("Context & queries")),
+                HubAction::Doctor => rows.push(MenuRow::Header("Diagnostics & dashboard")),
+                HubAction::Help => rows.push(MenuRow::Header("")),
+                _ => {}
+            }
+            rows.push(MenuRow::Item(label));
+        }
+        // Land the cursor on the most useful action for the current state.
+        let default_idx = if status.is_first_run() {
+            0 // Integrate agents
+        } else if matches!(status.index, HubIndexState::Missing) {
+            1 // Index workspace
+        } else {
+            3 // Context packet
+        };
+
+        let selection = hub_select(
+            "What would you like to do?",
+            &rows,
+            "↑↓ move · enter select · esc quit",
+            default_idx,
+        );
+
+        let action = match selection {
+            Ok(Some(idx)) => entries[idx].1,
+            // Esc or Ctrl+C: leave quietly instead of erroring.
+            Ok(None) | Err(_) => HubAction::Exit,
+        };
+
+        let workspace_root = status.workspace_root.clone();
+        let db_path = hub_db_path(&workspace_root).to_string_lossy().into_owned();
+
+        let outcome: Result<()> = match action {
+            HubAction::Integrate => cmd_integrate(&[]),
+            HubAction::Index => run_index_command(&workspace_root),
+            HubAction::Watch => hub_watch(&workspace_root),
+            HubAction::Context => cmd_context_interactive(&db_path),
+            HubAction::Query => cmd_query_interactive(&db_path),
+            HubAction::Doctor => {
+                // Guard like Query: never create an empty graph.db just to
+                // report that nothing is indexed.
+                if Path::new(&db_path).exists() {
+                    run_doctor(&db_path, None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "no index found at {db_path} — run “Index workspace” first"
+                    ))
+                }
+            }
+            HubAction::Dashboard => {
+                // The dashboard is served by the daemon; bring it up first so
+                // "Open dashboard" never lands on a dead port.
+                if let Err(e) = hub_ensure_daemon() {
+                    eprintln!(
+                        "  {} daemon start warning (dashboard may be unreachable): {e:#}",
+                        style("!").yellow().bold()
+                    );
+                }
+                cmd_ui(&workspace_root)
+            }
+            #[cfg(feature = "desktop")]
+            HubAction::Desktop => cmd_desktop_submenu(),
+            HubAction::Help => {
+                print_help();
+                Ok(())
+            }
+            HubAction::Exit => {
+                println!("{}", style("Goodbye.").dim());
+                return Ok(());
+            }
+        };
+
+        // Keep the hub alive when an action fails: report and return to menu.
+        match outcome {
+            Err(e) => {
+                eprintln!("\n  {} {e:#}", style("✗").red().bold());
+                hub_pause();
+            }
+            // Submenus render their own looping UI — nothing to pause over.
+            Ok(()) if !action.is_submenu() => hub_pause(),
+            Ok(()) => {}
+        }
+    }
+}
+
+/// Hub variant of `marrow watch`: same daemon-registered watch as the CLI
+/// command (the hub must never block on a foreground watch loop). Runs on a
+/// throwaway current-thread runtime because the hub has no Tokio runtime.
+fn hub_watch(workspace_root: &Path) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to build Tokio runtime for watch registration")?;
+    rt.block_on(async {
+        ipc::ensure_daemon_running().await?;
+        registry::register_workspace_best_effort(workspace_root);
+        ipc::default_client().register_watch(workspace_root).await?;
+        println!("[marrow] watching {}", display_path(workspace_root));
+        Ok(())
+    })
+}
+
+/// Boot the daemon (best-effort) from the runtime-free hub, mirroring the
+/// `marrow ui` CLI path.
+fn hub_ensure_daemon() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to build Tokio runtime for daemon startup")?;
+    rt.block_on(ipc::ensure_daemon_running())
+}
+
+/// Interactive wrapper around `marrow query`: pick an indexed repo, name a
+/// symbol, and print its context capsule + impact analysis.
+fn cmd_query_interactive(db_path: &str) -> Result<()> {
+    use dialoguer::{theme::ColorfulTheme, Input, Select};
+
+    if !Path::new(db_path).exists() {
+        anyhow::bail!("no index found at {db_path} — run “Index workspace” first");
+    }
+    let conn = db::init_db_or_memory(db_path)?;
+    let repos = known_repo_ids(&conn);
+    if repos.is_empty() {
+        anyhow::bail!("nothing indexed yet — run “Index workspace” first");
+    }
+    let repo_id = if repos.len() == 1 {
+        repos[0].clone()
+    } else {
+        let idx = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Repository")
+            .items(&repos)
+            .default(0)
+            .interact()?;
+        repos[idx].clone()
+    };
+
+    let symbol: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("Symbol name (function, class, module…)")
+        .interact_text()?;
+    let symbol = symbol.trim().to_string();
+    if symbol.is_empty() {
+        anyhow::bail!("query: symbol must not be empty");
+    }
+
+    print_symbol_report(&conn, &symbol, &repo_id)
+}
+
+/// Desktop App submenu for the interactive hub. Loops like the Dashboard
+/// submenu so action output (Status reports, Enable/Disable confirmations)
+/// stays on screen until the user chooses Back.
+#[cfg(feature = "desktop")]
+fn cmd_desktop_submenu() -> Result<()> {
+    let rows = [
+        MenuRow::Item("Open                Launch the native dashboard window"),
+        MenuRow::Item("Enable              Register an OS launcher entry"),
+        MenuRow::Item("Disable             Remove the OS launcher entry"),
+        MenuRow::Item("Status              Show registration and process state"),
+        MenuRow::Item("Back"),
     ];
 
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Welcome to Marrow. Select an action")
-        .items(&items)
-        .default(0)
-        .interact()?;
+    loop {
+        let selection = hub_select("Desktop App", &rows, "↑↓ move · enter select · esc back", 0);
 
-    let workspace_root = current_workspace_root();
-
-    match selection {
-        0 => cmd_integrate(&[])?,
-        1 => run_index_command(&workspace_root)?,
-        2 => cmd_context_interactive()?,
-        #[cfg(feature = "desktop")]
-        3 => cmd_desktop_submenu()?,
-        _ => eprintln!("{}", style("Goodbye.").dim()),
+        match selection {
+            Ok(Some(0)) => ui_app::open_app()?,
+            Ok(Some(1)) => ui_app::enable()?,
+            Ok(Some(2)) => ui_app::disable()?,
+            Ok(Some(3)) => ui_app::status()?,
+            // "Back", Esc, or Ctrl+C: return to the hub.
+            _ => break,
+        }
     }
 
     Ok(())
 }
 
-/// Desktop App submenu for the interactive TUI.
-#[cfg(feature = "desktop")]
-fn cmd_desktop_submenu() -> Result<()> {
-    use dialoguer::{theme::ColorfulTheme, Select};
+/// Styled `marrow help` / `marrow --help` output: version up top, commands
+/// grouped by workflow, every command still launchable directly.
+fn print_help() {
+    use console::style;
 
-    let items = [
-        "Open       (Launch native dashboard window)",
-        "Enable     (Register OS launcher entry)",
-        "Disable    (Remove OS launcher entry)",
-        "Status     (Show registration and process state)",
-        "Back",
-    ];
+    let heading = |s: &str| style(s).bold().to_string();
+    // Pad the plain text BEFORE styling: ANSI escapes are invisible but count
+    // toward format-width padding, which would break column alignment.
+    let row = |invocation: &str, desc: &str| {
+        println!("  {}{}", style(format!("{invocation:<26}")).cyan(), desc);
+    };
+    let cmd = |name: &str, args: &str, desc: &str| {
+        println!(
+            "  {}{}{}",
+            style(format!("{name:<14}")).cyan(),
+            if args.is_empty() {
+                String::new()
+            } else {
+                format!("{} — ", style(args).dim())
+            },
+            desc
+        );
+    };
 
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Desktop App")
-        .items(&items)
-        .default(0)
-        .interact()?;
+    println!(
+        "{} {} — local AST context engine & MCP server for AI agents",
+        style("marrow").green().bold(),
+        style(format!("v{}", env!("CARGO_PKG_VERSION"))).green()
+    );
+    println!();
+    println!("{}", heading("USAGE"));
+    row("marrow", "Open the interactive hub (recommended)");
+    row("marrow <command> [args]", "Run any command directly");
+    println!();
+    println!("{}", heading("GETTING STARTED"));
+    cmd(
+        "integrate",
+        "",
+        "Connect coding agents (MCP config + instruction files)",
+    );
+    cmd(
+        "init",
+        "",
+        "Initialize workspace config (.marrow/, .marrowrc.json)",
+    );
+    cmd(
+        "index",
+        "",
+        "Index the current workspace into the AST graph",
+    );
+    cmd(
+        "watch",
+        "",
+        "Keep the index fresh via the background daemon",
+    );
+    println!();
+    println!("{}", heading("CONTEXT & QUERIES"));
+    cmd("mcp", "", "Start the MCP stdio server (agents launch this)");
+    cmd(
+        "context",
+        "<task>",
+        "Compile a provider-neutral context packet",
+    );
+    cmd(
+        "query",
+        "<symbol> <repo_id>",
+        "Context capsule + impact analysis for a symbol",
+    );
+    println!();
+    println!("{}", heading("DIAGNOSTICS"));
+    cmd(
+        "doctor",
+        "[repo_id]",
+        "Verify indexed repos answer agent queries",
+    );
+    cmd(
+        "validate",
+        "",
+        "Check workspace setup and integration config",
+    );
+    cmd(
+        "benchmark",
+        "[<symbol> <repo_id>]",
+        "Token-reduction benchmark",
+    );
+    cmd("perf-harness", "", "Ingest + query performance benchmark");
+    cmd("maintenance", "", "WAL checkpoint + vacuum on graph.db");
+    println!();
+    println!("{}", heading("DAEMON & DASHBOARD"));
+    cmd(
+        "daemon",
+        "[install|uninstall|status]",
+        "Run the daemon / manage autostart",
+    );
+    cmd(
+        "status",
+        "",
+        "Show whether the background daemon is running",
+    );
+    cmd("stop", "", "Stop the background daemon");
+    cmd("ui", "", "Open the web dashboard");
+    cmd(
+        "ui-app",
+        "[open|enable|disable|status]",
+        "Manage the desktop app window",
+    );
+    println!();
+    println!("{}", heading("OPTIONS"));
+    row("-h, --help", "Show this help");
+    row("-V, --version", "Show the installed version");
+    println!();
+    println!(
+        "{}",
+        style("Docs & benchmarks: https://github.com/NDMyers/marrow").dim()
+    );
+}
 
-    match selection {
-        0 => ui_app::open_app()?,
-        1 => ui_app::enable()?,
-        2 => ui_app::disable()?,
-        3 => ui_app::status()?,
-        _ => {} // Back — return to main menu
+/// `marrow doctor` core: self-check every indexed repo (or one specific repo)
+/// in the given DB and report lifetime MCP failure stats. Shared by the CLI
+/// arm and the interactive hub.
+fn run_doctor(db_path: &str, repo_filter: Option<&str>) -> Result<()> {
+    let conn = db::init_db_or_memory(db_path)?;
+    let repos: Vec<String> = match repo_filter {
+        Some(repo) => vec![repo.to_string()],
+        None => known_repo_ids(&conn),
+    };
+    if repos.is_empty() {
+        println!("[marrow] doctor: no repos indexed in {db_path}.");
+        return Ok(());
     }
+    let mut all_passed = true;
+    for repo in &repos {
+        let report = doctor::run_index_self_check(&conn, repo, 8)?;
+        println!("[marrow] {}", report.summary_line());
+        all_passed &= report.passed();
+    }
+    let calls_total = db::read_stat(&conn, "tool_calls_total");
+    let failures_total = db::read_stat(&conn, "query_failures_total");
+    if calls_total > 0 || failures_total > 0 {
+        println!(
+            "[marrow] lifetime MCP tool calls: {calls_total}; hard failures recorded: {failures_total}"
+        );
+    }
+    let recent = db::recent_query_failures(&conn, 10)?;
+    if !recent.is_empty() {
+        println!("[marrow] most recent failures (newest first):");
+        for failure in &recent {
+            println!(
+                "  [{}] {} via {} (repo={}, target={}, filepath={}): {}",
+                failure.ts,
+                failure.category,
+                failure.tool,
+                failure.repo_id.as_deref().unwrap_or("-"),
+                failure.target.as_deref().unwrap_or("-"),
+                failure.filepath.as_deref().unwrap_or("-"),
+                failure.message
+            );
+        }
+    }
+    if !all_passed {
+        anyhow::bail!("doctor found unresolvable symbols — the index is not fully queryable");
+    }
+    println!("[marrow] doctor: all checks passed ({db_path}).");
+    Ok(())
+}
 
+/// Print a symbol's context capsule followed by its impact analysis.
+/// Shared by `marrow query` and the hub's "Query symbol" action.
+fn print_symbol_report(conn: &rusqlite::Connection, symbol: &str, repo_id: &str) -> Result<()> {
+    let result = retrieval::get_context_capsule(conn, symbol, repo_id, None)?;
+    println!("{}", result.optimized_text);
+
+    let impact = retrieval::analyze_impact(conn, symbol, repo_id, None)?;
+    println!("\nIMPACT ANALYSIS:");
+    if impact.affected.is_empty() {
+        println!("  No downstream dependents found.");
+    } else {
+        for n in impact.affected {
+            let loc = if n.start_line > 0 {
+                format!("{}:{}", n.file_path, n.start_line)
+            } else {
+                n.file_path.clone()
+            };
+            println!(
+                "  [Depth {}] {} ({}) in {}",
+                n.depth, n.symbol_name, n.symbol_type, loc
+            );
+        }
+    }
     Ok(())
 }
 
@@ -10343,30 +11178,7 @@ fn main() -> Result<()> {
         }
         // Help — no runtime needed.
         Some("--help") | Some("-h") | Some("help") => {
-            println!("Usage: marrow [COMMAND]\n");
-            println!("Commands:");
-            println!("  (none)          Interactive TUI menu");
-            println!("  mcp             Start MCP stdio server");
-            println!("  index           Index current workspace");
-            println!("  watch           Watch workspace for changes");
-            println!("  init            Initialize workspace config");
-            println!("  integrate       Install agent instruction files");
-            println!("  validate        Check workspace setup");
-            println!("  benchmark       Run token benchmark");
-            println!("  context         Compile provider-neutral context packet");
-            println!("  query           Query a symbol");
-            println!("  doctor          Verify indexed repos answer agent queries [repo_id]");
-            println!("  maintenance     Checkpoint & vacuum database");
-            println!("  daemon          Start background daemon or manage autostart");
-            println!("  status          Show daemon status");
-            println!("  stop            Stop daemon");
-            println!("  ui              Open dashboard");
-            println!("  ui-app          Desktop app (open|enable|disable|status)");
-            println!("  perf-harness    Run performance benchmarks");
-            println!("  service install Install daemon autostart (compatibility alias)");
-            println!("\nOptions:");
-            println!("  --help, -h      Show this help");
-            println!("  --version, -V   Show version");
+            print_help();
             return Ok(());
         }
         Some("ui-app") => {
@@ -10403,7 +11215,15 @@ async fn async_main(args: Vec<String>) -> Result<()> {
         None | Some("--help") | Some("-h") | Some("help") | Some("ui-app") => {
             unreachable!("Dispatched from main() before Tokio runtime")
         }
-        Some("ui") => return cmd_ui(),
+        Some("ui") => {
+            // The dashboard is served by the daemon — make sure it is up
+            // before offering to open the browser (warning is non-fatal so
+            // the auto-open toggle stays usable offline).
+            if let Err(e) = ipc::ensure_daemon_running().await {
+                eprintln!("[marrow] daemon start warning (dashboard may be unreachable): {e}");
+            }
+            return cmd_ui(&current_workspace_root());
+        }
         Some("init") => return cmd_init(),
         Some("rules") => return cmd_rules(),
         Some("index") => return cmd_index(&args[2..]),
@@ -10464,51 +11284,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
         Some("doctor") => {
             let db_path =
                 std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
-            let conn = db::init_db_or_memory(&db_path)?;
-            let repos: Vec<String> = match args.get(2) {
-                Some(repo) => vec![repo.clone()],
-                None => known_repo_ids(&conn),
-            };
-            if repos.is_empty() {
-                println!("[marrow] doctor: no repos indexed in {db_path}.");
-                return Ok(());
-            }
-            let mut all_passed = true;
-            for repo in &repos {
-                let report = doctor::run_index_self_check(&conn, repo, 8)?;
-                println!("[marrow] {}", report.summary_line());
-                all_passed &= report.passed();
-            }
-            let calls_total = db::read_stat(&conn, "tool_calls_total");
-            let failures_total = db::read_stat(&conn, "query_failures_total");
-            if calls_total > 0 || failures_total > 0 {
-                println!(
-                    "[marrow] lifetime MCP tool calls: {calls_total}; hard failures recorded: {failures_total}"
-                );
-            }
-            let recent = db::recent_query_failures(&conn, 10)?;
-            if !recent.is_empty() {
-                println!("[marrow] most recent failures (newest first):");
-                for failure in &recent {
-                    println!(
-                        "  [{}] {} via {} (repo={}, target={}, filepath={}): {}",
-                        failure.ts,
-                        failure.category,
-                        failure.tool,
-                        failure.repo_id.as_deref().unwrap_or("-"),
-                        failure.target.as_deref().unwrap_or("-"),
-                        failure.filepath.as_deref().unwrap_or("-"),
-                        failure.message
-                    );
-                }
-            }
-            if !all_passed {
-                anyhow::bail!(
-                    "doctor found unresolvable symbols — the index is not fully queryable"
-                );
-            }
-            println!("[marrow] doctor: all checks passed ({db_path}).");
-            return Ok(());
+            return run_doctor(&db_path, args.get(2).map(|s| s.as_str()));
         }
         Some("query") => {
             let symbol = args
@@ -10522,27 +11298,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
                 std::env::var("MARROW_DB_PATH").unwrap_or_else(|_| ".marrow/graph.db".to_string());
 
             let conn = db::init_db_or_memory(&db_path)?;
-            let result = retrieval::get_context_capsule(&conn, symbol, repo_id, None)?;
-            println!("{}", result.optimized_text);
-
-            let impact = retrieval::analyze_impact(&conn, symbol, repo_id, None)?;
-            println!("\nIMPACT ANALYSIS:");
-            if impact.affected.is_empty() {
-                println!("  No downstream dependents found.");
-            } else {
-                for n in impact.affected {
-                    let loc = if n.start_line > 0 {
-                        format!("{}:{}", n.file_path, n.start_line)
-                    } else {
-                        n.file_path.clone()
-                    };
-                    println!(
-                        "  [Depth {}] {} ({}) in {}",
-                        n.depth, n.symbol_name, n.symbol_type, loc
-                    );
-                }
-            }
-            return Ok(());
+            return print_symbol_report(&conn, symbol, repo_id);
         }
         Some("daemon") => match args.get(2).map(|s| s.as_str()) {
             None => return daemon::run().await,
