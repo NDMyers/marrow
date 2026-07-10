@@ -9026,31 +9026,25 @@ fn cmd_integrate(args: &[String]) -> Result<()> {
             eprintln!("  {}", style(rule_install_note()).dim());
         }
 
-        let scope =
-            match inquire::Select::new("Rule file scope", vec!["Global (recommended)", "Project"])
-                .prompt()
-            {
-                Ok(choice) => {
-                    if choice.starts_with("Global") {
-                        skills::Scope::Global
-                    } else {
-                        skills::Scope::Project
-                    }
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-        let method = match inquire::Select::new("Rule file method", vec!["Write File", "Symlink"])
-            .prompt()
-        {
-            Ok(choice) => {
-                if choice == "Symlink" {
-                    skills::Method::Symlink
-                } else {
-                    skills::Method::WriteFile
-                }
+        let scope = {
+            let choice =
+                inquire::Select::new("Rule file scope", vec!["Global (recommended)", "Project"])
+                    .prompt()?;
+            if choice.starts_with("Global") {
+                skills::Scope::Global
+            } else {
+                skills::Scope::Project
             }
-            Err(e) => return Err(e.into()),
+        };
+
+        let method = {
+            let choice =
+                inquire::Select::new("Rule file method", vec!["Write File", "Symlink"]).prompt()?;
+            if choice == "Symlink" {
+                skills::Method::Symlink
+            } else {
+                skills::Method::WriteFile
+            }
         };
 
         eprintln!();
