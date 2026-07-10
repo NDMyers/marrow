@@ -10685,7 +10685,9 @@ fn cmd_query_interactive(db_path: &str) -> Result<()> {
     print_symbol_report(&conn, &symbol, &repo_id)
 }
 
-/// Desktop App submenu for the interactive hub.
+/// Desktop App submenu for the interactive hub. Loops like the Dashboard
+/// submenu so action output (Status reports, Enable/Disable confirmations)
+/// stays on screen until the user chooses Back.
 #[cfg(feature = "desktop")]
 fn cmd_desktop_submenu() -> Result<()> {
     use dialoguer::{theme::ColorfulTheme, Select};
@@ -10698,19 +10700,21 @@ fn cmd_desktop_submenu() -> Result<()> {
         "Back",
     ];
 
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Desktop App (Esc to go back)")
-        .items(&items)
-        .default(0)
-        .interact_opt();
+    loop {
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Desktop App (Esc to go back)")
+            .items(&items)
+            .default(0)
+            .interact_opt();
 
-    match selection {
-        Ok(Some(0)) => ui_app::open_app()?,
-        Ok(Some(1)) => ui_app::enable()?,
-        Ok(Some(2)) => ui_app::disable()?,
-        Ok(Some(3)) => ui_app::status()?,
-        // "Back", Esc, or Ctrl+C: return to the hub.
-        _ => {}
+        match selection {
+            Ok(Some(0)) => ui_app::open_app()?,
+            Ok(Some(1)) => ui_app::enable()?,
+            Ok(Some(2)) => ui_app::disable()?,
+            Ok(Some(3)) => ui_app::status()?,
+            // "Back", Esc, or Ctrl+C: return to the hub.
+            _ => break,
+        }
     }
 
     Ok(())
