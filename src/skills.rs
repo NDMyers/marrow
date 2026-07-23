@@ -5,6 +5,13 @@ use std::{
 
 use anyhow::Result;
 
+/// Serializes tests that mutate the process-global `CODEX_HOME` env var (the
+/// Codex writer test in the binary crate and the Codex skill-install test here),
+/// so parallel test threads never observe each other's env changes. Defined in
+/// this shared module because `skills` compiles into both the lib and bin crates.
+#[cfg(test)]
+pub(crate) static CODEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub const MARROW_CORE_SKILL_MD: &str = r#"---
 # marrow-generated: true
 # marrow-generated-checksum: fnv1a64:aa9240036df20f67
@@ -186,6 +193,7 @@ pub enum Agent {
     Windsurf,
     RooCode,
     Zed,
+    Codex,
 }
 
 impl Agent {
@@ -277,8 +285,30 @@ impl Agent {
             // Unreachable for installs (supports_scope denies Global): Zed's
             // Rules Library is an internal prompt database, not rule files.
             (Agent::Zed, Scope::Global) => home.join(".config/zed/rules/marrow-optimization.rules"),
+
+            // Codex discovers skills only as `<skills-root>/<name>/SKILL.md`
+            // directory packages (a flat `.md` is silently ignored, exactly like
+            // Claude Code). The reported artifact is therefore the SKILL.md
+            // package; install_skill additionally appends an always-on directive
+            // block to AGENTS.md (repo root / $CODEX_HOME/AGENTS.md).
+            (Agent::Codex, Scope::Project) => {
+                PathBuf::from(".codex/skills/marrow-optimization/SKILL.md")
+            }
+            (Agent::Codex, Scope::Global) => {
+                codex_home(home).join("skills/marrow-optimization/SKILL.md")
+            }
         }
     }
+}
+
+/// Codex's root config directory: `$CODEX_HOME` when set (and non-empty),
+/// otherwise `<home>/.codex`. Shared by the Codex CLI and the ChatGPT app.
+pub fn codex_home(home: &Path) -> PathBuf {
+    std::env::var("CODEX_HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"))
 }
 
 /// VS Code's per-user configuration directory, resolved relative to `home`.
@@ -548,6 +578,22 @@ pub fn install_skill(
         return Ok(status);
     }
 
+    // Codex gets two artifacts:
+    //   1. A discoverable `<name>/SKILL.md` package (the reported `target`); a
+    //      flat `.md` is ignored by Codex's loader, so this must be a package.
+    //   2. An always-on directive block appended idempotently to AGENTS.md
+    //      (repo root for Project, $CODEX_HOME/AGENTS.md for Global) — a shared
+    //      user file, so we never own it wholesale.
+    if matches!(agent, Agent::Codex) {
+        let package_status = install_managed_file(&target, &marrow_skill_package_md())?;
+        let agents_path = match scope {
+            Scope::Project => PathBuf::from("AGENTS.md"),
+            Scope::Global => codex_home(home).join("AGENTS.md"),
+        };
+        let block_status = install_agents_md_block(&agents_path)?;
+        return Ok(combine_install_status(package_status, Some(block_status)));
+    }
+
     let central = install_source_path(method, home)
         .unwrap_or_else(|| home.join(".marrow/marrow-optimization.md"));
 
@@ -600,6 +646,72 @@ pub fn install_source_description(method: Method, home: &Path) -> String {
             "source: embedded Marrow template; edit/remove the target file directly".to_string()
         }
     }
+}
+
+// ── Codex AGENTS.md directive block ───────────────────────────────────────────
+
+const AGENTS_BLOCK_BEGIN: &str = "<!-- BEGIN MARROW MCP DIRECTIVE -->";
+const AGENTS_BLOCK_END: &str = "<!-- END MARROW MCP DIRECTIVE -->";
+
+/// The Marrow directive rendered for AGENTS.md: the core skill body with its
+/// YAML frontmatter stripped (AGENTS.md is plain, always-on markdown), wrapped
+/// in BEGIN/END markers so it can be located and refreshed idempotently.
+fn marrow_agents_block() -> String {
+    let body = strip_yaml_frontmatter(MARROW_CORE_SKILL_MD).trim();
+    format!("{AGENTS_BLOCK_BEGIN}\n{body}\n{AGENTS_BLOCK_END}\n")
+}
+
+/// Drop a leading `---\n … \n---\n` YAML frontmatter block, returning the body.
+fn strip_yaml_frontmatter(md: &str) -> &str {
+    md.strip_prefix("---\n")
+        .and_then(|rest| rest.find("\n---\n").map(|idx| &rest[idx + "\n---\n".len()..]))
+        .unwrap_or(md)
+}
+
+/// Append or refresh the Marrow directive block in an AGENTS.md-style file,
+/// preserving everything the user wrote outside the BEGIN/END markers.
+fn install_agents_md_block(target: &Path) -> Result<InstallStatus> {
+    let block = marrow_agents_block();
+    let existing = if target.exists() {
+        fs::read_to_string(target)?
+    } else {
+        String::new()
+    };
+
+    // Refresh an existing managed block in place.
+    if let (Some(start), Some(end_at)) =
+        (existing.find(AGENTS_BLOCK_BEGIN), existing.find(AGENTS_BLOCK_END))
+    {
+        let end = end_at + AGENTS_BLOCK_END.len();
+        if &existing[start..end] == block.trim_end() {
+            return Ok(InstallStatus::PreservedExisting);
+        }
+        let mut updated = String::with_capacity(existing.len() + block.len());
+        updated.push_str(&existing[..start]);
+        updated.push_str(block.trim_end());
+        updated.push_str(&existing[end..]);
+        fs::write(target, updated)?;
+        return Ok(InstallStatus::Refreshed);
+    }
+
+    // No block yet: create the file, or append below the user's content.
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    if existing.is_empty() {
+        fs::write(target, block)?;
+    } else {
+        let mut updated = existing;
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push('\n');
+        updated.push_str(&block);
+        fs::write(target, updated)?;
+    }
+    Ok(InstallStatus::Written)
 }
 
 // ── File-system helpers ───────────────────────────────────────────────────────
@@ -1649,5 +1761,121 @@ mod tests {
             fs::read_to_string(home.join(".marrow/marrow-optimization.md")).unwrap(),
             MARROW_CORE_SKILL_MD
         );
+    }
+
+    #[test]
+    fn agents_block_body_has_no_yaml_frontmatter() {
+        let block = super::marrow_agents_block();
+        assert!(block.starts_with(super::AGENTS_BLOCK_BEGIN));
+        assert!(block.contains("# Marrow MCP Optimization Directives"));
+        assert!(
+            !block.contains("alwaysApply:"),
+            "AGENTS.md is plain markdown; YAML frontmatter must be stripped"
+        );
+    }
+
+    #[test]
+    fn install_agents_md_block_is_idempotent_and_preserves_user_content() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("AGENTS.md");
+
+        // Absent file → created with just the block.
+        assert_eq!(
+            super::install_agents_md_block(&target).unwrap(),
+            InstallStatus::Written
+        );
+        let first = fs::read_to_string(&target).unwrap();
+        assert_eq!(first.matches(super::AGENTS_BLOCK_BEGIN).count(), 1);
+
+        // Second run → no change, no duplicate block.
+        assert_eq!(
+            super::install_agents_md_block(&target).unwrap(),
+            InstallStatus::PreservedExisting
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), first);
+        assert_eq!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .matches(super::AGENTS_BLOCK_BEGIN)
+                .count(),
+            1
+        );
+
+        // User-authored content around a stale block is preserved on refresh.
+        let user_top = "# My project rules\nUse tabs, not spaces.\n\n";
+        let stale = format!(
+            "{user_top}{}\nold marrow text\n{}\n\n## More rules\nBe kind.\n",
+            super::AGENTS_BLOCK_BEGIN,
+            super::AGENTS_BLOCK_END
+        );
+        fs::write(&target, &stale).unwrap();
+        assert_eq!(
+            super::install_agents_md_block(&target).unwrap(),
+            InstallStatus::Refreshed
+        );
+        let refreshed = fs::read_to_string(&target).unwrap();
+        assert!(refreshed.starts_with("# My project rules"));
+        assert!(refreshed.contains("## More rules\nBe kind."));
+        assert!(refreshed.contains("# Marrow MCP Optimization Directives"));
+        assert!(!refreshed.contains("old marrow text"));
+        assert_eq!(refreshed.matches(super::AGENTS_BLOCK_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn codex_project_target_is_a_skill_md_package_not_a_flat_file() {
+        // Codex ignores flat `.md` skills; the target must be a <name>/SKILL.md package.
+        let target = Agent::Codex.target_path(Scope::Project, Path::new("/home/u"));
+        assert_eq!(
+            target,
+            Path::new(".codex/skills/marrow-optimization/SKILL.md")
+        );
+    }
+
+    #[test]
+    fn install_skill_codex_writes_package_and_agents_block() {
+        // Serialize against the main-crate Codex writer test on the shared CODEX_HOME.
+        let _env_guard = super::CODEX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempdir().unwrap();
+        let codex_home = dir.path().join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        std::env::set_var("CODEX_HOME", &codex_home);
+
+        let home = dir.path();
+        assert_eq!(
+            super::install_skill(Agent::Codex, Scope::Global, Method::WriteFile, home).unwrap(),
+            InstallStatus::Written
+        );
+
+        // 1. Discoverable SKILL.md directory package with skill frontmatter.
+        let pkg = codex_home.join("skills/marrow-optimization/SKILL.md");
+        assert!(pkg.is_file(), "expected package at {}", pkg.display());
+        assert!(fs::read_to_string(&pkg).unwrap().contains("name: marrow-optimization"));
+
+        // 2. Always-on directive block appended to $CODEX_HOME/AGENTS.md.
+        let agents = codex_home.join("AGENTS.md");
+        assert_eq!(
+            fs::read_to_string(&agents)
+                .unwrap()
+                .matches(super::AGENTS_BLOCK_BEGIN)
+                .count(),
+            1
+        );
+
+        // Idempotent re-run: no changes, no duplicate skill or block.
+        assert_eq!(
+            super::install_skill(Agent::Codex, Scope::Global, Method::WriteFile, home).unwrap(),
+            InstallStatus::PreservedExisting
+        );
+        assert_eq!(
+            fs::read_to_string(&agents)
+                .unwrap()
+                .matches(super::AGENTS_BLOCK_BEGIN)
+                .count(),
+            1
+        );
+
+        std::env::remove_var("CODEX_HOME");
     }
 }

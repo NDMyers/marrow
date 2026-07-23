@@ -1,6 +1,6 @@
 [package]
 name = "marrow"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 authors = ["NDMyers <99777840+NDMyers@users.noreply.github.com>"]
 license = "MIT"
@@ -49,6 +49,9 @@ rusqlite = { version = "0.38.0", features = ["bundled"] }
 # Serialization for MCP Tool schemas
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Format- and comment-preserving TOML editing for Codex's config.toml MCP entries
+toml_edit = "0.22"
 
 # JSON Schema derivation (required by rmcp macros)
 schemars = "1.0"
