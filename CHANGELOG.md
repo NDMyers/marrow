@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.6] - 2026-07-23
+
+### Added
+
+- Codex integration: `marrow integrate` now configures the Codex CLI and the ChatGPT desktop app (which share the same config) as a first-class **automatic** target instead of a guided-only one that received nothing. Marrow merges a `[mcp_servers.marrow]` entry into `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`, honoring `CODEX_HOME`) using format- and comment-preserving TOML editing, so existing servers, settings, and comments survive untouched. It also installs a discoverable `marrow-optimization/SKILL.md` skill package (`.codex/skills/` for project scope, `$CODEX_HOME/skills/` for global) — Codex, like Claude Code, ignores flat `.md` skills and loads only `<name>/SKILL.md` packages — and appends an idempotent always-on Marrow directive block to `AGENTS.md` (repo root for project scope, `$CODEX_HOME/AGENTS.md` for global).
+
+### Changed
+
+- The Codex MCP launch spec uses the shared login-shell wrapper so both the terminal CLI and the GUI desktop app resolve `marrow` on PATH under a stripped launch environment, with `startup_timeout_sec` widened to absorb slow login-profile sourcing. If Codex is not installed (`$CODEX_HOME` absent), the writer reports the target as skipped rather than creating a phantom config.
+
 ## [0.1.5] - 2026-07-09
 
 ### Added

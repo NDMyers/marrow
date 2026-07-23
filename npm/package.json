@@ -1,6 +1,6 @@
 {
   "name": "@nickm-swe/marrow",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "A local, deterministic MCP server that parses multi-language codebases into an AST dependency graph.",
   "keywords": [
     "mcp",

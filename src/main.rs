@@ -1798,13 +1798,13 @@ const INTEGRATION_TARGETS: &[IntegrationTarget] = &[
         aliases: &["codex", "codex-cli", "openai-codex"],
         support_tier: IntegrationSupportTier::FirstClass,
         kind: IntegrationTargetKind::Agent,
-        setup_mode: IntegrationSetupMode::Guided,
-        rule_support: RuleFileSupport::None,
-        rule_agent: None,
+        setup_mode: IntegrationSetupMode::Automatic,
+        rule_support: RuleFileSupport::ProjectAndGlobal,
+        rule_agent: Some(skills::Agent::Codex),
         workspace_rule_files: &[],
         baseline_workspace_required: false,
-        allow_config_write: false,
-        writer: None,
+        allow_config_write: true,
+        writer: Some(integrate_codex),
     },
     IntegrationTarget {
         name: "Gemini CLI",
@@ -5123,7 +5123,6 @@ mod tests {
     fn guided_targets_do_not_have_config_writers() {
         for name in [
             "Continue",
-            "Codex CLI",
             "Gemini CLI",
             "JetBrains AI Assistant",
             "JetBrains Junie",
@@ -5151,7 +5150,6 @@ mod tests {
 
         for name in [
             "Continue",
-            "Codex CLI",
             "Gemini CLI",
             "JetBrains AI Assistant",
             "JetBrains Junie",
@@ -5175,6 +5173,91 @@ mod tests {
                 "guided target {name} must not create config files"
             );
         }
+    }
+
+    #[test]
+    fn integrate_codex_writes_merges_and_honors_codex_home() {
+        // CODEX_HOME is process-global; serialize against the skills-crate Codex
+        // test and normalize the var so ambient/parallel values can't leak in.
+        let _env_guard = crate::skills::CODEX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CODEX_HOME");
+
+        // Expected launch command/args come from the shared platform helper so the
+        // assertion holds on macOS (/bin/zsh), Windows (powershell.exe), and Linux.
+        let spec = mcp_shell_launch_spec();
+        let expected_command = spec["command"].as_str().unwrap().to_string();
+        let expected_args: Vec<String> = spec["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        // ── Case A: Codex not installed (~/.codex absent) → NotFound, nothing written.
+        let home_a = tempfile::tempdir().unwrap();
+        let ctx_a = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home_a.path().to_string_lossy().into_owned(),
+        };
+        assert_eq!(
+            integrate_codex(&ctx_a).unwrap(),
+            AgentOutcome::NotFound,
+            "absent ~/.codex must report NotFound"
+        );
+        assert!(!home_a.path().join(".codex/config.toml").exists());
+
+        // ── Case B: existing config.toml with unrelated content is merged, not clobbered.
+        let home_b = tempfile::tempdir().unwrap();
+        let codex_dir = home_b.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let cfg_path = codex_dir.join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "# my codex config\nmodel = \"gpt-5\"\n\n[mcp_servers.other]\ncommand = \"other-mcp\"\n",
+        )
+        .unwrap();
+        let ctx_b = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home_b.path().to_string_lossy().into_owned(),
+        };
+        assert_eq!(integrate_codex(&ctx_b).unwrap(), AgentOutcome::Installed);
+
+        let written = std::fs::read_to_string(&cfg_path).unwrap();
+        let doc = written.parse::<toml_edit::DocumentMut>().unwrap();
+        // Marrow entry present with the platform shell wrapper + widened timeout.
+        let marrow = &doc["mcp_servers"]["marrow"];
+        assert_eq!(marrow["command"].as_str().unwrap(), expected_command);
+        let args: Vec<String> = marrow["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(args, expected_args);
+        assert_eq!(marrow["startup_timeout_sec"].as_integer().unwrap(), 30);
+        // User content survives.
+        assert_eq!(doc["model"].as_str().unwrap(), "gpt-5");
+        assert_eq!(doc["mcp_servers"]["other"]["command"].as_str().unwrap(), "other-mcp");
+        assert!(written.contains("# my codex config"), "comments must survive");
+
+        // Re-running stays Installed and does not duplicate the entry.
+        assert_eq!(integrate_codex(&ctx_b).unwrap(), AgentOutcome::Installed);
+        let rerun = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(rerun.matches("[mcp_servers.marrow]").count(), 1);
+
+        // ── Case C: CODEX_HOME override targets a different directory.
+        let alt = tempfile::tempdir().unwrap();
+        std::env::set_var("CODEX_HOME", alt.path());
+        let ctx_c = IntegrationCtx {
+            binary: "/absolute/path/to/marrow".to_string(),
+            home: home_a.path().to_string_lossy().into_owned(), // home has no .codex
+        };
+        assert_eq!(integrate_codex(&ctx_c).unwrap(), AgentOutcome::Installed);
+        assert!(alt.path().join("config.toml").exists());
+        assert!(!home_a.path().join(".codex/config.toml").exists());
+        std::env::remove_var("CODEX_HOME");
     }
 
     #[test]
@@ -8341,6 +8424,30 @@ fn save_json(path: &Path, val: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Read a TOML file into an editable document, returning an empty document if
+/// the file is absent or blank. Format-preserving: comments, ordering, and
+/// unrelated tables in a user's existing `config.toml` are retained on save.
+fn load_toml_doc_or_empty(path: &Path) -> Result<toml_edit::DocumentMut> {
+    if path.exists() {
+        let raw = fs::read_to_string(path)?;
+        if raw.trim().is_empty() {
+            return Ok(toml_edit::DocumentMut::new());
+        }
+        Ok(raw.parse::<toml_edit::DocumentMut>()?)
+    } else {
+        Ok(toml_edit::DocumentMut::new())
+    }
+}
+
+/// Write an editable TOML document to disk, creating parent directories as needed.
+fn save_toml_doc(path: &Path, doc: &toml_edit::DocumentMut) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
 // ── Shared launch-spec helpers ────────────────────────────────────────────────
 
 /// Returns the canonical, portable MCP launch spec for Marrow.
@@ -8640,6 +8747,53 @@ fn integrate_copilot(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
     cli_cfg["mcpServers"]["marrow"] = spec;
     save_json(&cli_path, &cli_cfg)?;
 
+    Ok(AgentOutcome::Installed)
+}
+
+/// `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) — the single MCP
+/// config file shared by the Codex CLI and the ChatGPT desktop app.
+///
+/// Codex is the one first-class target that reads TOML, not JSON: MCP servers
+/// live under a `[mcp_servers.<name>]` table. We merge with `toml_edit` so a
+/// user's existing servers, settings, and comments survive untouched.
+///
+/// The launch spec is the shared shell wrapper (`/bin/zsh -lc "marrow mcp"` on
+/// macOS, `powershell.exe …` on Windows). Codex CLI would resolve a bare
+/// `marrow` from the terminal PATH, but the GUI ChatGPT desktop app inherits the
+/// stripped launchd/GUI PATH — the wrapper's login shell resolves `marrow` in
+/// both, exactly as for Copilot/Cursor. `startup_timeout_sec` is widened from
+/// Codex's 10s default to absorb slow login-profile sourcing.
+///
+/// If `$CODEX_HOME` does not exist, Codex is not installed: report `NotFound`
+/// rather than creating a phantom config.
+fn integrate_codex(ctx: &IntegrationCtx) -> Result<AgentOutcome> {
+    let codex_home = std::env::var("CODEX_HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&ctx.home).join(".codex"));
+    if !codex_home.exists() {
+        return Ok(AgentOutcome::NotFound);
+    }
+
+    let path = codex_home.join("config.toml");
+    let mut doc = load_toml_doc_or_empty(&path)?;
+
+    let spec = mcp_shell_launch_spec();
+    let mut table = toml_edit::Table::new();
+    table["command"] = toml_edit::value(spec["command"].as_str().unwrap_or("marrow"));
+    let mut args = toml_edit::Array::new();
+    if let Some(items) = spec["args"].as_array() {
+        for item in items.iter().filter_map(|value| value.as_str()) {
+            args.push(item);
+        }
+    }
+    table["args"] = toml_edit::value(args);
+    table["startup_timeout_sec"] = toml_edit::value(30_i64);
+
+    // Replace the whole `marrow` table so a stale entry never leaves orphaned keys.
+    doc["mcp_servers"]["marrow"] = toml_edit::Item::Table(table);
+    save_toml_doc(&path, &doc)?;
     Ok(AgentOutcome::Installed)
 }
 
